@@ -210,7 +210,7 @@ def _sqlite_ro_uri(db_path: Path) -> str:
 class ConversationDbReader:
     """Bounded LRU reader over Antigravity conversations/<id>.db files."""
 
-    def __init__(self, conversations_dir: Path | str, max_cache_entries: int = 12, tail_rows: int = 12) -> None:
+    def __init__(self, conversations_dir: Path | str, max_cache_entries: int = 12, tail_rows: int = 16) -> None:
         self.conversations_dir = Path(conversations_dir)
         self.max_cache_entries = max(2, int(max_cache_entries))
         self.tail_rows = max(4, int(tail_rows))

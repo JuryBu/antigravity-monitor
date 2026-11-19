@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
+from core.account_ledger import AccountSwitchLedger
 from core.config_store import ConfigStore
 from core.log_monitor import (
     AntigravityMonitorEngine,
@@ -283,6 +284,158 @@ class TestLogMonitorLogic(unittest.TestCase):
             snap2 = engine.poll(now_ts=now + 5)
             self.assertEqual(snap2.grade, "IDLE")
             self.assertEqual(snap2.alerts, [])
+
+    def test_account_ledger_splits_daily_steps_and_suppresses_switch_first_cold(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+            ledger_p = root / "account_ledger.json"
+
+            now = time.time()
+            t_acc1 = now - 3600
+            t_acc2 = now - 600
+            iso1 = time.strftime("%Y-%m-%dT%H:%M:%S.123456789+08:00", time.localtime(t_acc1))
+            iso2 = time.strftime("%Y-%m-%dT%H:%M:%S.987654321+08:00", time.localtime(t_acc2))
+            (ck_logs / "app.log.2026-11-20").write_text(
+                f"{iso1}  INFO [Antigravity 2.0] 写入系统凭据: alpha123@example.com\n"
+                f"{iso2}  INFO [Antigravity 2.0] 写入系统凭据: beta9876@example.com\n",
+                encoding="utf-8",
+            )
+
+            ledger = AccountSwitchLedger(ledger_path=ledger_p, cockpit_logs_dir=ck_logs)
+            ledger.observe_online("be***6", now)
+            # Ledger on disk must contain ONLY masked labels, never raw emails
+            if ledger_p.is_file():
+                raw_txt = ledger_p.read_text(encoding="utf-8")
+                self.assertNotIn("alpha123@example.com", raw_txt)
+                self.assertNotIn("beta9876@example.com", raw_txt)
+
+            tl = ledger.get_timeline(now - 7200)
+            self.assertEqual([lbl for _, lbl in tl], ["al***3", "be***6"])
+            # Attribution separates steps cleanly across the switch timestamp
+            self.assertEqual(ledger.attribute_timestamp(t_acc1 + 300, tl), "al***3")
+            self.assertEqual(ledger.attribute_timestamp(t_acc2 + 100, tl), "be***6")
+
+            # Same conversation crossing an account switch: first cr=0 after switch is expected_cold ("account_switch")
+            switches = ledger.get_switch_timestamps(now - 7200)
+            raw_steps = [
+                {"step_index": 1, "timestamp": t_acc2 - 30, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 120000},
+                {"step_index": 2, "timestamp": t_acc2 + 20, "model": "gemini-4-neon-xhigh", "input_tokens": 124000, "cache_read_tokens": 0},
+                {"step_index": 3, "timestamp": t_acc2 + 60, "model": "gemini-4-neon-xhigh", "input_tokens": 126000, "cache_read_tokens": 0},
+            ]
+            classified = classify_steps(raw_steps, idle_rewarm_sec=180, account_switches=switches)
+            self.assertEqual(classified[1].classification, "expected_cold")
+            self.assertEqual(classified[1].reason, "account_switch")
+            self.assertEqual(classified[2].classification, "abnormal_miss")
+
+    def test_recent_ttft_series_avg_and_max(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "ttft1234-5678" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 30))
+            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 10))
+            rows = [
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 600},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": t1, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 800},
+            ]
+            (brain / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            conn = sqlite3.connect(convs / "ttft1234-5678.db")
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (1, _build_fake_gen_blob(50000, 0, 600, ttft_s=10, strm_s=4)))
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (2, _build_fake_gen_blob(2000, 50000, 800, ttft_s=30, strm_s=5)))
+            conn.commit()
+            conn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                }
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertEqual(len(snap.primary_recent_ttfts), 2)
+            # _build_fake_gen_blob appends 0.5s nanos -> 10.5s & 30.5s (avg=20.5s, max=30.5s)
+            self.assertAlmostEqual(snap.primary_ttft_avg or 0.0, 20.5, places=2)
+            self.assertAlmostEqual(snap.primary_ttft_max or 0.0, 30.5, places=2)
+            summary = format_text_summary(snap)
+            self.assertIn("近10步均 20.5s / 峰 30.5s", summary)
+
+    def test_intermittent_t1_cannot_wash_to_t0_on_single_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "wash1234-5678" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            # Step 0 warm seed + 10 steps: 4 misses, 1 lucky hit, 4 misses, 1 lucky hit (8/10 abnormal misses!)
+            pattern = [True, False, False, False, False, True, False, False, False, False, True]
+            rows = []
+            for idx, is_hit in enumerate(pattern):
+                ts_s = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - (len(pattern) - idx) * 20))
+                rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": idx + 1,
+                    "created_at": ts_s,
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000 if is_hit else 180000,
+                    "cache_read_tokens": 180000 if is_hit else 0,
+                    "output_tokens": 600,
+                })
+            tp = brain / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                }
+            )
+            snap = engine.poll(now_ts=now)
+            # Even though latest step hit 98.9%, 8/10 abnormal misses MUST stay T1 red, never wash to T0 green!
+            self.assertEqual(snap.grade, "T1")
+            self.assertEqual(snap.level, "red")
+            self.assertEqual(snap.max_abnormal_recent10, 8)
+            self.assertIn("频繁掉缓存", snap.headline)
+
+            # Now test moderate recovery window: 2 abnormal misses among 10 steps, latest 2 steps hit -> WARN (not T0)
+            pattern2 = [True, True, True, True, True, True, True, False, False, True, True]
+            rows2 = []
+            for idx, is_hit in enumerate(pattern2):
+                ts_s = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - (len(pattern2) - idx) * 20))
+                rows2.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": idx + 1,
+                    "created_at": ts_s,
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000 if is_hit else 120000,
+                    "cache_read_tokens": 120000 if is_hit else 0,
+                    "output_tokens": 600,
+                })
+            time.sleep(0.02)
+            tp.write_text("\n".join(json.dumps(r) for r in rows2) + "\n", encoding="utf-8")
+            snap2 = engine.poll(now_ts=now + 2)
+            self.assertEqual(snap2.grade, "WARN")
+            self.assertEqual(snap2.level, "orange")
+            self.assertIn("观察恢复中", snap2.sub_headline)
 
     def test_end_to_end_t1_invalid_freshness_dedup_and_no_offline_cockpit_leak(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from core.account_ledger import AccountSwitchLedger
 from core.config_store import DEFAULT_CONFIG, sanitize_config
 from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot
 
@@ -240,11 +241,19 @@ class ConversationSummary:
     wasted_cold_tokens: int
     freshness_remaining_sec: Optional[int]
     freshness_invalid_reason: str = ""  # non-empty when latest step abnormally lost cache (cr=0)
+    abnormal_in_recent10: int = 0
+    cacheable_in_recent10: int = 0
+    recent10_hit_ratio: Optional[float] = None
+    first_abnormal_step_in_recent10: int = 0
     ttft_sec: Optional[float] = None
     streaming_sec: Optional[float] = None
     tps: Optional[float] = None
     shard_tag: str = ""
     speed_status: str = "unknown"  # "ok" | "slow" | "unknown"
+    recent_ttfts: List[Optional[float]] = field(default_factory=list)
+    recent_tps_list: List[Optional[float]] = field(default_factory=list)
+    ttft_avg_sec: Optional[float] = None
+    ttft_max_sec: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +313,14 @@ class MonitorSnapshot:
     sliding_window_min: int
     freshness_window_sec: int
     alerts: List[Tuple[str, str, str]] = field(default_factory=list)
+    primary_ttft_avg: Optional[float] = None
+    primary_ttft_max: Optional[float] = None
+    primary_recent_ttfts: List[Optional[float]] = field(default_factory=list)
+    account_today_steps: int = 0
+    total_today_steps: int = 0
+    steps_scope_label: str = "全机"
+    max_abnormal_recent10: int = 0
+    worst_recent10_hit_ratio: Optional[float] = None
 
 
 def default_antigravity_paths() -> Dict[str, Path]:
@@ -315,6 +332,8 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "daemon_dir": home / ".gemini" / "antigravity" / "daemon",
         "ls_log_path": appdata / "Antigravity" / "logs" / "language_server.log",
         "cockpit_quota_db": home / ".antigravity_cockpit" / "platform-quota-history-v1.sqlite",
+        "cockpit_logs_dir": home / ".antigravity_cockpit" / "logs",
+        "ledger_path": Path(__file__).resolve().parent.parent / "account_ledger.json",
     }
 
 
@@ -322,12 +341,14 @@ def classify_steps(
     raw_steps: List[Dict[str, Any]],
     idle_rewarm_sec: int = 180,
     min_cacheable_tokens: int = 32000,
+    account_switches: Optional[List[float]] = None,
 ) -> List[StepRecord]:
     """Classify consecutive PLANNER_RESPONSE steps, filtering normal zero-cache causes."""
     classified: List[StepRecord] = []
     prev_ts: Optional[float] = None
     prev_model: Optional[str] = None
     prev_total: Optional[int] = None
+    switches = sorted(account_switches) if account_switches else []
 
     for idx, item in enumerate(raw_steps):
         inp = max(0, int(item.get("input_tokens", 0) or 0))
@@ -342,10 +363,19 @@ def classify_steps(
         step_idx = int(raw_si) if raw_si is not None else idx
         hit_rate = (cr / total) * 100.0
 
+        crossed_switch = False
+        if prev_ts is not None and ts > prev_ts and switches:
+            for sw_ts in switches:
+                if prev_ts < sw_ts <= ts + 2.0:
+                    crossed_switch = True
+                    break
+
         if cr > 0:
             cls, reason = "hit", "cached"
         elif prev_ts is None:
             cls, reason = "expected_cold", "first_turn"
+        elif crossed_switch:
+            cls, reason = "expected_cold", "account_switch"
         elif ts > 0 and prev_ts > 0 and (ts - prev_ts) > idle_rewarm_sec:
             cls, reason = "expected_cold", "idle_rewarm"
         elif prev_model and model and model.lower() != prev_model.lower():
@@ -559,10 +589,19 @@ class AntigravityMonitorEngine:
         self.daemon_dir = Path(base_paths["daemon_dir"])
         self.ls_log_path = Path(base_paths["ls_log_path"])
         self.cockpit_quota_db = Path(base_paths["cockpit_quota_db"])
+        cockpit_logs_dir = base_paths.get("cockpit_logs_dir")
+        ledger_path = base_paths.get("ledger_path")
+        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir,
+        # avoid reading the host's real Cockpit logs or polluting the real local ledger file.
+        if paths and "ledger_path" not in paths:
+            ledger_path = None
+        if paths and "cockpit_logs_dir" not in paths:
+            cockpit_logs_dir = None
 
         self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]]]] = {}
-        self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=12, tail_rows=12)
+        self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=12, tail_rows=16)
         self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=200)
+        self._ledger = AccountSwitchLedger(ledger_path=ledger_path, cockpit_logs_dir=cockpit_logs_dir)
         self._account_cache: AccountQuotaInfo = AccountQuotaInfo()
         self._active_hub_pid: int = 0
         self._last_account_poll: float = 0.0
@@ -577,15 +616,29 @@ class AntigravityMonitorEngine:
         now = now_ts if now_ts is not None else time.time()
         self._log_tailer.poll(now)
 
+        # Poll account liveness first so switch ledger & per-account step attribution stay up-to-date
+        hub_dropped = self._account_cache.online and self._active_hub_pid > 0 and not _is_windows_pid_alive(self._active_hub_pid)
+        account_interval = 15.0 if self._account_cache.online else 5.0
+        if force_account or hub_dropped or (now - self._last_account_poll >= account_interval):
+            self._account_cache = self._poll_account_and_quota(now, self._last_quota_family)
+            self._last_account_poll = now
+            if self._account_cache.online and self._account_cache.short_label:
+                self._ledger.observe_online(self._account_cache.short_label, now)
+
         today_start = datetime.datetime.fromtimestamp(now).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
         lookback_cutoff = min(today_start - 3600, now - 24 * 3600)
 
+        timeline = self._ledger.get_timeline(today_start)
+        switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
+        cur_acct_label = self._account_cache.short_label if self._account_cache.online else ""
+
         # Scan all today-touched transcripts without truncating at 40 so swarm runs never undercount
         all_recent = self._iter_recent_transcripts(lookback_cutoff, today_start)
         convs: List[ConversationSummary] = []
-        today_steps = 0
+        total_today_steps = 0
+        account_today_steps = 0
 
         for idx_conv, (conv_id, tp) in enumerate(all_recent):
             raw_steps = self._read_transcript_cached(conv_id, tp)
@@ -593,8 +646,13 @@ class AntigravityMonitorEngine:
                 continue
 
             for s in raw_steps:
-                if float(s.get("timestamp", 0.0) or 0.0) >= today_start:
-                    today_steps += 1
+                sts = float(s.get("timestamp", 0.0) or 0.0)
+                if sts >= today_start:
+                    total_today_steps += 1
+                    if cur_acct_label:
+                        owner = self._ledger.attribute_timestamp(sts, timeline, fallback_label=cur_acct_label)
+                        if owner.lower() == cur_acct_label.lower():
+                            account_today_steps += 1
 
             # Only build full ConversationSummary for the top 16 most recently updated conversations
             if idx_conv >= 16:
@@ -603,6 +661,7 @@ class AntigravityMonitorEngine:
             steps = classify_steps(
                 raw_steps,
                 idle_rewarm_sec=self.config["idle_rewarm_sec"],
+                account_switches=switch_timestamps,
             )
             if not steps:
                 continue
@@ -620,6 +679,12 @@ class AntigravityMonitorEngine:
                     break
             single_miss = consec_miss == 1
             wasted_cold = sum(s.input_tokens for s in recent10 if s.classification == "abnormal_miss")
+            abnormal_steps_r10 = [s for s in recent10 if s.classification == "abnormal_miss"]
+            abnormal_r10 = len(abnormal_steps_r10)
+            hits_r10 = sum(1 for s in recent10 if s.classification == "hit")
+            cacheable_r10 = abnormal_r10 + hits_r10
+            hit_ratio_r10 = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
+            first_abn_step_r10 = abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0
 
             fresh_rem: Optional[int] = None
             fresh_invalid = ""
@@ -650,6 +715,10 @@ class AntigravityMonitorEngine:
                     wasted_cold_tokens=wasted_cold,
                     freshness_remaining_sec=fresh_rem,
                     freshness_invalid_reason=fresh_invalid,
+                    abnormal_in_recent10=abnormal_r10,
+                    cacheable_in_recent10=cacheable_r10,
+                    recent10_hit_ratio=hit_ratio_r10,
+                    first_abnormal_step_in_recent10=first_abn_step_r10,
                 )
             )
 
@@ -658,23 +727,38 @@ class AntigravityMonitorEngine:
 
         for c in top_convs:
             snap: Optional[ConversationDbSnapshot] = self._db_reader.read(c.conversation_id)
-            if snap and snap.latest:
-                gen = snap.latest
-                c.ttft_sec = gen.ttft_sec
-                c.streaming_sec = gen.streaming_sec
-                c.tps = gen.tps
-                c.max_context_tokens = snap.max_context_tokens
-                c.shard_tag = gen.shard_tag
-                c.speed_status = self._classify_speed(gen.output_tokens, gen.tps, gen.ttft_sec, c.context_tokens)
+            if snap:
+                valid_gens = [g for g in snap.recent if g.total_in > 0 or g.output_tokens > 0][-10:]
+                c.recent_ttfts = [g.ttft_sec for g in valid_gens]
+                c.recent_tps_list = [g.tps for g in valid_gens]
+                valid_ttfts = [t for t in c.recent_ttfts if t is not None]
+                if valid_ttfts:
+                    c.ttft_avg_sec = sum(valid_ttfts) / len(valid_ttfts)
+                    c.ttft_max_sec = max(valid_ttfts)
+                if snap.latest:
+                    gen = snap.latest
+                    c.ttft_sec = gen.ttft_sec
+                    c.streaming_sec = gen.streaming_sec
+                    c.tps = gen.tps
+                    c.max_context_tokens = snap.max_context_tokens
+                    c.shard_tag = gen.shard_tag
+                    c.speed_status = self._classify_speed(gen.output_tokens, gen.tps, gen.ttft_sec, c.context_tokens)
 
         primary = top_convs[0] if top_convs else None
         active_family = "3p" if (primary and any(k in primary.model_raw.lower() for k in ("claude", "fable", "opus", "sonnet", "gpt"))) else "gemini"
-        hub_dropped = self._account_cache.online and self._active_hub_pid > 0 and not _is_windows_pid_alive(self._active_hub_pid)
-        account_interval = 15.0 if self._account_cache.online else 5.0
-        if force_account or hub_dropped or active_family != self._last_quota_family or (now - self._last_account_poll >= account_interval):
+        if active_family != self._last_quota_family:
             self._account_cache = self._poll_account_and_quota(now, active_family)
             self._last_account_poll = now
             self._last_quota_family = active_family
+            if self._account_cache.online and self._account_cache.short_label:
+                self._ledger.observe_online(self._account_cache.short_label, now)
+
+        if cur_acct_label:
+            steps_scope_label = cur_acct_label
+            today_steps = account_today_steps
+        else:
+            steps_scope_label = "全机"
+            today_steps = total_today_steps
 
         # Large-context freshness candidates (include invalid cr=0 large conversations so UI never hides them)
         large_freshness = [
@@ -717,6 +801,24 @@ class AntigravityMonitorEngine:
         any_single_miss = any(c.single_miss for c in recent_active)
         any_slow = any(c.speed_status == "slow" for c in recent_active[:2])
         wasted_total = sum(c.wasted_cold_tokens for c in recent_active)
+        max_abnormal_r10 = max((c.abnormal_in_recent10 for c in recent_active), default=0)
+        # Prevent intermittent T1 accounts (e.g. 8/10 misses + 1 lucky hit) from washing back to T0 green
+        severe_frequent_miss_conv = next(
+            (
+                c
+                for c in recent_active
+                if c.abnormal_in_recent10 >= 4
+                and c.cacheable_in_recent10 >= 4
+                and (c.recent10_hit_ratio is not None and c.recent10_hit_ratio < 0.5)
+            ),
+            None,
+        )
+        unstable_recovery_conv = next(
+            (c for c in recent_active if c.abnormal_in_recent10 >= 2),
+            None,
+        )
+        ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
+        worst_hit_ratio = min(ratios) if ratios else None
 
         level, grade, headline, sub_headline = self._evaluate_health(
             active_model=active_model,
@@ -729,6 +831,8 @@ class AntigravityMonitorEngine:
             primary=primary,
             is_online=self._account_cache.online,
             has_live_transcript=has_live_transcript,
+            severe_frequent_miss_conv=severe_frequent_miss_conv,
+            unstable_recovery_conv=unstable_recovery_conv,
         )
 
         alerts = self._collect_new_alerts(
@@ -737,8 +841,14 @@ class AntigravityMonitorEngine:
             recent_active=recent_active,
             max_consec_miss=max_consec_miss,
             today_steps=today_steps,
+            steps_scope_label=steps_scope_label,
             is_online=self._account_cache.online,
+            severe_frequent_miss_conv=severe_frequent_miss_conv,
         )
+
+        primary_ttft_avg = primary.ttft_avg_sec if primary else None
+        primary_ttft_max = primary.ttft_max_sec if primary else None
+        primary_recent_ttfts = list(primary.recent_ttfts) if primary else []
 
         return MonitorSnapshot(
             generated_at=now,
@@ -776,6 +886,14 @@ class AntigravityMonitorEngine:
             sliding_window_min=self.config["log_sliding_window_min"],
             freshness_window_sec=self.config["freshness_window_sec"],
             alerts=alerts,
+            primary_ttft_avg=primary_ttft_avg,
+            primary_ttft_max=primary_ttft_max,
+            primary_recent_ttfts=primary_recent_ttfts,
+            account_today_steps=account_today_steps,
+            total_today_steps=total_today_steps,
+            steps_scope_label=steps_scope_label,
+            max_abnormal_recent10=max_abnormal_r10,
+            worst_recent10_hit_ratio=worst_hit_ratio,
         )
 
     def _classify_speed(
@@ -805,6 +923,8 @@ class AntigravityMonitorEngine:
         primary: Optional[ConversationSummary],
         is_online: bool = True,
         has_live_transcript: bool = True,
+        severe_frequent_miss_conv: Optional[ConversationSummary] = None,
+        unstable_recovery_conv: Optional[ConversationSummary] = None,
     ) -> Tuple[str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
@@ -833,6 +953,14 @@ class AntigravityMonitorEngine:
                 f"T1 连续掉缓存 · {active_model}",
                 f"主活跃会话已连续 {max_consec_miss} 步 cr=0，建议检查账号或切回主力号",
             )
+        if severe_frequent_miss_conv is not None:
+            pct = int(round((severe_frequent_miss_conv.recent10_hit_ratio or 0.0) * 100))
+            return (
+                "red",
+                "T1",
+                f"T1 频繁掉缓存 · {active_model}",
+                f"近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
+            )
         if today_steps >= self.config["daily_steps_alert"]:
             return (
                 "red",
@@ -840,10 +968,12 @@ class AntigravityMonitorEngine:
                 f"步数超红线 · {active_model}",
                 f"今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
             )
-        if any_single_miss or eff_503 == 1 or any_slow or today_steps >= self.config["daily_steps_warn"]:
+        if any_single_miss or unstable_recovery_conv is not None or eff_503 == 1 or any_slow or today_steps >= self.config["daily_steps_warn"]:
             reasons = []
             if any_single_miss:
                 reasons.append("单步异常归零")
+            elif unstable_recovery_conv is not None:
+                reasons.append(f"近10步 {unstable_recovery_conv.abnormal_in_recent10} 次掉缓存(观察恢复中)")
             if any_slow:
                 reasons.append("疑似暗限速")
             if eff_503 == 1:
@@ -869,7 +999,9 @@ class AntigravityMonitorEngine:
         recent_active: List[ConversationSummary],
         max_consec_miss: int,
         today_steps: int,
+        steps_scope_label: str = "全机",
         is_online: bool = True,
+        severe_frequent_miss_conv: Optional[ConversationSummary] = None,
     ) -> List[Tuple[str, str, str]]:
         if grade == "IDLE" or (not is_online and not recent_active):
             self._baseline_ready = True
@@ -884,17 +1016,28 @@ class AntigravityMonitorEngine:
                 if ev.category in ("503", "timeout"):
                     candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
         elif grade == "T1":
-            # Deduplicate per contiguous cr=0 streak start so repeated consecutive misses notify only once
+            # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
             offending = next((c for c in recent_active if c.consec_miss >= 2), None)
             if offending is not None:
                 key = f"t1:{offending.conversation_id}:{offending.consec_miss_start_step}"
                 candidates.append(
                     (key, "Antigravity 疑似 T1 掉缓存", f"{offending.short_id} ({offending.model}) 已连续 {max_consec_miss} 步 cr=0")
                 )
+            elif severe_frequent_miss_conv is not None:
+                c = severe_frequent_miss_conv
+                pct = int(round((c.recent10_hit_ratio or 0.0) * 100))
+                key = f"t1freq:{c.conversation_id}:{c.first_abnormal_step_in_recent10}"
+                candidates.append(
+                    (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
+                )
         elif today_steps >= self.config["daily_steps_alert"]:
             day = datetime.date.today().isoformat()
             candidates.append(
-                (f"steps:{day}:{self.config['daily_steps_alert']}", "Antigravity 今日步数红线", f"今日已达 {today_steps} 步，注意控频护号")
+                (
+                    f"steps:{day}:{steps_scope_label}:{self.config['daily_steps_alert']}",
+                    f"Antigravity 今日步数红线 ({steps_scope_label})",
+                    f"{steps_scope_label} 今日已达 {today_steps} 步，注意控频护号",
+                )
             )
 
         if not self._baseline_ready:
@@ -1128,15 +1271,20 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
     hit_str = f"{snap.primary_hit_rate:.1f}%" if snap.primary_hit_rate is not None else "—"
     tps_str = f"{snap.primary_tps:.1f} tok/s" if snap.primary_tps is not None else "—"
     ttft_str = f"{snap.primary_ttft:.1f}s" if snap.primary_ttft is not None else "—"
+    if snap.primary_ttft_avg is not None and snap.primary_ttft_max is not None:
+        ttft_str += f" (近10步均 {snap.primary_ttft_avg:.1f}s / 峰 {snap.primary_ttft_max:.1f}s)"
     acc_5h = f"{snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "—"
     acc_wk = f"{snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "—"
+    steps_str = f"{snap.steps_scope_label} {snap.today_steps}/{snap.daily_steps_alert}"
+    if snap.total_today_steps > snap.today_steps:
+        steps_str += f" (全机 {snap.total_today_steps})"
 
     lines = [
         f"Antigravity 实时体检摘要 ({ts_str})",
         f"健康评级: [{snap.grade}] {snap.headline}",
         f"状态说明: {snap.sub_headline}",
         f"当前账号: {snap.account.short_label} | 5h 额度 {acc_5h} | 周额度 {acc_wk}",
-        f"实时性能: 缓存 {hit_str} | 吞吐 {tps_str} | TTFT {ttft_str} | 今日步数 {snap.today_steps}/{snap.daily_steps_alert}",
+        f"实时性能: 缓存 {hit_str} | 吞吐 {tps_str} | TTFT {ttft_str} | 今日步数 {steps_str}",
         f"底层日志 (近 {snap.sliding_window_min}m / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
     ]
     if snap.active_conversations:
@@ -1144,10 +1292,13 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         for c in snap.active_conversations:
             bar = "".join("█" if s.classification == "hit" else ("▒" if s.classification == "expected_cold" else "×") for s in c.recent_steps)
             sp = f" {c.tps:.0f}t/s" if c.tps is not None else ""
+            tf = f" TTFT {c.ttft_sec:.1f}s" if c.ttft_sec is not None else ""
+            if c.ttft_avg_sec is not None and c.ttft_max_sec is not None and len([x for x in c.recent_ttfts if x is not None]) >= 2:
+                tf += f"(均{c.ttft_avg_sec:.0f}/峰{c.ttft_max_sec:.0f}s)"
             lines.append(
-                f"  - {c.short_id} {c.model} {format_tokens(c.context_tokens)} [{bar}] {c.latest_hit_rate:.1f}%{sp}"
+                f"  - {c.short_id} {c.model} {format_tokens(c.context_tokens)} [{bar}] {c.latest_hit_rate:.1f}%{tf}{sp}"
             )
-    if snap.wasted_cold_tokens_total > 0 and snap.max_consec_miss >= 1:
+    if snap.wasted_cold_tokens_total > 0 and (snap.max_consec_miss >= 1 or snap.max_abnormal_recent10 >= 2):
         lines.append(f"冷算提醒: 近 10 步异常归零累计多耗约 {format_tokens(snap.wasted_cold_tokens_total)} Token")
     return mask_email("\n".join(lines))
 

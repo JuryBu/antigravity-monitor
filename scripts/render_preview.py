@@ -91,6 +91,10 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         tps=27.8,
         shard_tag="dm01",
         speed_status="slow",
+        recent_ttfts=[11.2, 14.5, 18.0, 22.4, 29.1, 33.8, 38.9],
+        recent_tps_list=[165.0, 152.0, 128.0, 82.0, 48.0, 34.0, 27.8],
+        ttft_avg_sec=24.0,
+        ttft_max_sec=38.9,
     )
     c2 = ConversationSummary(
         conversation_id="demo0002-0000-0000-0000-000000000002",
@@ -115,6 +119,10 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         tps=195.0,
         shard_tag="dm02",
         speed_status="ok",
+        recent_ttfts=[4.8, 5.5, 6.1, 4.9, 5.2],
+        recent_tps_list=[188.0, 192.0, 184.0, 198.0, 195.0],
+        ttft_avg_sec=5.3,
+        ttft_max_sec=6.1,
     )
     return MonitorSnapshot(
         generated_at=now,
@@ -159,6 +167,12 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         ),
         sliding_window_min=30,
         freshness_window_sec=210,
+        primary_ttft_avg=24.0,
+        primary_ttft_max=38.9,
+        primary_recent_ttfts=[11.2, 14.5, 18.0, 22.4, 29.1, 33.8, 38.9],
+        account_today_steps=86,
+        total_today_steps=312,
+        steps_scope_label="de***o",
     )
 
 

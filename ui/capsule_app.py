@@ -148,6 +148,9 @@ class AntigravityCapsuleApp:
         self._var_notifications = tk.BooleanVar(value=bool(self.config["notifications_enabled"]))
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
 
+        self._tooltip_win: Optional[tk.Toplevel] = None
+        self._conv_hover_texts: List[str] = ["", "", "", ""]
+
         self._build_collapsed_bar()
         self._build_expanded_panel()
         self._build_context_menu()
@@ -286,11 +289,13 @@ class AntigravityCapsuleApp:
         self._lbl_ttft = tk.Label(sp_top, text="TTFT —", font=(MONO_FONT, 8))
         self._lbl_ttft.pack(side="right")
         sp_bot = tk.Frame(self._card_speed)
-        sp_bot.pack(fill="x", pady=(5, 0))
+        sp_bot.pack(fill="x", pady=(4, 0))
         self._lbl_tps_big = tk.Label(sp_bot, text="— tok/s", font=(MONO_FONT, 12, "bold"))
         self._lbl_tps_big.pack(side="left")
         self._lbl_speed_badge = tk.Label(sp_bot, text="待采样", font=(UI_FONT, 8, "bold"), padx=6, pady=1)
         self._lbl_speed_badge.pack(side="right")
+        self._lbl_ttft_stats = tk.Label(self._card_speed, text="近10步 TTFT 待采样", font=(MONO_FONT, 8), anchor="w")
+        self._lbl_ttft_stats.pack(fill="x", pady=(3, 0))
 
         self._card_fresh = tk.Frame(self._mid_row, padx=10, pady=8, highlightthickness=1)
         self._card_fresh.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
@@ -299,18 +304,18 @@ class AntigravityCapsuleApp:
         self._lbl_fresh_title = tk.Label(fr_top, text="大上下文保鲜 (≥100K)", font=(UI_FONT, 8))
         self._lbl_fresh_title.pack(side="left")
         self._lbl_fresh_sub = tk.Label(self._card_fresh, text="当前无活跃大对话", font=(MONO_FONT, 8), anchor="w")
-        self._lbl_fresh_sub.pack(fill="x", pady=(3, 0))
+        self._lbl_fresh_sub.pack(fill="x", pady=(4, 0))
         self._lbl_fresh_big = tk.Label(self._card_fresh, text="闲置", font=(MONO_FONT, 11, "bold"), anchor="w")
-        self._lbl_fresh_big.pack(fill="x", pady=(1, 0))
+        self._lbl_fresh_big.pack(fill="x", pady=(2, 0))
 
-        # --- Module 3: Active Conversations 10-Step Micro-Bar Chart (DPI-safe grid layout) ---
+        # --- Module 3: Active Conversations 10-Step TTFT + Cache Micro-Bars (DPI-safe grid layout) ---
         self._card_convs = tk.Frame(self._details, padx=10, pady=8, highlightthickness=1)
         self._card_convs.pack(fill="x", pady=(0, 8))
         conv_hdr = tk.Frame(self._card_convs)
         conv_hdr.pack(fill="x", pady=(0, 6))
-        self._lbl_convs_title = tk.Label(conv_hdr, text="活跃对话实时缓存（近 10 步）", font=(UI_FONT, 9, "bold"))
+        self._lbl_convs_title = tk.Label(conv_hdr, text="活跃对话 · 首字 TTFT 与缓存（近 10 步）", font=(UI_FONT, 9, "bold"))
         self._lbl_convs_title.pack(side="left")
-        self._lbl_convs_legend = tk.Label(conv_hdr, text="绿命中  橙重热  红掉缓存", font=(UI_FONT, 8))
+        self._lbl_convs_legend = tk.Label(conv_hdr, text="悬停看逐拍明细 │ 绿良 橙警 红异常", font=(UI_FONT, 8))
         self._lbl_convs_legend.pack(side="right")
 
         self._convs_table = tk.Frame(self._card_convs)
@@ -321,16 +326,23 @@ class AntigravityCapsuleApp:
         for r_idx in range(4):
             lbl_id = tk.Label(self._convs_table, text="", font=(MONO_FONT, 9, "bold"), anchor="w", width=7)
             lbl_mod = tk.Label(self._convs_table, text="", font=(UI_FONT, 8), anchor="w")
-            lbl_ctx = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8), anchor="e", width=7)
-            bar_cv = tk.Canvas(self._convs_table, width=108, height=16, highlightthickness=0, bd=0)
+            lbl_ctx = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8), anchor="e", width=6)
+            ttft_cv = tk.Canvas(self._convs_table, width=68, height=16, highlightthickness=0, bd=0)
+            lbl_ttft = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8), anchor="e", width=6)
+            bar_cv = tk.Canvas(self._convs_table, width=98, height=16, highlightthickness=0, bd=0)
             lbl_hit = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8, "bold"), anchor="e", width=6)
             lbl_spd = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8), anchor="e", width=7)
+            for hover_w in (lbl_id, lbl_mod, lbl_ctx, ttft_cv, lbl_ttft, bar_cv, lbl_hit, lbl_spd):
+                hover_w.bind("<Enter>", lambda e, idx=r_idx: self._show_conv_tooltip(idx, e))
+                hover_w.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
             self._conv_rows.append(
                 {
                     "row": r_idx,
                     "id": lbl_id,
                     "model": lbl_mod,
                     "ctx": lbl_ctx,
+                    "ttft_canvas": ttft_cv,
+                    "ttft_val": lbl_ttft,
                     "canvas": bar_cv,
                     "hit": lbl_hit,
                     "speed": lbl_spd,
@@ -475,6 +487,7 @@ class AntigravityCapsuleApp:
         self._lbl_ttft.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_tps_big.configure(bg=t["card_bg"], fg=t["text_primary"])
         self._lbl_speed_badge.configure(bg=t["green_bg"], fg=t["green"])
+        self._lbl_ttft_stats.configure(bg=t["card_bg"], fg=t["text_muted"])
 
         self._lbl_fresh_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_fresh_sub.configure(bg=t["card_bg"], fg=t["text_secondary"])
@@ -488,6 +501,8 @@ class AntigravityCapsuleApp:
             row_ui["id"].configure(bg=t["card_bg"], fg=t["text_primary"])
             row_ui["model"].configure(bg=t["card_bg"], fg=t["text_secondary"])
             row_ui["ctx"].configure(bg=t["card_bg"], fg=t["text_secondary"])
+            row_ui["ttft_canvas"].configure(bg=t["card_bg"])
+            row_ui["ttft_val"].configure(bg=t["card_bg"], fg=t["text_secondary"])
             row_ui["canvas"].configure(bg=t["card_bg"])
             row_ui["hit"].configure(bg=t["card_bg"])
             row_ui["speed"].configure(bg=t["card_bg"])
@@ -827,14 +842,20 @@ class AntigravityCapsuleApp:
         )
 
         pct = min(100, int(round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100)))
-        self._lbl_steps_val.configure(text=f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%)", fg=step_color)
+        self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label})")
+        if snap.total_today_steps > snap.today_steps:
+            steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {snap.total_today_steps}"
+        else:
+            steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%)"
+        self._lbl_steps_val.configure(text=steps_val_txt, fg=step_color)
         self._last_steps_pct = pct
         self._last_steps_color = step_color if step_color != t["text_secondary"] else t["green"]
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
 
         # Module 2: Speed & Freshness
         ttft_txt = f"TTFT {snap.primary_ttft:.1f}s" if snap.primary_ttft is not None else "TTFT —"
-        self._lbl_ttft.configure(text=ttft_txt, fg=t["orange"] if (snap.primary_ttft or 0) >= 45 else t["text_secondary"])
+        ttft_col = t["red"] if (snap.primary_ttft or 0) >= 90 else (t["orange"] if (snap.primary_ttft or 0) >= 45 else t["text_secondary"])
+        self._lbl_ttft.configure(text=ttft_txt, fg=ttft_col)
         if snap.primary_tps is not None:
             self._lbl_tps_big.configure(text=f"{snap.primary_tps:.1f} tok/s", fg=t["orange"] if snap.primary_speed_status == "slow" else t["text_primary"])
         else:
@@ -846,6 +867,15 @@ class AntigravityCapsuleApp:
             self._lbl_speed_badge.configure(text="满速正常", bg=t["green_bg"], fg=t["green"])
         else:
             self._lbl_speed_badge.configure(text="待采样", bg=t["card_alt_bg"], fg=t["text_muted"])
+
+        if snap.primary_ttft_avg is not None and snap.primary_ttft_max is not None:
+            stat_col = t["red"] if snap.primary_ttft_max >= 90 else (t["orange"] if snap.primary_ttft_max >= 45 else t["text_secondary"])
+            self._lbl_ttft_stats.configure(
+                text=f"近10步 TTFT 均 {snap.primary_ttft_avg:.1f}s · 峰 {snap.primary_ttft_max:.1f}s",
+                fg=stat_col,
+            )
+        else:
+            self._lbl_ttft_stats.configure(text="近10步 TTFT 待采样", fg=t["text_muted"])
 
         if snap.min_freshness_invalid_reason:
             self._lbl_fresh_sub.configure(text=f"{snap.min_freshness_conv} · {format_tokens(snap.min_freshness_ctx)}（缓存诊断）")
@@ -881,7 +911,7 @@ class AntigravityCapsuleApp:
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1, offline_muted=True)
             self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999, offline_muted=True)
 
-        if snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and snap.max_consec_miss >= 2:
+        if snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (snap.max_consec_miss >= 2 or snap.max_abnormal_recent10 >= 4):
             self._banner_frame.configure(bg=t["alert_banner_bg"], highlightbackground=t["alert_banner_border"])
             self._lbl_banner.configure(
                 bg=t["alert_banner_bg"],
@@ -930,28 +960,127 @@ class AntigravityCapsuleApp:
         if fill_w > 0:
             c.create_rectangle(0, 1, fill_w, h - 1, fill=fill_color, outline="")
 
+    def _ttft_color(self, sec: Optional[float]) -> str:
+        t = self.theme
+        if sec is None:
+            return t["text_muted"]
+        if sec >= 90.0:
+            return t["red"]
+        if sec >= 45.0:
+            return t["orange"]
+        if sec >= 15.0:
+            return t["cyan"]
+        return t["green"]
+
+    def _build_conv_tooltip_text(self, conv: Any) -> str:
+        lines = [f"{conv.short_id} · {conv.model} · {format_tokens(conv.context_tokens)}"]
+        if conv.ttft_avg_sec is not None and conv.ttft_max_sec is not None:
+            cur_t = f"{conv.ttft_sec:.1f}s" if conv.ttft_sec is not None else "—"
+            lines.append(f"TTFT: 新 {cur_t}  │  均 {conv.ttft_avg_sec:.1f}s  │  峰 {conv.ttft_max_sec:.1f}s")
+        steps = conv.recent_steps[-10:]
+        ttfts = conv.recent_ttfts[-len(steps):] if conv.recent_ttfts else []
+        tpss = conv.recent_tps_list[-len(steps):] if conv.recent_tps_list else []
+        t_offset = len(steps) - len(ttfts)
+        s_offset = len(steps) - len(tpss)
+        reason_map = {
+            "cached": "命中",
+            "first_turn": "首轮",
+            "account_switch": "换号冷启",
+            "idle_rewarm": "闲置重热",
+            "model_switch": "切模型",
+            "compact_reset": "压缩重热",
+            "small_ctx": "小上下文",
+            "first_cacheable": "首次入窗",
+            "abnormal_zero": "掉缓存!",
+        }
+        lines.append("近 10 步逐拍明细（旧 → 新）:")
+        for idx, st in enumerate(steps, 1):
+            t_val = ttfts[idx - 1 - t_offset] if (idx - 1 - t_offset) >= 0 and (idx - 1 - t_offset) < len(ttfts) else None
+            p_val = tpss[idx - 1 - s_offset] if (idx - 1 - s_offset) >= 0 and (idx - 1 - s_offset) < len(tpss) else None
+            t_str = f"{t_val:5.1f}s" if t_val is not None else "    — "
+            p_str = f"{p_val:3.0f}t/s" if p_val is not None else "   — "
+            tag = reason_map.get(st.reason, st.reason)
+            lines.append(f"  #{idx:<2} 缓存 {st.hit_rate:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
+        return "\n".join(lines)
+
+    def _show_conv_tooltip(self, row_idx: int, event: tk.Event) -> None:
+        if self._closing or row_idx < 0 or row_idx >= len(self._conv_hover_texts):
+            return
+        text = self._conv_hover_texts[row_idx]
+        if not text:
+            return
+        self._hide_conv_tooltip()
+        t = self.theme
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.attributes("-alpha", 0.96)
+            win.configure(bg=t["border"])
+            inner = tk.Frame(win, bg=t["panel_bg"], padx=9, pady=7)
+            inner.pack(fill="both", expand=True, padx=1, pady=1)
+            lbl = tk.Label(
+                inner,
+                text=text,
+                font=(MONO_FONT, 8),
+                bg=t["panel_bg"],
+                fg=t["text_primary"],
+                justify="left",
+                anchor="w",
+            )
+            lbl.pack()
+            win.update_idletasks()
+            tw, th = win.winfo_reqwidth(), win.winfo_reqheight()
+            vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
+            px = min(vr - tw - 8, max(vx + 8, event.x_root + 14))
+            py = event.y_root + 16
+            if py + th > vb - 44:
+                py = max(vy + 8, event.y_root - th - 12)
+            win.geometry(f"+{px}+{py}")
+            self._tooltip_win = win
+        except tk.TclError:
+            self._tooltip_win = None
+
+    def _hide_conv_tooltip(self) -> None:
+        if self._tooltip_win is not None:
+            try:
+                self._tooltip_win.destroy()
+            except tk.TclError:
+                pass
+            self._tooltip_win = None
+
     def _draw_conversation_bars(self, snap: MonitorSnapshot) -> None:
         t = self.theme
         convs = snap.active_conversations[:4]
+        all_keys = ("id", "model", "ctx", "ttft_canvas", "ttft_val", "canvas", "hit", "speed")
 
         if not convs:
+            self._conv_hover_texts = ["", "", "", ""]
             for row_ui in self._conv_rows:
-                for key in ("id", "model", "ctx", "canvas", "hit", "speed"):
+                for key in all_keys:
                     row_ui[key].grid_remove()
-            self._lbl_convs_empty.grid(row=0, column=0, columnspan=6, sticky="w", pady=4)
+            self._lbl_convs_empty.grid(row=0, column=0, columnspan=8, sticky="w", pady=4)
             return
 
         self._lbl_convs_empty.grid_remove()
         for idx, row_ui in enumerate(self._conv_rows):
             if idx >= len(convs):
-                for key in ("id", "model", "ctx", "canvas", "hit", "speed"):
+                self._conv_hover_texts[idx] = ""
+                for key in all_keys:
                     row_ui[key].grid_remove()
                 continue
 
             conv = convs[idx]
+            self._conv_hover_texts[idx] = self._build_conv_tooltip_text(conv)
             row_ui["id"].configure(text=conv.short_id, fg=t["text_primary"])
             row_ui["model"].configure(text=conv.model, fg=t["text_secondary"])
             row_ui["ctx"].configure(text=format_tokens(conv.context_tokens), fg=t["text_secondary"])
+
+            if conv.ttft_sec is not None:
+                ttft_txt = f"{conv.ttft_sec:.0f}s" if conv.ttft_sec >= 100 else f"{conv.ttft_sec:.1f}s"
+            else:
+                ttft_txt = "—"
+            row_ui["ttft_val"].configure(text=ttft_txt, fg=self._ttft_color(conv.ttft_sec))
 
             latest_cls = conv.recent_steps[-1].classification if conv.recent_steps else ""
             if conv.latest_hit_rate >= 70:
@@ -966,16 +1095,38 @@ class AntigravityCapsuleApp:
             sp_col = t["orange"] if conv.speed_status == "slow" else t["cyan"]
             row_ui["speed"].configure(text=sp_txt, fg=sp_col)
 
-            row_ui["id"].grid(row=idx, column=0, sticky="w", padx=(0, 6), pady=3)
-            row_ui["model"].grid(row=idx, column=1, sticky="w", padx=(0, 8), pady=3)
-            row_ui["ctx"].grid(row=idx, column=2, sticky="e", padx=(0, 10), pady=3)
-            row_ui["canvas"].grid(row=idx, column=3, sticky="e", padx=(0, 10), pady=3)
-            row_ui["hit"].grid(row=idx, column=4, sticky="e", padx=(0, 8), pady=3)
-            row_ui["speed"].grid(row=idx, column=5, sticky="e", pady=3)
+            row_ui["id"].grid(row=idx, column=0, sticky="w", padx=(0, 5), pady=3)
+            row_ui["model"].grid(row=idx, column=1, sticky="w", padx=(0, 6), pady=3)
+            row_ui["ctx"].grid(row=idx, column=2, sticky="e", padx=(0, 8), pady=3)
+            row_ui["ttft_canvas"].grid(row=idx, column=3, sticky="e", padx=(0, 4), pady=3)
+            row_ui["ttft_val"].grid(row=idx, column=4, sticky="e", padx=(0, 8), pady=3)
+            row_ui["canvas"].grid(row=idx, column=5, sticky="e", padx=(0, 7), pady=3)
+            row_ui["hit"].grid(row=idx, column=6, sticky="e", padx=(0, 6), pady=3)
+            row_ui["speed"].grid(row=idx, column=7, sticky="e", pady=3)
 
+            # Draw 10-step TTFT spark-bars (left-to-right oldest -> newest)
+            tc = row_ui["ttft_canvas"]
+            tc.delete("all")
+            tw, tgap = 5, 2
+            ttop, tbot = 1, 15
+            t_series = conv.recent_ttfts[-10:]
+            t_pad = 10 - len(t_series)
+            for slot in range(10):
+                x0 = slot * (tw + tgap)
+                x1 = x0 + tw
+                if slot < t_pad or t_series[slot - t_pad] is None:
+                    tc.create_rectangle(x0, tbot - 3, x1, tbot, fill=t["bar_dim"], outline="")
+                    continue
+                sec = float(t_series[slot - t_pad])
+                col = self._ttft_color(sec)
+                h_ratio = min(1.0, max(0.24, sec / 75.0))
+                top_y = tbot - int(round((tbot - ttop) * h_ratio))
+                tc.create_rectangle(x0, top_y, x1, tbot, fill=col, outline="")
+
+            # Draw 10-step Cache hit-rate micro-bars
             c = row_ui["canvas"]
             c.delete("all")
-            bar_w = 8
+            bar_w = 7
             bar_gap = 3
             bar_top = 1
             bar_bot = 15
@@ -1086,6 +1237,7 @@ class AntigravityCapsuleApp:
         if self._closing:
             return
         self._closing = True
+        self._hide_conv_tooltip()
         self._stop_event.set()
         self._force_poll_event.set()
 
