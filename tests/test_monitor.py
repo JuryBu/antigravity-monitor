@@ -1,0 +1,326 @@
+"""Comprehensive unit tests for Antigravity Monitor core engine, SQLite reader, config, and shortcuts."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from core.config_store import ConfigStore
+from core.log_monitor import (
+    AntigravityMonitorEngine,
+    LanguageServerLogTailer,
+    classify_steps,
+    format_text_summary,
+    mask_email,
+    short_email_label,
+)
+from core.sqlite_reader import ConversationDbReader, parse_gen_metadata_row
+from core.startup_manager import install_desktop_shortcut, is_startup_enabled, set_startup_enabled
+from ui.icon_builder import build_tray_icon
+
+
+def _varint(val: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = val & 0x7F
+        val >>= 7
+        if val:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _pb_varint_field(fn: int, val: int) -> bytes:
+    return _varint((fn << 3) | 0) + _varint(val)
+
+
+def _pb_bytes_field(fn: int, payload: bytes) -> bytes:
+    return _varint((fn << 3) | 2) + _varint(len(payload)) + payload
+
+
+def _build_fake_gen_blob(
+    uncached_in: int,
+    cached_in: int,
+    total_out: int,
+    ttft_s: int,
+    strm_s: int,
+    resp_id: str = "demo_resp_0001XYZ_stub",
+    max_ctx: int = 512000,
+) -> bytes:
+    usage = (
+        _pb_varint_field(2, uncached_in)
+        + _pb_varint_field(3, total_out)
+        + _pb_varint_field(5, cached_in)
+        + _pb_bytes_field(11, resp_id.encode("utf-8"))
+    )
+    ttft_pb = _pb_varint_field(1, ttft_s) + _pb_varint_field(2, 500_000_000)
+    strm_pb = _pb_varint_field(1, strm_s) + _pb_varint_field(2, 0)
+    m10 = _pb_varint_field(4, max_ctx)
+    m9 = _pb_bytes_field(10, m10)
+    m1 = (
+        _pb_bytes_field(4, usage)
+        + _pb_bytes_field(9, m9)
+        + _pb_bytes_field(11, ttft_pb)
+        + _pb_bytes_field(12, strm_pb)
+    )
+    return _pb_bytes_field(1, m1) + _pb_bytes_field(21, b"Gemini 4 Neon (XHigh)")
+
+
+class TestConfigStore(unittest.TestCase):
+    def test_atomic_save_and_sanitize(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            store = ConfigStore(p)
+            saved = store.save({"theme": "invalid", "poll_interval_ms": 100, "window_x": "-240", "topmost": False})
+            self.assertEqual(saved["theme"], "midnight_blue")
+            self.assertEqual(saved["poll_interval_ms"], 1000)
+            self.assertEqual(saved["window_x"], -240)
+            self.assertEqual(saved["window_alpha"], 0.95)
+            self.assertFalse(saved["topmost"])
+            reloaded = store.load()
+            self.assertEqual(reloaded, saved)
+            self.assertEqual(list(Path(td).glob("*.tmp*")), [])
+
+
+class TestSqliteReader(unittest.TestCase):
+    def test_protobuf_decode_and_lru_cache_invalidation(self) -> None:
+        blob1 = _build_fake_gen_blob(2000, 98000, 1000, ttft_s=6, strm_s=10)
+        parsed = parse_gen_metadata_row(7, blob1)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.uncached_in, 2000)
+        self.assertEqual(parsed.cached_in, 98000)
+        self.assertEqual(parsed.total_in, 100000)
+        self.assertAlmostEqual(parsed.ttft_sec or 0.0, 6.5, places=2)
+        self.assertAlmostEqual(parsed.tps or 0.0, 100.0, places=2)
+        self.assertEqual(parsed.max_context_tokens, 512000)
+        self.assertEqual(parsed.shard_tag, "01XY")
+
+        # Negative/overflow varint duration should safely return None instead of 1e19s
+        bad_dur_blob = _pb_bytes_field(1, _pb_bytes_field(11, _pb_varint_field(1, (1 << 64) - 1)))
+        bad_parsed = parse_gen_metadata_row(8, bad_dur_blob)
+        self.assertIsNotNone(bad_parsed)
+        assert bad_parsed is not None
+        self.assertIsNone(bad_parsed.ttft_sec)
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "demo_conv.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (1, blob1))
+            conn.commit()
+            conn.close()
+
+            reader = ConversationDbReader(Path(td), max_cache_entries=2)
+            s1 = reader.read("demo_conv")
+            s2 = reader.read("demo_conv")
+            self.assertIsNotNone(s1)
+            self.assertIs(s1, s2)
+
+            time.sleep(0.02)
+            blob2 = _build_fake_gen_blob(120000, 0, 500, ttft_s=48, strm_s=20)
+            conn = sqlite3.connect(db_path)
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (2, blob2))
+            conn.commit()
+            conn.close()
+
+            s3 = reader.read("demo_conv")
+            self.assertIsNotNone(s3)
+            assert s3 is not None and s3.latest is not None
+            self.assertEqual(s3.latest.idx, 2)
+            self.assertAlmostEqual(s3.latest.tps or 0.0, 25.0, places=2)
+
+
+class TestLogMonitorLogic(unittest.TestCase):
+    def test_mask_email_and_plain_username(self) -> None:
+        self.assertEqual(mask_email("User alice99@example.com failed"), "User al***9@example.com failed")
+        self.assertEqual(mask_email("ab@test.org"), "a***@test.org")
+        self.assertEqual(short_email_label("plainuser"), "pl***r")
+
+    def test_classify_steps_filters_normal_zeros_and_threshold_crossing(self) -> None:
+        base = 1_795_000_000.0
+        steps = [
+            {"step_index": 0, "timestamp": base, "model": "gemini-4-neon-xhigh", "input_tokens": 18000, "cache_read_tokens": 0},
+            # Crossing from <32K to >=32K for the first time -> first_cacheable (not abnormal!)
+            {"step_index": 1, "timestamp": base + 15, "model": "gemini-4-neon-xhigh", "input_tokens": 45000, "cache_read_tokens": 0},
+            {"step_index": 2, "timestamp": base + 30, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 45000},
+            # Idle > 180s -> idle_rewarm
+            {"step_index": 3, "timestamp": base + 260, "model": "gemini-4-neon-xhigh", "input_tokens": 55000, "cache_read_tokens": 0},
+            # Model switch -> model_switch
+            {"step_index": 4, "timestamp": base + 280, "model": "gemini-4-carbon-high", "input_tokens": 60000, "cache_read_tokens": 0},
+            # Compact drop > 25% -> compact_reset
+            {"step_index": 5, "timestamp": base + 295, "model": "gemini-4-carbon-high", "input_tokens": 35000, "cache_read_tokens": 0},
+            # Same model, short gap, >= 32K, cr=0 -> abnormal_miss #1 & #2
+            {"step_index": 6, "timestamp": base + 310, "model": "gemini-4-carbon-high", "input_tokens": 42000, "cache_read_tokens": 0},
+            {"step_index": 7, "timestamp": base + 325, "model": "gemini-4-carbon-high", "input_tokens": 46000, "cache_read_tokens": 0},
+        ]
+        res = classify_steps(steps, idle_rewarm_sec=180)
+        self.assertEqual(res[0].step_index, 0)
+        self.assertEqual([r.reason for r in res], [
+            "first_turn",
+            "first_cacheable",
+            "cached",
+            "idle_rewarm",
+            "model_switch",
+            "compact_reset",
+            "abnormal_zero",
+            "abnormal_zero",
+        ])
+        self.assertEqual([r.classification for r in res[-2:]], ["abnormal_miss", "abnormal_miss"])
+
+    def test_go_slash_dates_partial_lines_and_sliding_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_p = Path(td) / "language_server.log"
+            now = time.time()
+            # Two days ago at the EXACT same clock time (Go slash date format YYYY/MM/DD HH:MM:SS)
+            two_days_ago = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 2 * 86400))
+            old_today = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 3600))
+            rec_go = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 60))
+            log_p.write_text(
+                f"{two_days_ago} ERROR 403 TOS_VIOLATION old-account\n"
+                f"{old_today} ERROR 503 No capacity available\n"
+                f"{rec_go} WARN 127.0.0.1 TLS handshake error\n"
+                f"{rec_go} code_assist_client.go:464] AICode FetchConfig failed: context deadline exceeded\n"
+                f"{rec_go} [run.go:412] attempt 1 failed: EOF\n"
+                f"{rec_go} ERROR 503 No capacity partial-without-newline",
+                encoding="utf-8",
+            )
+            tailer = LanguageServerLogTailer(log_p)
+            tailer.poll(now_ts=now)
+            recent, today, notable = tailer.get_counts(now, window_min=30)
+            self.assertEqual(recent["403"], 0)   # 2-day-old Go slash date must NOT resurrect as today!
+            self.assertEqual(today["403"], 0)
+            self.assertEqual(recent["503"], 0)   # Partial line without '\n' held back; 1h-old 503 decayed
+            self.assertEqual(recent["timeout"], 0)
+            self.assertEqual(recent["retry"], 1)
+            self.assertEqual(notable, [])
+
+            # Complete the partial line with '\n' and confirm incremental pickup
+            with log_p.open("a", encoding="utf-8") as fh:
+                fh.write("\n")
+            tailer.poll(now_ts=now + 2)
+            recent_b, _, notable_b = tailer.get_counts(now + 2, window_min=30)
+            self.assertEqual(recent_b["503"], 1)
+            self.assertEqual(len(notable_b), 1)
+
+            # Simulate client restart truncating log file
+            log_p.write_text(f"{rec_go} ERROR stream idle timeout\n", encoding="utf-8")
+            tailer.poll(now_ts=now + 5)
+            recent2, _, _ = tailer.get_counts(now + 5, window_min=30)
+            self.assertEqual(recent2["timeout"], 1)
+            self.assertEqual(recent2["retry"], 0)
+
+    def test_end_to_end_t1_invalid_freshness_dedup_and_no_offline_cockpit_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "demo1234-5678" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            # Fake Cockpit legacy binding + quota DB to verify offline state NEVER leaks unrelated account quota
+            ck_dir = root / "cockpit"
+            ck_dir.mkdir()
+            (ck_dir / "antigravity_legacy_instances.json").write_text(
+                json.dumps({"defaults": {"bindAccountId": "other_acct"}}), encoding="utf-8"
+            )
+            qdb = ck_dir / "platform-quota-history-v1.sqlite"
+            qconn = sqlite3.connect(qdb)
+            qconn.execute("CREATE TABLE quota_observations (account_id TEXT, metric TEXT, remaining REAL, observed_at REAL)")
+            qconn.execute("INSERT INTO quota_observations VALUES ('other_acct', 'gemini-weekly', 88.0, ?)", (time.time(),))
+            qconn.commit()
+            qconn.close()
+
+            now = time.time()
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 40))
+            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 25))
+            t2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 10))
+            rows = [
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 1000},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": t1, "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 1000},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": t2, "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 1000},
+            ]
+            tp = brain / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            conn = sqlite3.connect(convs / "demo1234-5678.db")
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (1, _build_fake_gen_blob(120000, 0, 500, ttft_s=38, strm_s=20)))
+            conn.commit()
+            conn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": qdb,
+                }
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertEqual(snap.grade, "T1")
+            self.assertEqual(snap.level, "red")
+            self.assertEqual(snap.max_consec_miss, 2)
+            self.assertIsNone(snap.min_freshness_sec)
+            self.assertIn("无热缓存", snap.min_freshness_invalid_reason)
+            self.assertEqual(snap.primary_speed_status, "slow")
+            self.assertIsNone(snap.account.weekly_pct)  # Offline must not borrow other_acct quota
+            self.assertEqual(snap.alerts, [])  # First poll sets baseline
+
+            # Append another cr=0 in the same streak -> must NOT spam another T1 alert for the same streak
+            time.sleep(0.02)
+            t3 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 2))
+            rows.append({"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": t3, "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 1000})
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            snap2 = engine.poll(now_ts=now + 2)
+            self.assertEqual(snap2.max_consec_miss, 3)
+            self.assertEqual(snap2.alerts, [])
+
+            summary = format_text_summary(snap2)
+            self.assertIn("T1", summary)
+            self.assertIn("360.0K", summary)
+
+
+class TestShortcutsAndIcons(unittest.TestCase):
+    def test_startup_toggle_com_roundtrip_and_tray_icons(self) -> None:
+        app_root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as td:
+            desk = Path(td) / "桌面 测试"
+            startup = Path(td) / "Startup"
+            lnk = install_desktop_shortcut(app_root, desktop_dir=desk)
+            self.assertTrue(lnk.is_file())
+            # Verify via PowerShell COM that Arguments preserve full Unicode path cleanly
+            ps = (
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                f"$sc = (New-Object -ComObject WScript.Shell).CreateShortcut('{str(lnk)}'); "
+                "Write-Output $sc.Arguments"
+            )
+            res = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("启动反重力监控.vbs", res.stdout)
+
+            self.assertFalse(is_startup_enabled(startup_dir=startup))
+            self.assertTrue(set_startup_enabled(True, app_root, startup_dir=startup))
+            self.assertTrue(is_startup_enabled(startup_dir=startup))
+            self.assertFalse(set_startup_enabled(False, app_root, startup_dir=startup))
+            self.assertFalse(is_startup_enabled(startup_dir=startup))
+
+        base_png = app_root / "assets" / "app-icon.png"
+        for lvl in ("green", "orange", "red"):
+            im = build_tray_icon(base_png, level=lvl, size=64)
+            self.assertEqual(im.size, (64, 64))
+            self.assertEqual(im.mode, "RGBA")
+
+
+if __name__ == "__main__":
+    unittest.main()
