@@ -14,8 +14,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "freshness_window_sec": 210,
     "idle_rewarm_sec": 180,
     "large_context_threshold": 100000,
-    "daily_steps_warn": 800,
-    "daily_steps_alert": 1000,
+    "daily_steps_warn": 960,
+    "daily_steps_alert": 1200,
     "log_sliding_window_min": 30,
     "slow_tps_threshold": 40.0,
     "slow_ttft_threshold_sec": 45.0,
@@ -60,8 +60,8 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
     cfg["freshness_window_sec"] = _clamp_int(raw.get("freshness_window_sec"), 210, 60, 900)
     cfg["idle_rewarm_sec"] = _clamp_int(raw.get("idle_rewarm_sec"), 180, 60, 900)
     cfg["large_context_threshold"] = _clamp_int(raw.get("large_context_threshold"), 100000, 16000, 1000000)
-    cfg["daily_steps_warn"] = _clamp_int(raw.get("daily_steps_warn"), 800, 50, 20000)
-    cfg["daily_steps_alert"] = _clamp_int(raw.get("daily_steps_alert"), 1000, cfg["daily_steps_warn"] + 1, 50000)
+    cfg["daily_steps_warn"] = _clamp_int(raw.get("daily_steps_warn"), 960, 50, 20000)
+    cfg["daily_steps_alert"] = _clamp_int(raw.get("daily_steps_alert"), 1200, cfg["daily_steps_warn"] + 1, 50000)
     cfg["log_sliding_window_min"] = _clamp_int(raw.get("log_sliding_window_min"), 30, 5, 240)
     cfg["slow_tps_threshold"] = _clamp_float(raw.get("slow_tps_threshold"), 40.0, 5.0, 200.0)
     cfg["slow_ttft_threshold_sec"] = _clamp_float(raw.get("slow_ttft_threshold_sec"), 45.0, 10.0, 300.0)

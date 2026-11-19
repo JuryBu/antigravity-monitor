@@ -27,6 +27,33 @@ UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
 
 
+def _lerp_hex(c1: str, c2: str, t: float) -> str:
+    """Linearly interpolate between two #RRGGBB colors for smooth visual warning gradients."""
+    ratio = max(0.0, min(1.0, float(t)))
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = int(round(r1 + (r2 - r1) * ratio))
+    g = int(round(g1 + (g2 - g1) * ratio))
+    b = int(round(b1 + (b2 - b1) * ratio))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def compute_steps_color(steps: int, warn_threshold: int, alert_threshold: int, green_hex: str, red_hex: str) -> str:
+    """Green below warn (80%), smooth yellow -> orange -> red from 80% to 100%, locked red >= 100%."""
+    alert = max(2, int(alert_threshold))
+    warn = max(1, min(int(warn_threshold), alert - 1))
+    if steps < warn:
+        return green_hex
+    if steps >= alert:
+        return red_hex
+    yellow = "#FACC15"
+    orange = "#F59E0B"
+    progress = (steps - warn) / float(alert - warn)
+    if progress <= 0.5:
+        return _lerp_hex(yellow, orange, progress / 0.5)
+    return _lerp_hex(orange, red_hex, (progress - 0.5) / 0.5)
+
+
 def _get_win32_user32() -> Optional[ctypes.WinDLL]:
     if os.name != "nt":
         return None
@@ -812,8 +839,11 @@ class AntigravityCapsuleApp:
             acc_txt += f" {snap.account.five_hour_pct:.0f}%"
         self._lbl_bar_acc.configure(text=acc_txt)
 
-        step_color = t["red"] if snap.today_steps >= snap.daily_steps_alert else (t["orange"] if snap.today_steps >= snap.daily_steps_warn else t["text_secondary"])
-        self._lbl_bar_steps.configure(text=f"{snap.today_steps}/{snap.daily_steps_alert}", fg=step_color)
+        step_bar_color = compute_steps_color(
+            snap.today_steps, snap.daily_steps_warn, snap.daily_steps_alert, t["green"], t["red"]
+        )
+        step_text_color = step_bar_color if snap.today_steps >= snap.daily_steps_warn else t["text_secondary"]
+        self._lbl_bar_steps.configure(text=f"{snap.today_steps}/{snap.daily_steps_alert}", fg=step_text_color)
 
         if self.tray is not None:
             hit_s = f"{snap.primary_hit_rate:.1f}%" if snap.primary_hit_rate is not None else "—"
@@ -847,9 +877,9 @@ class AntigravityCapsuleApp:
             steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {snap.total_today_steps}"
         else:
             steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%)"
-        self._lbl_steps_val.configure(text=steps_val_txt, fg=step_color)
+        self._lbl_steps_val.configure(text=steps_val_txt, fg=step_text_color)
         self._last_steps_pct = pct
-        self._last_steps_color = step_color if step_color != t["text_secondary"] else t["green"]
+        self._last_steps_color = step_bar_color
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
 
         # Module 2: Speed & Freshness

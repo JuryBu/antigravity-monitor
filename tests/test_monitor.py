@@ -22,6 +22,7 @@ from core.log_monitor import (
 )
 from core.sqlite_reader import ConversationDbReader, parse_gen_metadata_row
 from core.startup_manager import install_desktop_shortcut, is_startup_enabled, set_startup_enabled
+from ui.capsule_app import compute_steps_color
 from ui.icon_builder import build_tray_icon
 
 
@@ -609,6 +610,21 @@ class TestShortcutsAndIcons(unittest.TestCase):
             im = build_tray_icon(base_png, level=lvl, size=64)
             self.assertEqual(im.size, (64, 64))
             self.assertEqual(im.mode, "RGBA")
+
+    def test_steps_smooth_color_gradient_80_to_100_locked_red(self) -> None:
+        g, r = "#34D399", "#F87171"
+        self.assertEqual(compute_steps_color(0, 960, 1200, g, r), g)
+        self.assertEqual(compute_steps_color(959, 960, 1200, g, r), g)
+        # Exactly at 80% (960) switches cleanly to yellow
+        self.assertEqual(compute_steps_color(960, 960, 1200, g, r), "#FACC15")
+        # Midpoint 90% (1080) smoothly transitions through orange
+        self.assertEqual(compute_steps_color(1080, 960, 1200, g, r), "#F59E0B")
+        # 95% smoothly interpolates between orange and red
+        mid_or = compute_steps_color(1140, 960, 1200, g, r)
+        self.assertNotIn(mid_or, (g, "#FACC15", "#F59E0B", r))
+        # At and above 100% locks permanently to red
+        self.assertEqual(compute_steps_color(1200, 960, 1200, g, r), r)
+        self.assertEqual(compute_steps_color(1800, 960, 1200, g, r), r)
 
 
 if __name__ == "__main__":
