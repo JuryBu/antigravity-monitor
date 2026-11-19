@@ -993,14 +993,19 @@ class AntigravityCapsuleApp:
             "first_cacheable": "首次入窗",
             "abnormal_zero": "掉缓存!",
         }
-        lines.append("近 10 步逐拍明细（旧 → 新）:")
-        for idx, st in enumerate(steps, 1):
-            t_val = ttfts[idx - 1 - t_offset] if (idx - 1 - t_offset) >= 0 and (idx - 1 - t_offset) < len(ttfts) else None
-            p_val = tpss[idx - 1 - s_offset] if (idx - 1 - s_offset) >= 0 and (idx - 1 - s_offset) < len(tpss) else None
+        lines.append("近 10 步逐拍明细（新 → 旧，最新置顶）:")
+        step_rows = []
+        for i, st in enumerate(steps):
+            t_val = ttfts[i - t_offset] if (i - t_offset) >= 0 and (i - t_offset) < len(ttfts) else None
+            p_val = tpss[i - s_offset] if (i - s_offset) >= 0 and (i - s_offset) < len(tpss) else None
+            hm = datetime.datetime.fromtimestamp(st.timestamp).strftime("%H:%M:%S") if st.timestamp > 0 else "--:--:--"
             t_str = f"{t_val:5.1f}s" if t_val is not None else "    — "
             p_str = f"{p_val:3.0f}t/s" if p_val is not None else "   — "
             tag = reason_map.get(st.reason, st.reason)
-            lines.append(f"  #{idx:<2} 缓存 {st.hit_rate:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
+            step_rows.append((hm, st.hit_rate, t_str, p_str, tag))
+        for rev_idx, (hm, hr, t_str, p_str, tag) in enumerate(reversed(step_rows), 1):
+            badge = "最新" if rev_idx == 1 else f"#{rev_idx:<2}"
+            lines.append(f"  {badge:<3} {hm} │ 缓存 {hr:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
         return "\n".join(lines)
 
     def _show_conv_tooltip(self, row_idx: int, event: tk.Event) -> None:

@@ -437,6 +437,75 @@ class TestLogMonitorLogic(unittest.TestCase):
             self.assertEqual(snap2.level, "orange")
             self.assertIn("观察恢复中", snap2.sub_headline)
 
+    def test_switching_from_bad_account_to_healthy_does_not_inherit_t1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "swok1234-5678" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+
+            now = time.time()
+            t_bad_sw = now - 600
+            t_good_sw = now - 60
+            iso1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_bad_sw))
+            iso2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_good_sw))
+            (ck_logs / "app.log.2026-11-20").write_text(
+                f"{iso1}  INFO [Antigravity 2.0] 写入系统凭据: bad01@example.com\n"
+                f"{iso2}  INFO [Antigravity 2.0] 写入系统凭据: good9@example.com\n",
+                encoding="utf-8",
+            )
+
+            # 6 consecutive abnormal misses on bad01, then switch to good9 -> 1 switch cold + 1 warm hit
+            rows = []
+            for idx in range(7):
+                ts_s = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_bad_sw + 60 + idx * 20))
+                rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": idx + 1, "created_at": ts_s,
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000 if idx == 0 else 180000,
+                    "cache_read_tokens": 180000 if idx == 0 else 0,
+                    "output_tokens": 500,
+                })
+            rows.append({
+                "type": "PLANNER_RESPONSE", "step_index": 8,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_good_sw + 10)),
+                "model": "gemini-4-neon-xhigh", "input_tokens": 182000, "cache_read_tokens": 0, "output_tokens": 500,
+            })
+            rows.append({
+                "type": "PLANNER_RESPONSE", "step_index": 9,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_good_sw + 35)),
+                "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 182000, "output_tokens": 500,
+            })
+            (brain / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                }
+            )
+            # Simulate live online account good9
+            from core.log_monitor import AccountQuotaInfo
+            engine._account_cache = AccountQuotaInfo(email_masked="go***9@example.com", short_label="go***9", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T0")
+            self.assertEqual(snap.level, "green")
+            self.assertEqual(snap.max_abnormal_recent10, 0)
+            self.assertEqual(snap.wasted_cold_tokens_total, 0)
+            self.assertEqual(snap.today_steps, 2)
+            self.assertEqual(snap.total_today_steps, 9)
+
     def test_end_to_end_t1_invalid_freshness_dedup_and_no_offline_cockpit_leak(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

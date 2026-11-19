@@ -633,6 +633,9 @@ class AntigravityMonitorEngine:
         timeline = self._ledger.get_timeline(today_start)
         switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
         cur_acct_label = self._account_cache.short_label if self._account_cache.online else ""
+        # When switched between >=2 accounts today, evaluate T1 / wasted-cold only on steps after the latest switch
+        # so a previous degraded account's red streak never penalizes a freshly switched healthy account.
+        current_acct_since_ts = timeline[-1][0] if (cur_acct_label and len(timeline) >= 2) else 0.0
 
         # Scan all today-touched transcripts without truncating at 40 so swarm runs never undercount
         all_recent = self._iter_recent_transcripts(lookback_cutoff, today_start)
@@ -668,20 +671,30 @@ class AntigravityMonitorEngine:
 
             latest = steps[-1]
             recent10 = steps[-10:]
+            eval_steps = (
+                [s for s in steps if s.timestamp >= current_acct_since_ts - 2.0]
+                if current_acct_since_ts > 0.0
+                else steps
+            )
+            eval_recent10 = (
+                [s for s in recent10 if s.timestamp >= current_acct_since_ts - 2.0]
+                if current_acct_since_ts > 0.0
+                else recent10
+            )
 
             consec_miss = 0
             consec_start_step = latest.step_index
-            for s in reversed(steps):
+            for s in reversed(eval_steps):
                 if s.classification == "abnormal_miss":
                     consec_miss += 1
                     consec_start_step = s.step_index
                 else:
                     break
             single_miss = consec_miss == 1
-            wasted_cold = sum(s.input_tokens for s in recent10 if s.classification == "abnormal_miss")
-            abnormal_steps_r10 = [s for s in recent10 if s.classification == "abnormal_miss"]
+            wasted_cold = sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss")
+            abnormal_steps_r10 = [s for s in eval_recent10 if s.classification == "abnormal_miss"]
             abnormal_r10 = len(abnormal_steps_r10)
-            hits_r10 = sum(1 for s in recent10 if s.classification == "hit")
+            hits_r10 = sum(1 for s in eval_recent10 if s.classification == "hit")
             cacheable_r10 = abnormal_r10 + hits_r10
             hit_ratio_r10 = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
             first_abn_step_r10 = abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0
@@ -691,9 +704,9 @@ class AntigravityMonitorEngine:
             if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
                 age = now - latest.timestamp
                 if age <= 15 * 60:
-                    if latest.classification == "abnormal_miss":
+                    if latest.classification == "abnormal_miss" and (current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0):
                         fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
-                    else:
+                    elif current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0:
                         fresh_rem = int(self.config["freshness_window_sec"] - age)
 
             convs.append(
