@@ -743,11 +743,19 @@ class AntigravityCapsuleApp:
     def render_snapshot(self, snap: MonitorSnapshot) -> None:
         self._latest_snapshot = snap
         t = self.theme
-        level_color = t["green"] if snap.level == "green" else (t["orange"] if snap.level == "orange" else t["red"])
+        if snap.grade == "IDLE":
+            level_color = t["cyan"]
+        elif snap.level == "green":
+            level_color = t["green"]
+        elif snap.level == "orange":
+            level_color = t["orange"]
+        else:
+            level_color = t["red"]
 
         # Collapsed capsule bar
         self._dot_canvas.itemconfig(self._dot_oval, fill=level_color)
         short_grade = {
+            "IDLE": "离线待机",
             "T0": "T0 健康",
             "WARN": "留意预警",
             "T1": "T1 掉缓存",
@@ -757,7 +765,12 @@ class AntigravityCapsuleApp:
         self._lbl_bar_status.configure(text=short_grade, fg=level_color)
 
         if snap.primary_hit_rate is not None:
-            hit_color = t["green"] if snap.primary_hit_rate >= 70 else (t["orange"] if snap.primary_hit_rate >= 20 else t["red"])
+            if snap.primary_hit_rate >= 70:
+                hit_color = t["green"]
+            elif snap.primary_hit_rate >= 20 or snap.primary_hit_classification == "expected_cold":
+                hit_color = t["orange"]
+            else:
+                hit_color = t["red"]
             self._lbl_bar_cache_v.configure(text=f"{snap.primary_hit_rate:.1f}%", fg=hit_color)
         else:
             self._lbl_bar_cache_v.configure(text="—", fg=t["text_secondary"])
@@ -806,7 +819,7 @@ class AntigravityCapsuleApp:
         self._lbl_acc_pill.configure(text=snap.account.short_label or "离线")
         self._lbl_acc_5h.configure(
             text=f"5h {snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "5h —",
-            fg=t["green"] if (snap.account.five_hour_pct or 100) >= 35 else t["orange"],
+            fg=t["text_muted"] if snap.account.five_hour_pct is None else (t["green"] if snap.account.five_hour_pct >= 35 else t["orange"]),
         )
         self._lbl_acc_wk.configure(
             text=f"周 {snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "周 —",
@@ -853,21 +866,29 @@ class AntigravityCapsuleApp:
         # Module 3: 10-step micro bars
         self._draw_conversation_bars(snap)
 
-        # Module 4: Sliding-window log stats (always dual format recent / today)
-        self._lbl_logs_title.configure(text=f"底层日志滑动窗监控（近 {snap.sliding_window_min} 分钟 / 今日）")
-        self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
-        self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1)
-        self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
-        self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999)
+        # Module 4: Sliding-window log stats (always dual format recent / today; muted while offline)
+        logs_live = bool(snap.account.online) and snap.grade != "IDLE"
+        if logs_live:
+            self._lbl_logs_title.configure(text=f"底层日志滑动窗监控（近 {snap.sliding_window_min} 分钟 / 今日）")
+            self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
+            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1)
+            self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
+            self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999)
+        else:
+            self._lbl_logs_title.configure(text="底层日志监控（客户端未运行 · 已暂停实时告警）")
+            self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2, offline_muted=True)
+            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1, offline_muted=True)
+            self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1, offline_muted=True)
+            self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999, offline_muted=True)
 
-        if snap.wasted_cold_tokens_total >= 150_000 and snap.max_consec_miss >= 2:
+        if snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and snap.max_consec_miss >= 2:
             self._banner_frame.configure(bg=t["alert_banner_bg"], highlightbackground=t["alert_banner_border"])
             self._lbl_banner.configure(
                 bg=t["alert_banner_bg"],
                 fg=t["alert_banner_text"],
                 text=f"近 10 步异常归零已多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token，建议核查账号",
             )
-        elif snap.recent_events and (snap.recent_503 > 0 or snap.recent_timeout > 0 or snap.recent_403 > 0):
+        elif logs_live and snap.recent_events and (snap.recent_503 > 0 or snap.recent_timeout > 0 or snap.recent_403 > 0):
             ev_txt = "\n".join(e.summary for e in snap.recent_events[-2:])
             self._banner_frame.configure(bg=t["red_bg"], highlightbackground=t["red"])
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
@@ -875,9 +896,20 @@ class AntigravityCapsuleApp:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["border_soft"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["text_secondary"], text=snap.sub_headline)
 
-    def _update_log_cell(self, key: str, recent: int, today: int, warn_on_recent: int, red_on_recent: int) -> None:
+    def _update_log_cell(
+        self,
+        key: str,
+        recent: int,
+        today: int,
+        warn_on_recent: int,
+        red_on_recent: int,
+        offline_muted: bool = False,
+    ) -> None:
         t = self.theme
         cell = self._log_cells[key]
+        if offline_muted:
+            cell["val"].configure(text=f"— / {today}", fg=t["text_muted"])
+            return
         txt = f"{recent} / {today}"
         if recent >= red_on_recent:
             fg = t["red"]
@@ -921,7 +953,13 @@ class AntigravityCapsuleApp:
             row_ui["model"].configure(text=conv.model, fg=t["text_secondary"])
             row_ui["ctx"].configure(text=format_tokens(conv.context_tokens), fg=t["text_secondary"])
 
-            hit_col = t["green"] if conv.latest_hit_rate >= 70 else (t["orange"] if conv.latest_hit_rate >= 20 else t["red"])
+            latest_cls = conv.recent_steps[-1].classification if conv.recent_steps else ""
+            if conv.latest_hit_rate >= 70:
+                hit_col = t["green"]
+            elif conv.latest_hit_rate >= 20 or latest_cls == "expected_cold":
+                hit_col = t["orange"]
+            else:
+                hit_col = t["red"]
             row_ui["hit"].configure(text=f"{conv.latest_hit_rate:.1f}%", fg=hit_col)
 
             sp_txt = f"{conv.tps:.0f} t/s" if conv.tps is not None else "—"

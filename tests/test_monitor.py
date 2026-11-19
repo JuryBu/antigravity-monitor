@@ -179,36 +179,59 @@ class TestLogMonitorLogic(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             log_p = Path(td) / "language_server.log"
             now = time.time()
-            # Two days ago at the EXACT same clock time (Go slash date format YYYY/MM/DD HH:MM:SS)
+            # Two days ago at the EXACT same clock time (Go slash date format & glog MMDD format)
             two_days_ago = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 2 * 86400))
+            two_days_mmdd = time.strftime("%m%d %H:%M:%S", time.localtime(now - 2 * 86400))
             old_today = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 3600))
             rec_go = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now - 60))
+            rec_glog = time.strftime("%m%d %H:%M:%S", time.localtime(now - 45))
             log_p.write_text(
-                f"{two_days_ago} ERROR 403 TOS_VIOLATION old-account\n"
-                f"{old_today} ERROR 503 No capacity available\n"
-                f"{rec_go} WARN 127.0.0.1 TLS handshake error\n"
-                f"{rec_go} code_assist_client.go:464] AICode FetchConfig failed: context deadline exceeded\n"
-                f"{rec_go} [run.go:412] attempt 1 failed: EOF\n"
-                f"{rec_go} ERROR 503 No capacity partial-without-newline",
+                f"{two_days_ago} ERROR 403 PERMISSION_DENIED TOS_VIOLATION old-account\n"
+                f"ERROR: logging before google.Init: I{two_days_mmdd}.111111 22456 run.go:315] Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available)\n"
+                f"{old_today} ERROR status=503 No capacity available\n"
+                f"{rec_go} WARN 127.0.0.1:55503 TLS handshake error\n"
+                f"ERROR: logging before google.Init: W{rec_glog}.350309     607 extract_searchable_content.go:54] conversationsearch: loading trajectory\n"
+                f"ERROR: logging before google.Init: E{rec_glog}.850324    8711 cascade_manager.go:2064] LoadTrajectory LoadUnsafe failed for demo01: not found\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.282503       1 server.go:3993] Wrote hub discovery file: demo_hub.json\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.745168    7650 runner.go:898] Monitor sir_flash_lite FINISHED: reason=\"debugging a 503 error\"\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.101751     189 server.go:5878] [RemoteControl] Staying disconnected: user setting is off\n"
+                f"ERROR: logging before google.Init: W{rec_glog}.100000     100 code_assist_client.go:464] AICode FetchConfig failed: context deadline exceeded\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.200000   22456 run.go:315] Run: attempt 1 failed (context canceled)\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.222222   22456 run.go:315] Run: attempt 1 failed (unexpected EOF), retrying in 1.5s\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.333333   22456 run.go:315] Run: attempt 2 failed (UNAVAILABLE (code 503): The service is currently unavailable.), partial-without-newline",
                 encoding="utf-8",
             )
             tailer = LanguageServerLogTailer(log_p)
             tailer.poll(now_ts=now)
             recent, today, notable = tailer.get_counts(now, window_min=30)
-            self.assertEqual(recent["403"], 0)   # 2-day-old Go slash date must NOT resurrect as today!
+            self.assertEqual(recent["403"], 0)
             self.assertEqual(today["403"], 0)
-            self.assertEqual(recent["503"], 0)   # Partial line without '\n' held back; 1h-old 503 decayed
+            self.assertEqual(recent["503"], 0)   # Microsecond .350309/.850324/.282503 & sir_flash_lite & 1h-old 503 must NOT match!
             self.assertEqual(recent["timeout"], 0)
-            self.assertEqual(recent["retry"], 1)
+            self.assertEqual(recent["retry"], 1)  # Only genuine unexpected EOF retry; context canceled excluded!
             self.assertEqual(notable, [])
 
-            # Complete the partial line with '\n' and confirm incremental pickup
+            # Complete the partial line with '\n' and confirm incremental pickup of real "(code 503)" format
             with log_p.open("a", encoding="utf-8") as fh:
                 fh.write("\n")
             tailer.poll(now_ts=now + 2)
             recent_b, _, notable_b = tailer.get_counts(now + 2, window_min=30)
             self.assertEqual(recent_b["503"], 1)
             self.assertEqual(len(notable_b), 1)
+            # Confirm real glog timestamp was extracted instead of stamping fallback now
+            self.assertNotEqual(notable_b[0].timestamp, now + 2)
+
+            # Append real glog 5m stream idle timeout + real 403 TOS_VIOLATION and verify exact classification
+            with log_p.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"ERROR: logging before google.Init: I{rec_glog}.429371   22456 run.go:315] Run: attempt 1 failed (request failed: stream idle timeout (5m0s): context deadline exceeded), retrying in 5.4s\n"
+                    f"ERROR: logging before google.Init: E{rec_glog}.555555   22456 client.go:200] onboardUser failed: 403 PERMISSION_DENIED (reason: TOS_VIOLATION)\n"
+                )
+            tailer.poll(now_ts=now + 3)
+            recent_c, _, notable_c = tailer.get_counts(now + 3, window_min=30)
+            self.assertEqual(recent_c["timeout"], 1)
+            self.assertEqual(recent_c["403"], 1)
+            self.assertEqual(recent_c["retry"], 1)  # 5m timeout classified as timeout, not double-counted as retry
 
             # Simulate client restart truncating log file
             log_p.write_text(f"{rec_go} ERROR stream idle timeout\n", encoding="utf-8")
@@ -216,6 +239,50 @@ class TestLogMonitorLogic(unittest.TestCase):
             recent2, _, _ = tailer.get_counts(now + 5, window_min=30)
             self.assertEqual(recent2["timeout"], 1)
             self.assertEqual(recent2["retry"], 0)
+            self.assertEqual(recent2["503"], 0)
+
+    def test_offline_client_enters_idle_and_silences_stale_log_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "idle1234-5678" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+
+            now = time.time()
+            # Pre-shutdown real errors from 4 minutes ago, while Antigravity is currently closed (no live hub)
+            rec_glog = time.strftime("%m%d %H:%M:%S", time.localtime(now - 240))
+            ls_log.write_text(
+                f"ERROR: logging before google.Init: I{rec_glog}.429371   22456 run.go:315] Run: attempt 1 failed (request failed: stream idle timeout (5m0s): context deadline exceeded)\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.500000   22456 run.go:315] Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available)\n"
+                f"ERROR: logging before google.Init: I{rec_glog}.600000   22456 run.go:315] Run: attempt 2 failed (UNAVAILABLE (code 503): No capacity available)\n",
+                encoding="utf-8",
+            )
+            t_old = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 300))
+            (brain / "transcript.jsonl").write_text(
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t_old, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 500}) + "\n",
+                encoding="utf-8",
+            )
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing_cockpit.sqlite",
+                }
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertFalse(snap.account.online)
+            self.assertEqual(snap.grade, "IDLE")
+            self.assertEqual(snap.level, "green")
+            self.assertEqual(snap.alerts, [])
+            # Even on a subsequent poll with another trailing log line while still offline, stay IDLE with 0 alerts
+            snap2 = engine.poll(now_ts=now + 5)
+            self.assertEqual(snap2.grade, "IDLE")
+            self.assertEqual(snap2.alerts, [])
 
     def test_end_to_end_t1_invalid_freshness_dedup_and_no_offline_cockpit_leak(self) -> None:
         with tempfile.TemporaryDirectory() as td:

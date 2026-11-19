@@ -124,6 +124,7 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         sub_headline="主活跃会话已连续 5 步 cr=0，建议检查账号或切回主力号",
         active_model="Neon XHigh",
         primary_hit_rate=0.0,
+        primary_hit_classification="abnormal_miss",
         primary_tps=27.8,
         primary_ttft=38.9,
         primary_speed_status="slow",

@@ -30,13 +30,35 @@ from core.config_store import DEFAULT_CONFIG, sanitize_config
 from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot
 
 EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
-RETRY_RE = re.compile(r"run\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
+RETRY_RE = re.compile(r"(?:^|[\s\[/\\])run\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
+# Strip Go/glog wrapper prefix so timestamp microseconds (e.g. .350309) and "ERROR: logging before google.Init:" never false-match!
+GLOG_PREFIX_RE = re.compile(
+    r"^(?:ERROR:\s+logging before google\.Init:\s+)?([IWEF])(\d{2})(\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+\d+\s+([^\]]+)\]\s*(.*)$"
+)
 # Supports both ISO-8601 (YYYY-MM-DD...) and Go stdlog slash dates (YYYY/MM/DD HH:MM:SS)
 FULL_TS_RE = re.compile(
-    r"(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
+    r"^.{0,12}?(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s*(.*)$"
 )
-# Anchor bare HH:MM:SS fallback near line prefix (e.g. glog W1120 02:14:39) to avoid body text numbers
-PREFIX_HMS_RE = re.compile(r"^.{0,36}?\b(\d{2}:\d{2}:\d{2})\b")
+# Strict upstream HTTP/gRPC error patterns (evaluated ONLY against stripped message body)
+HTTP_503_RE = re.compile(
+    r"(?:no capacity|resource_exhausted|\b(?:http(?:\s+status)?|status(?:\s+code)?|error\s+code|code)\s*[:=]?\s*503\b|\b503\s+(?:service\s+)?unavailable\b)",
+    re.IGNORECASE,
+)
+STREAM_TIMEOUT_RE = re.compile(
+    r"(?:stream idle timeout|timed out after 5m)",
+    re.IGNORECASE,
+)
+TOS_403_RE = re.compile(
+    r"(?:tos_violation|permission_denied[^a-z0-9]{0,16}(?:code\s*[:=]?\s*)?403\b|(?:status|http|code)[^0-9]{0,12}403\b.*permission_denied)",
+    re.IGNORECASE,
+)
+IGNORED_LOG_SOURCES = (
+    "extract_searchable_content.go",
+    "llm_monitor.go",
+    "runner.go",
+    "code_assist_client.go",
+    "conversationsearch",
+)
 
 MODEL_SHORT_MAP = (
     ("gemini-4-neon-xhigh", "Neon XHigh"),
@@ -254,6 +276,7 @@ class MonitorSnapshot:
     sub_headline: str
     active_model: str
     primary_hit_rate: Optional[float]
+    primary_hit_classification: str
     primary_tps: Optional[float]
     primary_ttft: Optional[float]
     primary_speed_status: str
@@ -367,6 +390,7 @@ class LanguageServerLogTailer:
         self._offset: int = 0
         self._events: Deque[LogEvent] = deque(maxlen=self.max_events)
         self._initialized: bool = False
+        self._last_seen_ts: Optional[float] = None
 
     def poll(self, now_ts: Optional[float] = None) -> None:
         now = now_ts if now_ts is not None else time.time()
@@ -382,12 +406,14 @@ class LanguageServerLogTailer:
         if size < self._offset:
             self._offset = 0
             self._events.clear()
+            self._last_seen_ts = None
 
         if size == self._offset and self._initialized:
             return
 
+        is_cold_start = not self._initialized
         discard_first_partial = False
-        if not self._initialized and size > 2 * 1024 * 1024:
+        if is_cold_start and size > 2 * 1024 * 1024:
             self._offset = size - 2 * 1024 * 1024
             discard_first_partial = True
 
@@ -402,7 +428,6 @@ class LanguageServerLogTailer:
         if not chunk:
             return
 
-        # Only consume up to the last complete newline so concurrent half-written lines are never split
         last_nl = chunk.rfind(b"\n")
         if last_nl == -1:
             return
@@ -418,70 +443,83 @@ class LanguageServerLogTailer:
 
         text = consumed.decode("utf-8", errors="replace")
         for line in text.splitlines():
-            event = self._parse_line(line, now)
+            event = self._parse_line(line, now, is_cold_start=is_cold_start)
             if event is not None:
                 self._events.append(event)
 
-    def _parse_line(self, line: str, fallback_ts: float) -> Optional[LogEvent]:
+    def _parse_line(self, line: str, fallback_ts: float, is_cold_start: bool = False) -> Optional[LogEvent]:
         if not line:
             return None
-        low = line.lower()
-        if "127.0.0.1" in low or "localhost" in low or "tls handshake error" in low:
+        low_full = line.lower()
+        if "127.0.0.1" in low_full or "localhost" in low_full or "tls handshake error" in low_full:
+            return None
+
+        ts, source, body = self._split_header_and_body(line, fallback_ts, is_cold_start=is_cold_start)
+        if ts is not None:
+            self._last_seen_ts = ts
+
+        src_low = source.lower()
+        body_low = body.lower()
+        if any(ign in src_low or ign in body_low[:80] for ign in IGNORED_LOG_SOURCES):
+            return None
+        if "monitor sir_" in body_low or "llm monitor" in body_low:
             return None
 
         category: Optional[str] = None
         label = ""
-        if "tos_violation" in low or ("403" in low and "permission_denied" in low):
+        if TOS_403_RE.search(body):
             category = "403"
             label = "403 TOS/权限拒绝"
-        elif "stream idle timeout" in low or "timed out after 5m" in low or (
-            "context deadline exceeded" in low
-            and not any(
-                noise in low
-                for noise in ("fetchconfig", "code_assist_client", "remote_config", "metadata", "health", "getuserstatus")
-            )
-        ):
+        elif STREAM_TIMEOUT_RE.search(body):
             category = "timeout"
             label = "5m 流超时"
-        elif "no capacity" in low or ("503" in low and ("unavailable" in low or "service" in low or "error" in low or "status" in low)):
+        elif HTTP_503_RE.search(body):
             category = "503"
             label = "服务端 503 No capacity"
-        elif RETRY_RE.search(line):
+        elif RETRY_RE.search(line) and "context canceled" not in body_low and "shutting down" not in body_low:
             category = "retry"
             label = "代理/流断连重试"
 
         if category is None:
             return None
 
-        ts = self._extract_timestamp(line, fallback_ts)
-        hm = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        clean_detail = mask_email(line.strip())
+        # On cold start, ignore lines that have no verifiable timestamp at all rather than stamping them as "now"
+        effective_ts = ts if ts is not None else (self._last_seen_ts if self._last_seen_ts is not None else (0.0 if is_cold_start else fallback_ts))
+        if effective_ts <= 0.0:
+            return None
+
+        hm = datetime.datetime.fromtimestamp(effective_ts).strftime("%H:%M:%S")
+        clean_detail = mask_email(body.strip())
         if len(clean_detail) > 96:
             clean_detail = clean_detail[:93] + "..."
         summary = f"[{hm}] {label}"
-        event_key = f"log:{category}:{int(ts)}:{hash(clean_detail) & 0xFFFF:04x}"
-        return LogEvent(timestamp=ts, category=category, summary=summary, event_key=event_key)
+        event_key = f"log:{category}:{int(effective_ts)}:{hash(clean_detail) & 0xFFFF:04x}"
+        return LogEvent(timestamp=effective_ts, category=category, summary=summary, event_key=event_key)
 
     @staticmethod
-    def _extract_timestamp(line: str, fallback_ts: float) -> float:
-        m_full = FULL_TS_RE.search(line)
+    def _split_header_and_body(line: str, fallback_ts: float, is_cold_start: bool = False) -> Tuple[Optional[float], str, str]:
+        # 1. glog format: [ERROR: logging before google.Init: ]W1120 05:08:41.350309 607 file.go:54] body
+        m_glog = GLOG_PREFIX_RE.match(line)
+        if m_glog:
+            mm, dd, hms, source, body = int(m_glog.group(2)), int(m_glog.group(3)), m_glog.group(4), m_glog.group(5), m_glog.group(6)
+            now_dt = datetime.datetime.fromtimestamp(fallback_ts)
+            try:
+                h, mi, s = (int(p) for p in hms.split(":"))
+                cand = now_dt.replace(month=mm, day=dd, hour=h, minute=mi, second=s, microsecond=0)
+                if cand.timestamp() > fallback_ts + 86400:
+                    cand = cand.replace(year=now_dt.year - 1)
+                return cand.timestamp(), source, body
+            except ValueError:
+                return None, source, body
+
+        # 2. ISO / Go stdlog slash format: 2026/11/20 02:18:54 body
+        m_full = FULL_TS_RE.match(line)
         if m_full:
             iso_norm = f"{m_full.group(1)}-{m_full.group(2)}-{m_full.group(3)}T{m_full.group(4)}"
             parsed = parse_iso_timestamp(iso_norm)
-            if parsed is not None:
-                return parsed
-        m_hms = PREFIX_HMS_RE.search(line)
-        if m_hms:
-            try:
-                now_dt = datetime.datetime.fromtimestamp(fallback_ts)
-                h, mi, s = (int(p) for p in m_hms.group(1).split(":"))
-                cand = now_dt.replace(hour=h, minute=mi, second=s, microsecond=0)
-                if cand.timestamp() > fallback_ts + 300:
-                    cand -= datetime.timedelta(days=1)
-                return cand.timestamp()
-            except ValueError:
-                pass
-        return fallback_ts
+            return parsed, "", m_full.group(5)
+
+        return None, "", line
 
     def get_counts(self, now_ts: float, window_min: int) -> Tuple[Dict[str, int], Dict[str, int], List[LogEvent]]:
         cutoff = now_ts - max(1, window_min) * 60
@@ -526,6 +564,7 @@ class AntigravityMonitorEngine:
         self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=12, tail_rows=12)
         self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=200)
         self._account_cache: AccountQuotaInfo = AccountQuotaInfo()
+        self._active_hub_pid: int = 0
         self._last_account_poll: float = 0.0
         self._last_quota_family: str = "gemini"
         self._baseline_ready: bool = False
@@ -630,7 +669,9 @@ class AntigravityMonitorEngine:
 
         primary = top_convs[0] if top_convs else None
         active_family = "3p" if (primary and any(k in primary.model_raw.lower() for k in ("claude", "fable", "opus", "sonnet", "gpt"))) else "gemini"
-        if force_account or active_family != self._last_quota_family or (now - self._last_account_poll >= 15.0):
+        hub_dropped = self._account_cache.online and self._active_hub_pid > 0 and not _is_windows_pid_alive(self._active_hub_pid)
+        account_interval = 15.0 if self._account_cache.online else 5.0
+        if force_account or hub_dropped or active_family != self._last_quota_family or (now - self._last_account_poll >= account_interval):
             self._account_cache = self._poll_account_and_quota(now, active_family)
             self._last_account_poll = now
             self._last_quota_family = active_family
@@ -664,12 +705,14 @@ class AntigravityMonitorEngine:
 
         active_model = primary.model if primary else "等待请求"
         primary_hit = primary.latest_hit_rate if primary else None
+        primary_hit_cls = primary.recent_steps[-1].classification if (primary and primary.recent_steps) else ""
         primary_tps = primary.tps if primary else None
         primary_ttft = primary.ttft_sec if primary else None
         primary_speed = primary.speed_status if primary else "unknown"
 
         recent_cutoff = now - self.config["log_sliding_window_min"] * 60
         recent_active = [c for c in top_convs if c.latest_timestamp >= recent_cutoff]
+        has_live_transcript = any((now - c.latest_timestamp) <= 120.0 for c in top_convs)
         max_consec_miss = max((c.consec_miss for c in recent_active), default=0)
         any_single_miss = any(c.single_miss for c in recent_active)
         any_slow = any(c.speed_status == "slow" for c in recent_active[:2])
@@ -684,6 +727,8 @@ class AntigravityMonitorEngine:
             any_slow=any_slow,
             today_steps=today_steps,
             primary=primary,
+            is_online=self._account_cache.online,
+            has_live_transcript=has_live_transcript,
         )
 
         alerts = self._collect_new_alerts(
@@ -692,6 +737,7 @@ class AntigravityMonitorEngine:
             recent_active=recent_active,
             max_consec_miss=max_consec_miss,
             today_steps=today_steps,
+            is_online=self._account_cache.online,
         )
 
         return MonitorSnapshot(
@@ -702,6 +748,7 @@ class AntigravityMonitorEngine:
             sub_headline=sub_headline,
             active_model=active_model,
             primary_hit_rate=primary_hit,
+            primary_hit_classification=primary_hit_cls,
             primary_tps=primary_tps,
             primary_ttft=primary_ttft,
             primary_speed_status=primary_speed,
@@ -756,16 +803,28 @@ class AntigravityMonitorEngine:
         any_slow: bool,
         today_steps: int,
         primary: Optional[ConversationSummary],
+        is_online: bool = True,
+        has_live_transcript: bool = True,
     ) -> Tuple[str, str, str, str]:
         win = self.config["log_sliding_window_min"]
-        if recent_log["403"] > 0:
+        # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
+        # stay quietly in standby instead of alerting on stale pre-shutdown log disconnects.
+        if not is_online and not has_live_transcript:
+            return ("green", "IDLE", "离线待机 · Antigravity 未运行", "客户端未启动，已暂停实时异常告警")
+
+        # Only evaluate live language_server.log T2/T3 alerts while Antigravity LS is actually online.
+        eff_403 = recent_log["403"] if is_online else 0
+        eff_timeout = recent_log["timeout"] if is_online else 0
+        eff_503 = recent_log["503"] if is_online else 0
+
+        if eff_403 > 0:
             return ("red", "T3", f"T3 封禁告警 · {active_model}", "检测到 403 TOS/权限拒绝，请立即停止使用当前账号")
-        if recent_log["timeout"] > 0 or recent_log["503"] >= 2:
+        if eff_timeout > 0 or eff_503 >= 2:
             return (
                 "red",
                 "T2",
                 f"T2 限流黑洞 · {active_model}",
-                f"近 {win} 分钟触发 {recent_log['503']} 次 503 / {recent_log['timeout']} 次 5m 超时",
+                f"近 {win} 分钟触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时",
             )
         if max_consec_miss >= 2:
             return (
@@ -781,13 +840,13 @@ class AntigravityMonitorEngine:
                 f"步数超红线 · {active_model}",
                 f"今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
             )
-        if any_single_miss or recent_log["503"] == 1 or any_slow or today_steps >= self.config["daily_steps_warn"]:
+        if any_single_miss or eff_503 == 1 or any_slow or today_steps >= self.config["daily_steps_warn"]:
             reasons = []
             if any_single_miss:
                 reasons.append("单步异常归零")
             if any_slow:
                 reasons.append("疑似暗限速")
-            if recent_log["503"] == 1:
+            if eff_503 == 1:
                 reasons.append("偶发 1 次 503")
             if today_steps >= self.config["daily_steps_warn"]:
                 reasons.append(f"今日步数 {today_steps}")
@@ -797,7 +856,7 @@ class AntigravityMonitorEngine:
             return ("green", "T0", "T0 待命 · 暂无活跃会话", "纯本地只读监控已就绪")
 
         hist_503 = today_log["503"]
-        if hist_503 > 0 and recent_log["503"] == 0:
+        if hist_503 > 0 and eff_503 == 0:
             sub = f"近 {win} 分钟无新异常（今日历史 {hist_503} 条 503 已自动衰减）"
         else:
             sub = f"近 {win} 分钟缓存与底层日志均健康"
@@ -810,7 +869,11 @@ class AntigravityMonitorEngine:
         recent_active: List[ConversationSummary],
         max_consec_miss: int,
         today_steps: int,
+        is_online: bool = True,
     ) -> List[Tuple[str, str, str]]:
+        if grade == "IDLE" or (not is_online and not recent_active):
+            self._baseline_ready = True
+            return []
         candidates: List[Tuple[str, str, str]] = []
         if grade == "T3":
             for ev in notable_events:
@@ -922,6 +985,7 @@ class AntigravityMonitorEngine:
 
     def _poll_account_and_quota(self, now: float, active_family: str = "gemini") -> AccountQuotaInfo:
         info = AccountQuotaInfo(observed_at=now, quota_family=active_family)
+        self._active_hub_pid = 0
         live_email = ""
         if self.daemon_dir.is_dir():
             try:
@@ -958,6 +1022,7 @@ class AntigravityMonitorEngine:
                     info.short_label = short_email_label(live_email)
                     info.tier = str((status.get("userTier") or {}).get("id", "") or "")
                     info.online = True
+                    self._active_hub_pid = pid
 
                     configs = (status.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
                     preferred_keys = ("Claude", "Fable", "Opus", "Sonnet") if active_family == "3p" else ("Neon", "Carbon", "Hydrogen", "Argon", "Gemini")
@@ -1082,7 +1147,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
             lines.append(
                 f"  - {c.short_id} {c.model} {format_tokens(c.context_tokens)} [{bar}] {c.latest_hit_rate:.1f}%{sp}"
             )
-    if snap.wasted_cold_tokens_total > 0:
+    if snap.wasted_cold_tokens_total > 0 and snap.max_consec_miss >= 1:
         lines.append(f"冷算提醒: 近 10 步异常归零累计多耗约 {format_tokens(snap.wasted_cold_tokens_total)} Token")
     return mask_email("\n".join(lines))
 
