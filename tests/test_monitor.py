@@ -16,6 +16,10 @@ from core.log_monitor import (
     AntigravityMonitorEngine,
     LanguageServerLogTailer,
     classify_steps,
+    compute_cli_exit_code,
+    compute_pressure,
+    format_detail_text_report,
+    format_json_snapshot,
     format_text_summary,
     mask_email,
     short_email_label,
@@ -688,6 +692,265 @@ class TestShortcutsAndIcons(unittest.TestCase):
             by_id = {c.short_id: c.is_subagent for c in snap.active_conversations}
             self.assertFalse(by_id["main00"])
             self.assertTrue(by_id["sub000"])
+
+    def test_checkpoint_compact_overrides_idle_rewarm_and_tracks_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "cmp00001-aaaa" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            # Compaction took 220s (>180s idle_rewarm_sec) after CHECKPOINT -> MUST classify as compact_reset, not idle_rewarm or abnormal_zero!
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 260))
+            t_chk = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 150))
+            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 40))
+            t2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 15))
+            lines = [
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 10, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 498000, "output_tokens": 500}),
+                json.dumps({"type": "CHECKPOINT", "step_index": 11, "created_at": t_chk, "input_tokens": 12000, "cache_read_tokens": 500000}),
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 12, "created_at": t1, "model": "gemini-4-neon-xhigh", "input_tokens": 42000, "cache_read_tokens": 0, "output_tokens": 400}),
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 13, "created_at": t2, "model": "gemini-4-neon-xhigh", "input_tokens": 8000, "cache_read_tokens": 42000, "output_tokens": 500}),
+            ]
+            (brain / "transcript.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertEqual(snap.grade, "T0")
+            self.assertEqual(snap.pressure, "normal")
+            self.assertEqual(compute_cli_exit_code(snap), 0)
+            conv = snap.active_conversations[0]
+            self.assertEqual(conv.recent_steps[1].reason, "compact_reset")
+            self.assertEqual(conv.recent_steps[1].classification, "expected_cold")
+            self.assertEqual(conv.recent_steps[1].context_delta, 42000 - 500000)
+            self.assertEqual(conv.latest_context_delta, 8000)
+
+    def test_json_contract_pressure_exit_codes_and_readonly_zero_write(self) -> None:
+        self.assertEqual(compute_pressure("IDLE", 0, 960, 1200), "offline_unknown")
+        self.assertEqual(compute_pressure("T0", 200, 960, 1200), "normal")
+        self.assertEqual(compute_pressure("WARN", 980, 960, 1200), "warn")
+        self.assertEqual(compute_pressure("WARN", 1250, 960, 1200), "red")
+        self.assertEqual(compute_pressure("T1", 100, 960, 1200), "degraded")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger_p = root / "account_ledger.json"
+            ledger = AccountSwitchLedger(ledger_path=ledger_p, read_only=True)
+            ledger.observe_online("de***o", time.time())
+            # Strict read_only MUST NEVER create or touch account_ledger.json on disk!
+            self.assertFalse(ledger_p.exists())
+
+            # Verify JSON contract on offline IDLE snapshot returns exit_code=2 and masks any emails
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": ledger_p,
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=time.time(), target_conversation_id="nonexistent")
+            self.assertEqual(snap.pressure, "offline_unknown")
+            self.assertEqual(compute_cli_exit_code(snap), 2)
+            raw_json = format_json_snapshot(snap)
+            parsed = json.loads(raw_json)
+            self.assertEqual(parsed["schema_version"], "1.0")
+            self.assertEqual(parsed["pressure"], "offline_unknown")
+            self.assertEqual(parsed["exit_code"], 2)
+            self.assertFalse(parsed["target_conversation_found"])
+            self.assertIsNone(parsed["target_conversation"])
+            for req_key in ("observed_at", "account", "grade", "level", "steps", "cache", "perf", "errors_30m", "errors_today", "alerts"):
+                self.assertIn(req_key, parsed)
+            self.assertFalse(ledger_p.exists())
+
+    def test_multi_pool_quota_reset_time_and_cockpit_reset_at(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import os
+        import threading
+
+        payload = {
+            "userStatus": {
+                "email": "tester42@example.com",
+                "userTier": {"id": "g1-pro-tier"},
+                "planStatus": {"planInfo": {"planName": "Pro", "teamsTier": "TEAMS_TIER_PRO"}},
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {"label": "Gemini 4 Neon (XHigh)", "quotaInfo": {"remainingFraction": 0.96, "resetTime": "2026-11-20T12:00:00Z"}},
+                        {"label": "Gemini 4 Carbon (High)", "quotaInfo": {"remainingFraction": 0.96, "resetTime": "2026-11-20T12:00:00Z"}},
+                        {"label": "Claude Opus 5.5", "quotaInfo": {"remainingFraction": 0.24, "resetTime": "2026-11-25T08:00:00Z"}},
+                    ]
+                },
+            }
+        }
+
+        class _MockHub(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _fmt: str, *_args: object) -> None:
+                return
+
+        srv = HTTPServer(("127.0.0.1", 0), _MockHub)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                daemon = root / "daemon"
+                daemon.mkdir()
+                (daemon / "hub_live.json").write_text(
+                    json.dumps({"pid": os.getpid(), "httpPort": port, "csrfToken": "tok_demo"}),
+                    encoding="utf-8",
+                )
+                ck_dir = root / "cockpit"
+                ck_dir.mkdir()
+                (ck_dir / "accounts.json").write_text(
+                    json.dumps({"accounts": [{"id": "acc_demo_1", "email": "tester42@example.com"}]}),
+                    encoding="utf-8",
+                )
+                qdb = ck_dir / "platform-quota-history-v1.sqlite"
+                now_ms = int(time.time() * 1000)
+                reset_wk_ms = now_ms + 3 * 86400 * 1000
+                qconn = sqlite3.connect(qdb)
+                qconn.execute(
+                    "CREATE TABLE quota_observations (account_id TEXT, metric TEXT, remaining REAL, observed_at REAL, reset_at REAL)"
+                )
+                qconn.execute("INSERT INTO quota_observations VALUES ('acc_demo_1', 'gemini-weekly', 71.0, ?, ?)", (now_ms, reset_wk_ms))
+                qconn.execute("INSERT INTO quota_observations VALUES ('acc_demo_1', '3p-weekly', 40.0, ?, ?)", (now_ms, reset_wk_ms))
+                qconn.commit()
+                qconn.close()
+
+                engine = AntigravityMonitorEngine(
+                    paths={
+                        "brain_dir": root / "brain",
+                        "conversations_dir": root / "conversations",
+                        "daemon_dir": daemon,
+                        "ls_log_path": root / "language_server.log",
+                        "cockpit_quota_db": qdb,
+                    },
+                    read_only=True,
+                )
+                snap = engine.poll(force_account=True)
+                self.assertTrue(snap.account.online)
+                self.assertEqual(snap.account.short_label, "te***2")
+                self.assertIn("Pro", snap.account.plan_status)
+                self.assertIn("gemini", snap.account.pools)
+                self.assertIn("3p", snap.account.pools)
+                self.assertAlmostEqual(snap.account.pools["gemini"].five_hour_pct or 0.0, 96.0, places=1)
+                self.assertEqual(snap.account.pools["gemini"].five_hour_reset_at, "2026-11-20T12:00:00Z")
+                self.assertAlmostEqual(snap.account.pools["gemini"].weekly_pct or 0.0, 71.0, places=1)
+                self.assertIsNotNone(snap.account.pools["gemini"].weekly_reset_at)
+                self.assertAlmostEqual(snap.account.pools["3p"].five_hour_pct or 0.0, 24.0, places=1)
+                self.assertEqual(snap.account.pools["3p"].five_hour_reset_at, "2026-11-25T08:00:00Z")
+                self.assertAlmostEqual(snap.account.pools["3p"].weekly_pct or 0.0, 40.0, places=1)
+
+                js = format_json_snapshot(snap)
+                self.assertNotIn("tester42@example.com", js)
+                obj = json.loads(js)
+                self.assertEqual(obj["account"]["pools"]["3p"]["model_count"], 1)
+                self.assertEqual(obj["account"]["pools"]["gemini"]["model_count"], 2)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_swarm_burst_protects_main_t1_step_breakdown_and_detail_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+            now = time.time()
+
+            # 1 older main conversation with T1 consecutive misses (rank 29 by mtime!)
+            main_id = "main9999-aaaa-bbbb"
+            b_main = root / "brain" / main_id / ".system_generated" / "logs"
+            b_main.mkdir(parents=True)
+            main_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "test"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 400)), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 400},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 380)), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 400},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 360)), "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 500},
+            ]
+            (b_main / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in main_rows) + "\n", encoding="utf-8")
+            mconn = sqlite3.connect(convs / f"{main_id}.db")
+            mconn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            mconn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(110000, 0, 400, ttft_s=12, strm_s=4),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(120000, 0, 400, ttft_s=50, strm_s=5),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(130000, 0, 500, ttft_s=95, strm_s=5),))
+            mconn.commit()
+            mconn.close()
+
+            # 28 newer swarm subagents pushing main_id well beyond index 24!
+            for idx in range(28):
+                sid = f"sub{idx:02d}xxx-1111-2222"
+                bs = root / "brain" / sid / ".system_generated" / "logs"
+                bs.mkdir(parents=True)
+                ts_s = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 30 + idx))
+                (bs / "transcript.jsonl").write_text(
+                    json.dumps({"source": "SWARM", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": ts_s, "model": "gemini-4-hydrogen-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 200}) + "\n",
+                    encoding="utf-8",
+                )
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=now, target_conversation_id="main99")
+            # Main conversation MUST be protected from swarm eviction and surface its T1 drop!
+            self.assertEqual(snap.grade, "T1")
+            self.assertEqual(snap.pressure, "degraded")
+            self.assertEqual(compute_cli_exit_code(snap), 1)
+            self.assertEqual(snap.main_today_steps, 3)
+            self.assertEqual(snap.subagent_today_steps, 28)
+            self.assertEqual(snap.today_steps, 31)
+            self.assertGreaterEqual(snap.last_1h_steps, 31)
+            self.assertGreaterEqual(snap.peak_hour_steps_today, 31)
+            self.assertIsNotNone(snap.target_conversation)
+            assert snap.target_conversation is not None
+            self.assertEqual(snap.target_conversation.conversation_id, main_id)
+            self.assertEqual(snap.target_conversation.latest_context_delta, 10000)
+
+            # On-demand full-history detail report
+            detail = engine.read_conversation_detail("main99", now_ts=now)
+            self.assertIsNotNone(detail)
+            assert detail is not None
+            self.assertEqual(detail.total_steps, 3)
+            self.assertEqual(detail.peak_context_tokens, 130000)
+            self.assertAlmostEqual(detail.max_ttft_sec or 0.0, 95.5, places=1)
+            self.assertEqual(len(detail.points), 3)
+            self.assertAlmostEqual(detail.points[0].ttft_sec or 0.0, 12.5, places=1)
+            txt = format_detail_text_report(detail)
+            self.assertIn("main99", txt)
+            self.assertIn("+10.0K", txt)
 
 
 if __name__ == "__main__":

@@ -304,3 +304,61 @@ class ConversationDbReader:
             last_step_epoch_ms=last_step_ms,
             is_subagent_hint=is_subagent_hint,
         )
+
+    def read_full_history(self, conversation_id: str) -> List[GenTelemetry]:
+        """On-demand read of all gen_metadata rows in ascending idx order for detail charts.
+
+        Opens SQLite strictly read-only and closes immediately without polluting the polling LRU cache.
+        """
+        if not conversation_id:
+            return []
+        db_path = self.conversations_dir / f"{conversation_id}.db"
+        if not db_path.is_file():
+            return []
+        uri = _sqlite_ro_uri(db_path)
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+            rows = conn.execute("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").fetchall()
+            parsed: List[GenTelemetry] = []
+            for idx, data in rows:
+                item = parse_gen_metadata_row(int(idx), bytes(data) if data else b"")
+                if item is not None and (item.total_in > 0 or item.output_tokens > 0):
+                    parsed.append(item)
+            return parsed
+        except sqlite3.Error:
+            return []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+    def check_subagent_hint(self, conversation_id: str) -> bool:
+        """Lightweight read-only subagent hint lookup without displacing the full snapshot LRU."""
+        if not conversation_id:
+            return False
+        cached = self._cache.get(conversation_id)
+        if cached is not None:
+            return cached[1].is_subagent_hint
+        db_path = self.conversations_dir / f"{conversation_id}.db"
+        if not db_path.is_file():
+            return False
+        uri = _sqlite_ro_uri(db_path)
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.25)
+            tmb_row = conn.execute("SELECT length(data), data FROM trajectory_metadata_blob LIMIT 1").fetchone()
+            if tmb_row and tmb_row[0] and int(tmb_row[0]) > 16384 and tmb_row[1]:
+                low_blob = bytes(tmb_row[1]).lower()
+                return (b"subagent" in low_blob) or (b"swarm" in low_blob) or (b"worker" in low_blob)
+            return False
+        except sqlite3.Error:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass

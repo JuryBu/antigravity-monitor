@@ -4,8 +4,8 @@
   "freshness_window_sec": 210,
   "idle_rewarm_sec": 180,
   "large_context_threshold": 100000,
-  "daily_steps_warn": 800,
-  "daily_steps_alert": 1000,
+  "daily_steps_warn": 960,
+  "daily_steps_alert": 1200,
   "log_sliding_window_min": 30,
   "slow_tps_threshold": 40.0,
   "slow_ttft_threshold_sec": 45.0,
@@ -14,5 +14,7 @@
   "start_minimized": false,
   "window_alpha": 0.95,
   "window_x": null,
-  "window_y": null
+  "window_y": null,
+  "conv_filter": "main",
+  "conv_list_rows": 5
 }

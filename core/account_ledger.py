@@ -64,9 +64,11 @@ class AccountSwitchLedger:
         self,
         ledger_path: Optional[Path | str] = None,
         cockpit_logs_dir: Optional[Path | str] = None,
+        read_only: bool = False,
     ) -> None:
         self.ledger_path: Optional[Path] = Path(ledger_path) if ledger_path is not None else None
         self.cockpit_logs_dir: Optional[Path] = Path(cockpit_logs_dir) if cockpit_logs_dir is not None else None
+        self.read_only: bool = bool(read_only)
         self._own_events: List[Tuple[float, str]] = []
         self._cockpit_cache: Dict[str, Tuple[Tuple[int, int], List[Tuple[float, str]]]] = {}
         self._load_own()
@@ -93,7 +95,7 @@ class AccountSwitchLedger:
         self._own_events = events[-120:]
 
     def _save_own(self) -> None:
-        if self.ledger_path is None:
+        if self.read_only or self.ledger_path is None:
             return
         try:
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)

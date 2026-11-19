@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +16,19 @@ from typing import Callable, Optional
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
+
+
+def _configure_stdio_utf8() -> None:
+    """Prevent Windows GBK console encoding crashes on Unicode symbols (e.g. '▒', '█')."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_stdio_utf8()
 
 MUTEX_NAME = "Local\\AntigravityMonitorSingleInstanceMutex_v1"
 WAKE_EVENT_NAME = "Local\\AntigravityMonitorWakeupEvent_v1"
@@ -152,23 +166,66 @@ def _spawn_restarted_self(no_tray: bool = False) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    _configure_stdio_utf8()
     parser = argparse.ArgumentParser(description="Antigravity 实时缓存与健康度桌面监控器")
-    parser.add_argument("--cli", action="store_true", help="仅运行单次命令行脱敏体检摘要并退出")
+    parser.add_argument("--cli", action="store_true", help="仅运行单次命令行脱敏体检摘要并退出（默认零写盘）")
+    parser.add_argument("--json", action="store_true", help="输出结构化脱敏 JSON 体检快照并退出（默认零写盘）")
+    parser.add_argument("--readonly", action="store_true", help="严格零写盘模式（不更新 account_ledger.json）")
+    parser.add_argument("--conversation-id", default="", help="定向附带指定对话（完整 UUID 或前缀）的详细状态")
     parser.add_argument("--minimized", action="store_true", help="启动后静默最小化到系统托盘")
     parser.add_argument("--no-tray", action="store_true", help="禁用系统托盘（调试/截图模式）")
     args = parser.parse_args(argv)
 
     from core.config_store import ConfigStore
-    from core.log_monitor import AntigravityMonitorEngine, format_text_summary
+    from core.log_monitor import (
+        AntigravityMonitorEngine,
+        compute_cli_exit_code,
+        format_json_snapshot,
+        format_text_summary,
+    )
 
-    config_store = ConfigStore(APP_ROOT / "config.json")
-    cfg = config_store.load()
-    engine = AntigravityMonitorEngine(config=cfg)
+    is_oneshot = bool(args.cli or args.json)
+    read_only = bool(args.readonly or is_oneshot)
 
-    if args.cli:
-        snap = engine.poll(force_account=True)
-        print(format_text_summary(snap))
-        return 0
+    try:
+        config_store = ConfigStore(APP_ROOT / "config.json")
+        cfg = config_store.load()
+        engine = AntigravityMonitorEngine(config=cfg, read_only=read_only)
+    except Exception as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {"schema_version": "1.0", "ok": False, "pressure": "offline_unknown", "exit_code": 2, "error": str(exc)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
+        if is_oneshot:
+            print(f"Antigravity 监控初始化失败: {exc}", file=sys.stderr)
+            return 2
+        raise
+
+    if is_oneshot:
+        try:
+            snap = engine.poll(force_account=True, target_conversation_id=args.conversation_id)
+            if args.json:
+                print(format_json_snapshot(snap))
+            else:
+                print(format_text_summary(snap))
+            return compute_cli_exit_code(snap)
+        except Exception as exc:
+            if args.json:
+                print(
+                    json.dumps(
+                        {"schema_version": "1.0", "ok": False, "pressure": "offline_unknown", "exit_code": 2, "error": str(exc)},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Antigravity 实时采集失败: {exc}", file=sys.stderr)
+            return 2
 
     _enable_high_dpi()
     guard = SingleInstanceGuard()
