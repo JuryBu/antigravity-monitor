@@ -254,6 +254,7 @@ class ConversationSummary:
     recent_tps_list: List[Optional[float]] = field(default_factory=list)
     ttft_avg_sec: Optional[float] = None
     ttft_max_sec: Optional[float] = None
+    is_subagent: bool = False
 
 
 @dataclass(frozen=True)
@@ -598,8 +599,8 @@ class AntigravityMonitorEngine:
         if paths and "cockpit_logs_dir" not in paths:
             cockpit_logs_dir = None
 
-        self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]]]] = {}
-        self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=12, tail_rows=16)
+        self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]] = {}
+        self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=36, tail_rows=16)
         self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=200)
         self._ledger = AccountSwitchLedger(ledger_path=ledger_path, cockpit_logs_dir=cockpit_logs_dir)
         self._account_cache: AccountQuotaInfo = AccountQuotaInfo()
@@ -644,7 +645,7 @@ class AntigravityMonitorEngine:
         account_today_steps = 0
 
         for idx_conv, (conv_id, tp) in enumerate(all_recent):
-            raw_steps = self._read_transcript_cached(conv_id, tp)
+            raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(conv_id, tp)
             if not raw_steps:
                 continue
 
@@ -657,8 +658,8 @@ class AntigravityMonitorEngine:
                         if owner.lower() == cur_acct_label.lower():
                             account_today_steps += 1
 
-            # Only build full ConversationSummary for the top 16 most recently updated conversations
-            if idx_conv >= 16:
+            # Build full ConversationSummary for the top 24 most recently updated conversations
+            if idx_conv >= 24:
                 continue
 
             steps = classify_steps(
@@ -703,7 +704,8 @@ class AntigravityMonitorEngine:
             fresh_invalid = ""
             if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
                 age = now - latest.timestamp
-                if age <= 15 * 60:
+                # Keep expired items visible for only 5 min past freshness window so stale sessions clear out cleanly
+                if age <= self.config["freshness_window_sec"] + 300:
                     if latest.classification == "abnormal_miss" and (current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0):
                         fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
                     elif current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0:
@@ -732,15 +734,18 @@ class AntigravityMonitorEngine:
                     cacheable_in_recent10=cacheable_r10,
                     recent10_hit_ratio=hit_ratio_r10,
                     first_abnormal_step_in_recent10=first_abn_step_r10,
+                    is_subagent=(not has_user_explicit) and has_subagent_marker,
                 )
             )
 
         convs.sort(key=lambda c: c.latest_timestamp, reverse=True)
-        top_convs = convs[:4]
+        top_convs = convs[:24]
 
         for c in top_convs:
             snap: Optional[ConversationDbSnapshot] = self._db_reader.read(c.conversation_id)
             if snap:
+                if snap.is_subagent_hint and not self._transcript_cache.get(c.conversation_id, (None, [], False, False))[2]:
+                    c.is_subagent = True
                 valid_gens = [g for g in snap.recent if g.total_in > 0 or g.output_tokens > 0][-10:]
                 c.recent_ttfts = [g.ttft_sec for g in valid_gens]
                 c.recent_tps_list = [g.tps for g in valid_gens]
@@ -757,7 +762,9 @@ class AntigravityMonitorEngine:
                     c.shard_tag = gen.shard_tag
                     c.speed_status = self._classify_speed(gen.output_tokens, gen.tps, gen.ttft_sec, c.context_tokens)
 
-        primary = top_convs[0] if top_convs else None
+        # Prefer latest active MAIN conversation for headline/speed/cache bar so short-lived subagents never hijack it
+        main_convs = [c for c in top_convs if not c.is_subagent]
+        primary = main_convs[0] if main_convs else (top_convs[0] if top_convs else None)
         active_family = "3p" if (primary and any(k in primary.model_raw.lower() for k in ("claude", "fable", "opus", "sonnet", "gpt"))) else "gemini"
         if active_family != self._last_quota_family:
             self._account_cache = self._poll_account_and_quota(now, active_family)
@@ -773,15 +780,16 @@ class AntigravityMonitorEngine:
             steps_scope_label = "全机"
             today_steps = total_today_steps
 
-        # Large-context freshness candidates (include invalid cr=0 large conversations so UI never hides them)
+        # Large-context freshness tracks MAIN conversations only (retired subagents never hijack freshness)
+        # Priority: 0) active invalid cr=0 -> 1) still-warm (remaining > 0, soonest expiring first) -> 2) recently expired (most recent first)
         large_freshness = [
             c for c in convs
-            if c.freshness_remaining_sec is not None or c.freshness_invalid_reason
+            if (not c.is_subagent) and (c.freshness_remaining_sec is not None or c.freshness_invalid_reason)
         ]
         large_freshness.sort(
             key=lambda c: (
-                0 if c.freshness_invalid_reason else 1,
-                c.freshness_remaining_sec if c.freshness_remaining_sec is not None else 999999,
+                0 if c.freshness_invalid_reason else (1 if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else 2),
+                c.freshness_remaining_sec if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else (-c.latest_timestamp),
             )
         )
 
@@ -1095,22 +1103,30 @@ class AntigravityMonitorEngine:
         merged = today_items + older_items[:16]
         return [(cid, tp) for _, cid, tp in merged]
 
-    def _read_transcript_cached(self, conv_id: str, tp: Path) -> List[Dict[str, Any]]:
+    def _read_transcript_cached(self, conv_id: str, tp: Path) -> Tuple[List[Dict[str, Any]], bool, bool]:
         try:
             st = tp.stat()
         except OSError:
             self._transcript_cache.pop(conv_id, None)
-            return []
+            return [], False, False
 
         stamp = (st.st_mtime_ns, st.st_size)
         cached = self._transcript_cache.get(conv_id)
         if cached is not None and cached[0] == stamp:
-            return cached[1]
+            return cached[1], cached[2], cached[3]
 
         parsed: List[Dict[str, Any]] = []
+        has_user_explicit = False
+        has_subagent_marker = False
         try:
             with tp.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
+                    if not has_user_explicit and '"USER_EXPLICIT"' in line:
+                        has_user_explicit = True
+                    if not has_subagent_marker and (
+                        '"SUBAGENT"' in line or '"SWARM"' in line or "[swarm]" in line or '"source":"AGENT"' in line
+                    ):
+                        has_subagent_marker = True
                     if '"PLANNER_RESPONSE"' not in line or '"input_tokens"' not in line:
                         continue
                     try:
@@ -1131,13 +1147,13 @@ class AntigravityMonitorEngine:
                         }
                     )
         except OSError:
-            return cached[1] if cached is not None else []
+            return (cached[1], cached[2], cached[3]) if cached is not None else ([], False, False)
 
-        self._transcript_cache[conv_id] = (stamp, parsed)
+        self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
         if len(self._transcript_cache) > 256:
             oldest_key = next(iter(self._transcript_cache))
             self._transcript_cache.pop(oldest_key, None)
-        return parsed
+        return parsed, has_user_explicit, has_subagent_marker
 
     def _poll_account_and_quota(self, now: float, active_family: str = "gemini") -> AccountQuotaInfo:
         info = AccountQuotaInfo(observed_at=now, quota_family=active_family)
@@ -1301,15 +1317,19 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         f"底层日志 (近 {snap.sliding_window_min}m / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
     ]
     if snap.active_conversations:
-        lines.append("活跃对话 (近 10 步):")
-        for c in snap.active_conversations:
+        main_list = [c for c in snap.active_conversations if not c.is_subagent]
+        sub_list = [c for c in snap.active_conversations if c.is_subagent]
+        lines.append(f"活跃对话 (主对话 {len(main_list)} / 子代理 {len(sub_list)}，展示近 10 步):")
+        ordered = main_list[:6] + sub_list[:4]
+        for c in ordered:
+            tag = "[子]" if c.is_subagent else "[主]"
             bar = "".join("█" if s.classification == "hit" else ("▒" if s.classification == "expected_cold" else "×") for s in c.recent_steps)
             sp = f" {c.tps:.0f}t/s" if c.tps is not None else ""
             tf = f" TTFT {c.ttft_sec:.1f}s" if c.ttft_sec is not None else ""
             if c.ttft_avg_sec is not None and c.ttft_max_sec is not None and len([x for x in c.recent_ttfts if x is not None]) >= 2:
                 tf += f"(均{c.ttft_avg_sec:.0f}/峰{c.ttft_max_sec:.0f}s)"
             lines.append(
-                f"  - {c.short_id} {c.model} {format_tokens(c.context_tokens)} [{bar}] {c.latest_hit_rate:.1f}%{tf}{sp}"
+                f"  - {tag} {c.short_id} {c.model} {format_tokens(c.context_tokens)} [{bar}] {c.latest_hit_rate:.1f}%{tf}{sp}"
             )
     if snap.wasted_cold_tokens_total > 0 and (snap.max_consec_miss >= 1 or snap.max_abnormal_recent10 >= 2):
         lines.append(f"冷算提醒: 近 10 步异常归零累计多耗约 {format_tokens(snap.wasted_cold_tokens_total)} Token")

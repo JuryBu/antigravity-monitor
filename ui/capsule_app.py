@@ -176,7 +176,14 @@ class AntigravityCapsuleApp:
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
 
         self._tooltip_win: Optional[tk.Toplevel] = None
-        self._conv_hover_texts: List[str] = ["", "", "", ""]
+        self._conv_hover_texts: List[str] = []
+        self._conv_filter: str = str(self.config.get("conv_filter", "main"))
+        self._conv_list_rows: int = int(self.config.get("conv_list_rows", 5))
+        self._conv_row_px: int = 24
+        self._resize_origin_y: int = 0
+        self._resize_origin_rows: int = self._conv_list_rows
+        self._scroll_drag_origin_y: int = 0
+        self._scroll_drag_origin_top: float = 0.0
 
         self._build_collapsed_bar()
         self._build_expanded_panel()
@@ -335,22 +342,69 @@ class AntigravityCapsuleApp:
         self._lbl_fresh_big = tk.Label(self._card_fresh, text="闲置", font=(MONO_FONT, 11, "bold"), anchor="w")
         self._lbl_fresh_big.pack(fill="x", pady=(2, 0))
 
-        # --- Module 3: Active Conversations 10-Step TTFT + Cache Micro-Bars (DPI-safe grid layout) ---
+        # --- Module 3: Active Conversations (Categorized + Scrollable + Resizable) ---
         self._card_convs = tk.Frame(self._details, padx=10, pady=8, highlightthickness=1)
         self._card_convs.pack(fill="x", pady=(0, 8))
         conv_hdr = tk.Frame(self._card_convs)
         conv_hdr.pack(fill="x", pady=(0, 6))
-        self._lbl_convs_title = tk.Label(conv_hdr, text="活跃对话 · 首字 TTFT 与缓存（近 10 步）", font=(UI_FONT, 9, "bold"))
+        self._lbl_convs_title = tk.Label(conv_hdr, text="活跃对话 · TTFT 与缓存", font=(UI_FONT, 9, "bold"))
         self._lbl_convs_title.pack(side="left")
-        self._lbl_convs_legend = tk.Label(conv_hdr, text="悬停看逐拍明细 │ 绿良 橙警 红异常", font=(UI_FONT, 8))
-        self._lbl_convs_legend.pack(side="right")
 
-        self._convs_table = tk.Frame(self._card_convs)
-        self._convs_table.pack(fill="x")
+        self._filter_bar = tk.Frame(conv_hdr)
+        self._filter_bar.pack(side="right")
+        self._filter_buttons: Dict[str, tk.Label] = {}
+        for f_key, f_lbl in (("main", "主对话"), ("subagent", "子代理"), ("all", "全部")):
+            fb = tk.Label(
+                self._filter_bar,
+                text=f_lbl,
+                font=(UI_FONT, 8),
+                padx=6,
+                pady=1,
+                cursor="hand2",
+            )
+            fb.pack(side="left", padx=(4, 0))
+            fb.bind("<Button-1>", lambda _e, k=f_key: self.set_conv_filter(k))
+            self._filter_buttons[f_key] = fb
+
+        self._convs_viewport_wrap = tk.Frame(self._card_convs)
+        self._convs_viewport_wrap.pack(fill="x")
+        self._conv_viewport = tk.Canvas(
+            self._convs_viewport_wrap,
+            height=self._conv_list_rows * self._conv_row_px,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._conv_viewport.pack(side="left", fill="both", expand=True)
+
+        self._conv_scrollbar = tk.Canvas(
+            self._convs_viewport_wrap,
+            width=7,
+            height=self._conv_list_rows * self._conv_row_px,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self._conv_scrollbar.pack(side="right", fill="y", padx=(4, 0))
+        self._conv_scrollbar.bind("<ButtonPress-1>", self._on_scrollbar_press)
+        self._conv_scrollbar.bind("<B1-Motion>", self._on_scrollbar_drag)
+        self._conv_scrollbar.bind("<Configure>", lambda _e: self._sync_custom_scrollbar())
+
+        self._convs_table = tk.Frame(self._conv_viewport)
         self._convs_table.grid_columnconfigure(1, weight=1)
+        self._conv_win_id = self._conv_viewport.create_window((0, 0), window=self._convs_table, anchor="nw")
+        self._conv_viewport.bind(
+            "<Configure>",
+            lambda e: (self._conv_viewport.itemconfigure(self._conv_win_id, width=e.width), self._sync_custom_scrollbar()),
+        )
+        self._convs_table.bind("<Configure>", lambda _e: self._update_conv_scrollregion())
+
+        for sc_w in (self._card_convs, self._convs_viewport_wrap, self._conv_viewport, self._convs_table, self._conv_scrollbar):
+            sc_w.bind("<MouseWheel>", self._on_conv_mousewheel)
+
         self._conv_rows: List[Dict[str, Any]] = []
-        self._lbl_convs_empty = tk.Label(self._convs_table, text="暂无近 24 小时活跃对话记录", font=(UI_FONT, 8), anchor="w")
-        for r_idx in range(4):
+        self._lbl_convs_empty = tk.Label(self._convs_table, text="当前分类暂无活跃对话记录", font=(UI_FONT, 8), anchor="w")
+        self._lbl_convs_empty.bind("<MouseWheel>", self._on_conv_mousewheel)
+        for r_idx in range(24):
             lbl_id = tk.Label(self._convs_table, text="", font=(MONO_FONT, 9, "bold"), anchor="w", width=7)
             lbl_mod = tk.Label(self._convs_table, text="", font=(UI_FONT, 8), anchor="w")
             lbl_ctx = tk.Label(self._convs_table, text="", font=(MONO_FONT, 8), anchor="e", width=6)
@@ -362,6 +416,7 @@ class AntigravityCapsuleApp:
             for hover_w in (lbl_id, lbl_mod, lbl_ctx, ttft_cv, lbl_ttft, bar_cv, lbl_hit, lbl_spd):
                 hover_w.bind("<Enter>", lambda e, idx=r_idx: self._show_conv_tooltip(idx, e))
                 hover_w.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
+                hover_w.bind("<MouseWheel>", self._on_conv_mousewheel)
             self._conv_rows.append(
                 {
                     "row": r_idx,
@@ -408,9 +463,9 @@ class AntigravityCapsuleApp:
         self._lbl_banner = tk.Label(self._banner_frame, text="纯本地只读监控运行中", font=(UI_FONT, 8), anchor="w", justify="left", wraplength=520)
         self._lbl_banner.pack(fill="x")
 
-        # --- Module 5: Quick Action Bar ---
+        # --- Module 5: Quick Action Bar + Bottom Height Resize Grip ---
         self._actions_row = tk.Frame(self._details, pady=2)
-        self._actions_row.pack(fill="x", pady=(0, 10))
+        self._actions_row.pack(fill="x", pady=(0, 4))
         for i in range(5):
             self._actions_row.grid_columnconfigure(i, weight=1, uniform="act")
 
@@ -437,6 +492,19 @@ class AntigravityCapsuleApp:
             btn.bind("<Enter>", lambda _e, b=btn: b.configure(bg=self.theme["btn_hover"]))
             btn.bind("<Leave>", lambda _e, b=btn: b.configure(bg=self.theme["btn_bg"]))
             self._action_buttons[key] = btn
+
+        self._resize_grip = tk.Canvas(
+            self._details,
+            height=9,
+            highlightthickness=0,
+            bd=0,
+            cursor="sb_v_double_arrow",
+        )
+        self._resize_grip.pack(fill="x", pady=(0, 3))
+        self._resize_grip.bind("<ButtonPress-1>", self._on_resize_start)
+        self._resize_grip.bind("<B1-Motion>", self._on_resize_drag)
+        self._resize_grip.bind("<ButtonRelease-1>", self._on_resize_end)
+        self._resize_grip.bind("<Configure>", lambda _e: self._draw_resize_grip())
 
     def _bind_recursive_context_menu(self, root_widget: tk.Widget) -> None:
         excluded = set(self._action_buttons.values())
@@ -521,7 +589,11 @@ class AntigravityCapsuleApp:
         self._lbl_fresh_big.configure(bg=t["card_bg"], fg=t["text_primary"])
 
         self._lbl_convs_title.configure(bg=t["card_bg"], fg=t["text_primary"])
-        self._lbl_convs_legend.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._filter_bar.configure(bg=t["card_bg"])
+        self._refresh_filter_buttons()
+        self._convs_viewport_wrap.configure(bg=t["card_bg"])
+        self._conv_viewport.configure(bg=t["card_bg"])
+        self._conv_scrollbar.configure(bg=t["card_bg"])
         self._convs_table.configure(bg=t["card_bg"])
         self._lbl_convs_empty.configure(bg=t["card_bg"], fg=t["text_muted"])
         for row_ui in self._conv_rows:
@@ -533,6 +605,9 @@ class AntigravityCapsuleApp:
             row_ui["canvas"].configure(bg=t["card_bg"])
             row_ui["hit"].configure(bg=t["card_bg"])
             row_ui["speed"].configure(bg=t["card_bg"])
+        self._resize_grip.configure(bg=t["panel_bg"])
+        self._draw_resize_grip()
+        self._sync_custom_scrollbar()
 
         self._lbl_logs_title.configure(bg=t["card_bg"], fg=t["text_primary"])
         self._log_grid.configure(bg=t["card_bg"])
@@ -835,8 +910,12 @@ class AntigravityCapsuleApp:
             self._lbl_bar_fresh.configure(text=f"保鲜 {fresh_txt}", fg=fresh_color)
 
         acc_txt = snap.account.short_label
-        if snap.account.five_hour_pct is not None:
+        if snap.account.five_hour_pct is not None and snap.account.weekly_pct is not None:
+            acc_txt += f" {snap.account.five_hour_pct:.0f}%/周{snap.account.weekly_pct:.0f}%"
+        elif snap.account.five_hour_pct is not None:
             acc_txt += f" {snap.account.five_hour_pct:.0f}%"
+        elif snap.account.weekly_pct is not None:
+            acc_txt += f" 周{snap.account.weekly_pct:.0f}%"
         self._lbl_bar_acc.configure(text=acc_txt)
 
         step_bar_color = compute_steps_color(
@@ -1084,23 +1163,158 @@ class AntigravityCapsuleApp:
                 pass
             self._tooltip_win = None
 
+    def set_conv_filter(self, mode: str) -> None:
+        if mode not in ("main", "subagent", "all"):
+            return
+        self._conv_filter = mode
+        self.config["conv_filter"] = mode
+        self.config_store.save(self.config)
+        self._conv_viewport.yview_moveto(0.0)
+        self._refresh_filter_buttons()
+        if self._latest_snapshot is not None and self._expanded:
+            self._draw_conversation_bars(self._latest_snapshot)
+
+    def _refresh_filter_buttons(self, main_cnt: Optional[int] = None, sub_cnt: Optional[int] = None) -> None:
+        t = self.theme
+        counts = {}
+        if main_cnt is not None and sub_cnt is not None:
+            counts = {"main": main_cnt, "subagent": sub_cnt, "all": main_cnt + sub_cnt}
+        base_labels = {"main": "主对话", "subagent": "子代理", "all": "全部"}
+        for key, btn in self._filter_buttons.items():
+            txt = f"{base_labels[key]}({counts[key]})" if key in counts else base_labels[key]
+            active = key == self._conv_filter
+            btn.configure(
+                text=txt,
+                bg=t["btn_hover"] if active else t["card_alt_bg"],
+                fg=t["cyan"] if active else t["text_muted"],
+                font=(UI_FONT, 8, "bold") if active else (UI_FONT, 8),
+            )
+
+    def _update_conv_scrollregion(self) -> None:
+        try:
+            bbox = self._conv_viewport.bbox("all")
+            if bbox:
+                self._conv_viewport.configure(scrollregion=bbox)
+        except tk.TclError:
+            pass
+        self._sync_custom_scrollbar()
+
+    def _sync_custom_scrollbar(self) -> None:
+        sb = self._conv_scrollbar
+        t = self.theme
+        try:
+            sb.delete("all")
+            h = max(16, sb.winfo_height())
+            w = max(6, sb.winfo_width())
+            first, last = self._conv_viewport.yview()
+            if last - first >= 0.995:
+                return
+            sb.create_rectangle(1, 2, w - 1, h - 2, fill=t["bar_track"], outline="")
+            y0 = max(2, int(round(first * (h - 4))) + 2)
+            y1 = min(h - 2, max(y0 + 18, int(round(last * (h - 4))) + 2))
+            sb.create_rectangle(1, y0, w - 1, y1, fill=t["cyan"], outline="")
+        except tk.TclError:
+            pass
+
+    def _on_conv_mousewheel(self, event: tk.Event) -> None:
+        first, last = self._conv_viewport.yview()
+        if last - first >= 0.995:
+            return
+        step = -1 if event.delta > 0 else 1
+        self._conv_viewport.yview_scroll(step, "units")
+        self._sync_custom_scrollbar()
+        self._hide_conv_tooltip()
+
+    def _on_scrollbar_press(self, event: tk.Event) -> None:
+        first, last = self._conv_viewport.yview()
+        if last - first >= 0.995:
+            return
+        self._scroll_drag_origin_y = event.y
+        self._scroll_drag_origin_top = first
+        h = max(16, self._conv_scrollbar.winfo_height())
+        thumb_frac = max(0.05, last - first)
+        target = max(0.0, min(1.0 - thumb_frac, (event.y / float(h)) - thumb_frac / 2.0))
+        self._conv_viewport.yview_moveto(target)
+        self._sync_custom_scrollbar()
+
+    def _on_scrollbar_drag(self, event: tk.Event) -> None:
+        first, last = self._conv_viewport.yview()
+        if last - first >= 0.995:
+            return
+        h = max(16, self._conv_scrollbar.winfo_height())
+        dy = event.y - self._scroll_drag_origin_y
+        target = max(0.0, min(1.0 - (last - first), self._scroll_drag_origin_top + dy / float(h)))
+        self._conv_viewport.yview_moveto(target)
+        self._sync_custom_scrollbar()
+
+    def _draw_resize_grip(self) -> None:
+        g = self._resize_grip
+        t = self.theme
+        try:
+            g.delete("all")
+            w = max(80, g.winfo_width())
+            cx = w // 2
+            g.create_rectangle(cx - 22, 3, cx + 22, 6, fill=t["border"], outline="")
+        except tk.TclError:
+            pass
+
+    def _on_resize_start(self, event: tk.Event) -> None:
+        self._resize_origin_y = event.y_root
+        self._resize_origin_rows = self._conv_list_rows
+
+    def _on_resize_drag(self, event: tk.Event) -> None:
+        dy = event.y_root - self._resize_origin_y
+        delta_rows = int(round(dy / float(max(18, self._conv_row_px))))
+        new_rows = max(3, min(12, self._resize_origin_rows + delta_rows))
+        if new_rows != self._conv_list_rows:
+            self._conv_list_rows = new_rows
+            if self._latest_snapshot is not None:
+                self._draw_conversation_bars(self._latest_snapshot)
+            else:
+                self._conv_viewport.configure(height=self._conv_list_rows * self._conv_row_px)
+                self._sync_custom_scrollbar()
+
+    def _on_resize_end(self, _event: tk.Event) -> None:
+        self.config["conv_list_rows"] = self._conv_list_rows
+        self.config_store.save(self.config)
+        self._clamp_window_to_screen()
+
     def _draw_conversation_bars(self, snap: MonitorSnapshot) -> None:
         t = self.theme
-        convs = snap.active_conversations[:4]
+        all_convs = snap.active_conversations[:24]
+        main_convs = [c for c in all_convs if not c.is_subagent]
+        sub_convs = [c for c in all_convs if c.is_subagent]
+        self._refresh_filter_buttons(len(main_convs), len(sub_convs))
+
+        if self._conv_filter == "main":
+            convs = main_convs
+        elif self._conv_filter == "subagent":
+            convs = sub_convs
+        else:
+            convs = all_convs
+
         all_keys = ("id", "model", "ctx", "ttft_canvas", "ttft_val", "canvas", "hit", "speed")
+        self._conv_hover_texts = [""] * len(self._conv_rows)
 
         if not convs:
-            self._conv_hover_texts = ["", "", "", ""]
             for row_ui in self._conv_rows:
                 for key in all_keys:
                     row_ui[key].grid_remove()
+            empty_msg = {
+                "main": "暂无近 24 小时活跃主对话",
+                "subagent": "当前无近 24 小时子代理记录",
+                "all": "暂无近 24 小时活跃对话记录",
+            }.get(self._conv_filter, "暂无活跃对话记录")
+            self._lbl_convs_empty.configure(text=empty_msg)
             self._lbl_convs_empty.grid(row=0, column=0, columnspan=8, sticky="w", pady=4)
+            self._conv_viewport.configure(height=28)
+            self._conv_scrollbar.configure(height=28)
+            self._update_conv_scrollregion()
             return
 
         self._lbl_convs_empty.grid_remove()
         for idx, row_ui in enumerate(self._conv_rows):
             if idx >= len(convs):
-                self._conv_hover_texts[idx] = ""
                 for key in all_keys:
                     row_ui[key].grid_remove()
                 continue
@@ -1108,7 +1322,8 @@ class AntigravityCapsuleApp:
             conv = convs[idx]
             self._conv_hover_texts[idx] = self._build_conv_tooltip_text(conv)
             row_ui["id"].configure(text=conv.short_id, fg=t["text_primary"])
-            row_ui["model"].configure(text=conv.model, fg=t["text_secondary"])
+            mod_txt = f"子·{conv.model}" if (self._conv_filter == "all" and conv.is_subagent) else conv.model
+            row_ui["model"].configure(text=mod_txt, fg=t["text_muted"] if conv.is_subagent else t["text_secondary"])
             row_ui["ctx"].configure(text=format_tokens(conv.context_tokens), fg=t["text_secondary"])
 
             if conv.ttft_sec is not None:
@@ -1185,6 +1400,16 @@ class AntigravityCapsuleApp:
                     h_ratio = 1.0
                 top_y = bar_bot - int(round((bar_bot - bar_top) * h_ratio))
                 c.create_rectangle(x0, top_y, x1, bar_bot, fill=col, outline="")
+
+        self._convs_table.update_idletasks()
+        if convs:
+            measured_row = max(20, self._conv_rows[0]["id"].winfo_reqheight() + 6)
+            self._conv_row_px = measured_row
+        vis_rows = min(len(convs), self._conv_list_rows)
+        vp_h = max(28, vis_rows * self._conv_row_px)
+        self._conv_viewport.configure(height=vp_h)
+        self._conv_scrollbar.configure(height=vp_h)
+        self._update_conv_scrollregion()
 
     # ------------------------------------------------------------------ Polling & lifecycle
     def _worker_loop(self) -> None:

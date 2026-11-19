@@ -25,9 +25,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "window_alpha": 0.95,
     "window_x": None,
     "window_y": None,
+    "conv_filter": "main",
+    "conv_list_rows": 5,
 }
 
 VALID_THEMES = ("midnight_blue", "obsidian_dark")
+VALID_CONV_FILTERS = ("main", "subagent", "all")
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -69,6 +72,10 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
     cfg["notifications_enabled"] = bool(raw.get("notifications_enabled", True))
     cfg["start_minimized"] = bool(raw.get("start_minimized", False))
     cfg["window_alpha"] = _clamp_float(raw.get("window_alpha"), 0.95, 0.72, 1.0)
+    conv_filter = raw.get("conv_filter")
+    if conv_filter in VALID_CONV_FILTERS:
+        cfg["conv_filter"] = conv_filter
+    cfg["conv_list_rows"] = _clamp_int(raw.get("conv_list_rows"), 5, 3, 12)
 
     for coord in ("window_x", "window_y"):
         val = raw.get(coord)

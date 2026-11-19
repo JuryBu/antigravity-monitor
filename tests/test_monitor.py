@@ -626,6 +626,69 @@ class TestShortcutsAndIcons(unittest.TestCase):
         self.assertEqual(compute_steps_color(1200, 960, 1200, g, r), r)
         self.assertEqual(compute_steps_color(1800, 960, 1200, g, r), r)
 
+    def test_subagent_classification_primary_isolation_and_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+            now = time.time()
+
+            # Main conversation (warm 200K, 30s ago -> remaining ~180s)
+            b_main = root / "brain" / "main0001-1111" / ".system_generated" / "logs"
+            b_main.mkdir(parents=True)
+            t_main = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 30))
+            (b_main / "transcript.jsonl").write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>hi</USER_REQUEST>"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": t_main, "model": "gemini-4-neon-xhigh", "input_tokens": 3000, "cache_read_tokens": 197000, "output_tokens": 500}) + "\n",
+                encoding="utf-8",
+            )
+
+            # Newer retired subagent (220K, expired 260s ago, PLUS a brand-new 50K subagent 5s ago)
+            b_sub1 = root / "brain" / "sub00001-2222" / ".system_generated" / "logs"
+            b_sub1.mkdir(parents=True)
+            t_sub1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 260))
+            (b_sub1 / "transcript.jsonl").write_text(
+                json.dumps({"source": "MODEL", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t_sub1, "model": "gemini-4-hydrogen-xhigh", "input_tokens": 5000, "cache_read_tokens": 215000, "output_tokens": 200}) + "\n",
+                encoding="utf-8",
+            )
+            conn1 = sqlite3.connect(convs / "sub00001-2222.db")
+            conn1.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn1.execute("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)")
+            conn1.execute("INSERT INTO trajectory_metadata_blob VALUES ('main', ?)", (b"swarm worker subagent " * 1000,))
+            conn1.commit()
+            conn1.close()
+
+            b_sub2 = root / "brain" / "sub00002-3333" / ".system_generated" / "logs"
+            b_sub2.mkdir(parents=True)
+            t_sub2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 5))
+            (b_sub2 / "transcript.jsonl").write_text(
+                json.dumps({"source": "SWARM", "type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t_sub2, "model": "gemini-4-hydrogen-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n",
+                encoding="utf-8",
+            )
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                }
+            )
+            snap = engine.poll(now_ts=now)
+            # Primary model/hit stays locked on MAIN conversation (Neon XHigh), not hijacked by newer Hydrogen subagent!
+            self.assertEqual(snap.active_model, "Neon XHigh")
+            self.assertAlmostEqual(snap.primary_hit_rate or 0.0, 98.5, places=1)
+            # Freshness tracks MAIN warm conversation (~180s), NOT expired subagent sub00001!
+            self.assertEqual(snap.min_freshness_conv, "main00")
+            self.assertIsNotNone(snap.min_freshness_sec)
+            self.assertGreater(snap.min_freshness_sec or 0, 150)
+            by_id = {c.short_id: c.is_subagent for c in snap.active_conversations}
+            self.assertFalse(by_id["main00"])
+            self.assertTrue(by_id["sub000"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,7 @@ class ConversationDbSnapshot:
     recent: Tuple[GenTelemetry, ...]
     max_context_tokens: int
     last_step_epoch_ms: int
+    is_subagent_hint: bool = False
 
 
 def _read_varint(buf: bytes | memoryview, pos: int) -> Tuple[int, int]:
@@ -274,6 +275,16 @@ class ConversationDbReader:
                             last_step_ms = int(ts_map[1][0]) * 1000
             except sqlite3.Error:
                 pass
+
+            is_subagent_hint = False
+            try:
+                tmb_row = cur.execute("SELECT length(data), data FROM trajectory_metadata_blob LIMIT 1").fetchone()
+                if tmb_row and tmb_row[0] and int(tmb_row[0]) > 16384 and tmb_row[1]:
+                    low_blob = bytes(tmb_row[1]).lower()
+                    if b"subagent" in low_blob or b"swarm" in low_blob or b"worker" in low_blob:
+                        is_subagent_hint = True
+            except sqlite3.Error:
+                pass
         finally:
             conn.close()
 
@@ -291,4 +302,5 @@ class ConversationDbReader:
             recent=tuple(parsed),
             max_context_tokens=max_ctx,
             last_step_epoch_ms=last_step_ms,
+            is_subagent_hint=is_subagent_hint,
         )
