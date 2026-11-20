@@ -18,6 +18,7 @@ from core.log_monitor import (
     MonitorSnapshot,
     format_countdown,
     format_delta_tokens,
+    format_model_name,
     format_text_summary,
     format_tokens,
     truncate_display_width,
@@ -184,6 +185,7 @@ class AntigravityCapsuleApp:
         self._hovered_row_idx: Optional[int] = None
         self._pinned_conv_id: Optional[str] = None
         self._fresh_hover_text: str = ""
+        self._speed_hover_text: str = ""
         self._detail_win: Optional[ConversationDetailWindow] = None
         self._conv_filter: str = str(self.config.get("conv_filter", "main"))
         self._conv_list_rows: int = int(self.config.get("conv_list_rows", 5))
@@ -330,6 +332,7 @@ class AntigravityCapsuleApp:
         self._lbl_speed_title.pack(side="left")
         self._lbl_pin_badge = tk.Label(sp_top, text="", font=(MONO_FONT, 7, "bold"), padx=4, pady=0, cursor="hand2")
         self._lbl_pin_badge.bind("<Button-1>", lambda _e: self.set_pinned_conversation(None))
+        self._lbl_models_badge = tk.Label(sp_top, text="", font=(UI_FONT, 7, "bold"), padx=4, pady=0)
         self._lbl_ttft = tk.Label(sp_top, text="TTFT —", font=(MONO_FONT, 8))
         self._lbl_ttft.pack(side="right")
         sp_bot = tk.Frame(self._card_speed)
@@ -340,6 +343,9 @@ class AntigravityCapsuleApp:
         self._lbl_speed_badge.pack(side="right")
         self._lbl_ttft_stats = tk.Label(self._card_speed, text="近10步 TTFT 待采样", font=(MONO_FONT, 8), anchor="w")
         self._lbl_ttft_stats.pack(fill="x", pady=(3, 0))
+        for sw in (self._card_speed, sp_top, sp_bot, self._lbl_speed_title, self._lbl_models_badge, self._lbl_ttft, self._lbl_tps_big, self._lbl_speed_badge, self._lbl_ttft_stats):
+            sw.bind("<Enter>", self._show_speed_tooltip)
+            sw.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._card_fresh = tk.Frame(self._mid_row, padx=10, pady=8, highlightthickness=1)
         self._card_fresh.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
@@ -609,6 +615,7 @@ class AntigravityCapsuleApp:
 
         self._lbl_speed_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_pin_badge.configure(bg=t["btn_hover"], fg=t["cyan"])
+        self._lbl_models_badge.configure(bg=t["card_alt_bg"], fg=t["cyan"])
         self._lbl_ttft.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_tps_big.configure(bg=t["card_bg"], fg=t["text_primary"])
         self._lbl_speed_badge.configure(bg=t["green_bg"], fg=t["green"])
@@ -1060,6 +1067,13 @@ class AntigravityCapsuleApp:
         else:
             self._lbl_pin_badge.pack_forget()
 
+        if len(snap.model_stats) >= 2:
+            self._lbl_models_badge.configure(text=f"{len(snap.model_stats)}模 ▾")
+            self._lbl_models_badge.pack(side="left", padx=(5, 0))
+        else:
+            self._lbl_models_badge.pack_forget()
+        self._speed_hover_text = self._build_model_stats_tooltip_text(snap)
+
         ttft_txt = f"TTFT {disp_ttft:.1f}s" if disp_ttft is not None else "TTFT —"
         ttft_col = t["red"] if (disp_ttft or 0) >= 90 else (t["orange"] if (disp_ttft or 0) >= 45 else t["text_secondary"])
         self._lbl_ttft.configure(text=ttft_txt, fg=ttft_col)
@@ -1117,10 +1131,12 @@ class AntigravityCapsuleApp:
         # Module 3: 10-step micro bars
         self._draw_conversation_bars(snap)
 
-        # Module 4: Sliding-window log stats (always dual format recent / today; muted while offline)
+        # Module 4: Sliding-window log stats (per-account isolated recent / today; muted while offline)
         logs_live = bool(snap.account.online) and snap.grade != "IDLE"
         if logs_live:
-            self._lbl_logs_title.configure(text=f"底层日志滑动窗监控（近 {snap.sliding_window_min} 分钟 / 今日）")
+            self._lbl_logs_title.configure(
+                text=f"底层日志滑动窗监控（{snap.log_scope_label} · 近 {snap.sliding_window_min} 分钟 / 今日）"
+            )
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
             self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1)
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
@@ -1139,13 +1155,20 @@ class AntigravityCapsuleApp:
                 fg=t["alert_banner_text"],
                 text=f"近 10 步异常归零已多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token，建议核查账号",
             )
-        elif logs_live and snap.recent_events and (snap.recent_503 > 0 or snap.recent_timeout > 0 or snap.recent_403 > 0):
+        elif logs_live and snap.grade in ("T2", "T3") and snap.recent_events:
             ev_txt = "\n".join(e.summary for e in snap.recent_events[-2:])
             self._banner_frame.configure(bg=t["red_bg"], highlightbackground=t["red"])
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
+        elif logs_live and snap.t2_recovery_note and snap.grade == "WARN":
+            self._banner_frame.configure(bg=t["orange_bg"], highlightbackground=t["orange"])
+            self._lbl_banner.configure(bg=t["orange_bg"], fg=t["orange"], text=snap.sub_headline)
         else:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["border_soft"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["text_secondary"], text=snap.sub_headline)
+
+        # Dynamically sync open single-conversation detail window on every poll tick
+        if self._detail_win is not None and not self._detail_win._closed:
+            self._detail_win.sync_from_snapshot(snap)
 
     def _update_log_cell(
         self,
@@ -1192,6 +1215,30 @@ class AntigravityCapsuleApp:
         if sec >= 15.0:
             return t["cyan"]
         return t["green"]
+
+    def _build_model_stats_tooltip_text(self, snap: MonitorSnapshot) -> str:
+        if not snap.model_stats:
+            return ""
+        lines = [f"近 {snap.sliding_window_min} 分钟分模型实测 ({snap.log_scope_label}):"]
+        for ms in snap.model_stats[:6]:
+            ttft_s = (
+                f"均 {ms.ttft_avg_sec:4.1f}s / 峰 {ms.ttft_max_sec:4.1f}s"
+                if (ms.ttft_avg_sec is not None and ms.ttft_max_sec is not None)
+                else "TTFT 待采样"
+            )
+            tps_s = f"{ms.tps_avg:3.0f}t/s" if ms.tps_avg is not None else "  — "
+            cacheable = ms.hit_count + ms.abnormal_miss_count
+            hit_s = f"{(ms.hit_count / cacheable) * 100:4.0f}%" if cacheable > 0 else "  — "
+            post_s = f" │ 503后+{ms.steps_after_last_t2}步" if ms.steps_after_last_t2 > 0 else ""
+            lines.append(f"  {ms.model:<12} │ {ms.step_count:>2}步 │ 命中 {hit_s} │ TTFT {ttft_s} │ {tps_s}{post_s}")
+        if snap.t2_recovery_note:
+            lines.append(f"恢复判定: {snap.t2_recovery_note}")
+        return "\n".join(lines)
+
+    def _show_speed_tooltip(self, event: tk.Event) -> None:
+        if self._closing or not self._speed_hover_text:
+            return
+        self._show_text_tooltip(self._speed_hover_text, event)
 
     def _build_freshness_tooltip_text(self, fresh_list: List[Any], window_sec: int) -> str:
         if not fresh_list:
@@ -1249,11 +1296,14 @@ class AntigravityCapsuleApp:
             p_str = f"{p_val:3.0f}t/s" if p_val is not None else "   — "
             ctx_s = f"{format_tokens(st.total_tokens):>6}"
             d_s = f"({format_delta_tokens(st.context_delta):>7})" if st.context_delta != 0 else "(    +0)"
+            mod_s = format_model_name(st.model)
             tag = reason_map.get(st.reason, st.reason)
-            step_rows.append((hm, ctx_s, d_s, st.hit_rate, t_str, p_str, tag))
-        for rev_idx, (hm, ctx_s, d_s, hr, t_str, p_str, tag) in enumerate(reversed(step_rows), 1):
+            step_rows.append((hm, mod_s, ctx_s, d_s, st.hit_rate, t_str, p_str, tag))
+        show_per_step_model = len({r[1] for r in step_rows}) >= 2
+        for rev_idx, (hm, mod_s, ctx_s, d_s, hr, t_str, p_str, tag) in enumerate(reversed(step_rows), 1):
             badge = "最新" if rev_idx == 1 else f"#{rev_idx:<2}"
-            lines.append(f"  {badge:<3} {hm} │ {ctx_s} {d_s} │ 缓存 {hr:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
+            mod_col = f" │ {mod_s:<11}" if show_per_step_model else ""
+            lines.append(f"  {badge:<3} {hm}{mod_col} │ {ctx_s} {d_s} │ 缓存 {hr:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
         return "\n".join(lines)
 
     def _show_text_tooltip(self, text: str, event: tk.Event) -> None:

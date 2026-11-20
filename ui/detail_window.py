@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.log_monitor import (
     ConversationDetailPoint,
     ConversationDetailReport,
+    MonitorSnapshot,
     format_countdown,
     format_delta_tokens,
     format_detail_text_report,
@@ -18,6 +19,38 @@ from core.log_monitor import (
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
+
+
+def _model_band_color(model_name: str, theme: Dict[str, str]) -> str:
+    low = (model_name or "").lower()
+    if "neon" in low:
+        return theme["cyan"]
+    if "carbon" in low:
+        return "#F59E0B"
+    if "argon" in low:
+        return theme["pink_accent"]
+    if "hydrogen" in low:
+        return theme["green"]
+    if any(k in low for k in ("opus", "sonnet", "fable", "claude", "gpt")):
+        return "#FB923C"
+    return theme["text_muted"]
+
+
+def _short_model_tag(model_name: str) -> str:
+    m = (model_name or "").strip()
+    if not m:
+        return "?"
+    for full, abbr in (
+        ("Neon XHigh", "Neon XH"),
+        ("Neon High", "Neon H"),
+        ("Carbon High", "Carbon H"),
+        ("Argon High", "Argon H"),
+        ("Hydrogen XH", "Hydro XH"),
+        ("Hydrogen H", "Hydro H"),
+    ):
+        if m == full:
+            return abbr
+    return m[:10]
 
 
 class ConversationDetailWindow:
@@ -48,6 +81,8 @@ class ConversationDetailWindow:
         self._window_mode: str = "60"  # "60" | "all"
         self._display_points: List[ConversationDetailPoint] = []
         self._chart_meta: Dict[str, Dict[str, Any]] = {}
+        self._last_sync_sig: Optional[Tuple[Any, ...]] = None
+        self._hovering_chart: bool = False
         self._drag_ox: int = 0
         self._drag_oy: int = 0
         self._win_ox: int = 0
@@ -89,6 +124,8 @@ class ConversationDetailWindow:
 
         self._range_bar = tk.Frame(self._hdr)
         self._range_bar.pack(side="right")
+        self._lbl_live_tag = tk.Label(self._range_bar, text="● 实时", font=(UI_FONT, 7, "bold"), padx=5, pady=2)
+        self._lbl_live_tag.pack(side="left", padx=(0, 6))
         self._range_btns: Dict[str, tk.Label] = {}
         for mode, label in (("60", "近 60 步"), ("all", "全部步数")):
             b = tk.Label(self._range_bar, text=label, font=(UI_FONT, 8), padx=7, pady=2, cursor="hand2")
@@ -119,12 +156,12 @@ class ConversationDetailWindow:
 
         # 3 long-range Canvas chart cards
         self._chart_specs = [
-            ("ctx", "请求体 / 上下文增长曲线", "青线=上下文规模 · 紫虚线=压缩裁剪"),
-            ("ttft", "首字延迟 TTFT 长线趋势", "绿<15s · 青15-45s · 橙45-90s · 红≥90s"),
+            ("ctx", "请求体 / 上下文增长曲线", "顶带=每步模型 · 青线=上下文规模 · 紫虚线=压缩裁剪"),
+            ("ttft", "首字延迟 TTFT 与模型切换趋势", "绿<15s · 青15-45s · 橙45-90s · 红≥90s"),
             ("cache", "缓存命中率长线轨迹", "绿命中 · 紫压缩重热 · 橙正常冷启 · 红异常掉缓存"),
         ]
         self._charts: Dict[str, Dict[str, Any]] = {}
-        chart_heights = {"ctx": 116, "ttft": 100, "cache": 82}
+        chart_heights = {"ctx": 118, "ttft": 112, "cache": 82}
         for key, title, legend in self._chart_specs:
             frame = tk.Frame(self._surface, padx=8, pady=6, highlightthickness=1)
             frame.pack(fill="x", pady=(0, 7))
@@ -182,6 +219,7 @@ class ConversationDetailWindow:
         self._lbl_sub.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._btn_close.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._range_bar.configure(bg=t["panel_bg"])
+        self._lbl_live_tag.configure(bg=t["green_bg"], fg=t["green"])
         self._kpi_row.configure(bg=t["panel_bg"])
         for kc in self._kpi_cards:
             kc["card"].configure(bg=t["card_bg"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
@@ -207,6 +245,8 @@ class ConversationDetailWindow:
         if self._closed:
             return
         self._conv_id = conv_id
+        self._last_sync_sig = None
+        self._hovering_chart = False
         self.win.deiconify()
         self.win.lift()
         self.win.update_idletasks()
@@ -219,6 +259,31 @@ class ConversationDetailWindow:
                 self._apply_rounding_fn(int(self.win.winfo_id()))
             except Exception:
                 pass
+
+    def sync_from_snapshot(self, snap: MonitorSnapshot) -> None:
+        """Keep the open detail modal dynamically in sync with the main 2.5s poll loop."""
+        if self._closed or not self._conv_id:
+            return
+        conv = next((c for c in snap.active_conversations if c.conversation_id == self._conv_id), None)
+        if conv is None:
+            return
+        sig = (
+            conv.total_step_count,
+            round(conv.latest_timestamp, 2),
+            conv.context_tokens,
+            round(conv.latest_hit_rate, 1),
+            round(conv.ttft_sec, 2) if conv.ttft_sec is not None else None,
+            round(conv.tps, 1) if conv.tps is not None else None,
+            conv.model_raw,
+        )
+        if sig != self._last_sync_sig:
+            self._last_sync_sig = sig
+            self.refresh()
+        else:
+            # Zero-IO fast path: smoothly tick the freshness countdown without redrawing canvases
+            latest_tps = self._report.latest_tps if self._report is not None else conv.tps
+            self._update_freshness_kpi(conv.freshness_remaining_sec, conv.freshness_invalid_reason, latest_tps)
+            self._sync_pin_button()
 
     def _on_chart_configure(self, chart_key: str) -> None:
         if self._closed or not self._display_points:
@@ -334,18 +399,38 @@ class ConversationDetailWindow:
             self._lbl_role.configure(text="子代理", bg=t["card_alt_bg"], fg=t["text_secondary"])
         else:
             self._lbl_role.configure(text="主对话", bg=t["green_bg"], fg=t["green"])
+        distinct_models = list(dict.fromkeys(p.model for p in rep.points if p.model))
+        model_tag = f"{rep.model} (含{len(distinct_models)}模)" if len(distinct_models) >= 2 else rep.model
         if rep.title:
-            disp_name = truncate_display_width(rep.title, 28)
+            disp_name = truncate_display_width(rep.title, 26)
             self._lbl_title.configure(text=disp_name)
-            self._lbl_sub.configure(text=f"{rep.short_id} · {rep.model} · 总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+            self._lbl_sub.configure(text=f"{rep.short_id} · {model_tag} · 总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
             self.win.title(f"{rep.title} ({rep.short_id}) - 长线体检")
         else:
-            self._lbl_title.configure(text=f"{rep.short_id} · {rep.model}")
+            self._lbl_title.configure(text=f"{rep.short_id} · {model_tag}")
             self._lbl_sub.configure(text=f"总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
             self.win.title(f"{rep.short_id} - 长线体检")
 
         pts = rep.points[-60:] if (self._window_mode == "60" and len(rep.points) > 60) else list(rep.points)
         self._display_points = pts
+        self._last_sync_sig = (
+            rep.total_steps,
+            round(rep.points[-1].timestamp, 2) if rep.points else 0.0,
+            rep.latest_context_tokens,
+            round(rep.points[-1].hit_rate, 1) if rep.points else 0.0,
+            round(rep.latest_ttft_sec, 2) if rep.latest_ttft_sec is not None else None,
+            round(rep.latest_tps, 1) if rep.latest_tps is not None else None,
+            rep.model_raw,
+        )
+
+        # Update dynamic model legend on TTFT chart header
+        vis_models = list(dict.fromkeys(p.model for p in pts if p.model))
+        if vis_models:
+            self._charts["ttft"]["legend"].configure(
+                text="顶带模型: " + " / ".join(_short_model_tag(m) for m in vis_models[:4]) + " │ 绿<15s 青<45s 橙<90s 红≥90s"
+            )
+        else:
+            self._charts["ttft"]["legend"].configure(text="绿<15s · 青15-45s · 橙45-90s · 红≥90s")
 
         # KPI 1: Context size & delta
         delta_s = format_delta_tokens(rep.latest_context_delta)
@@ -383,26 +468,84 @@ class ConversationDetailWindow:
             self._kpi_cards[3]["val"].configure(text=f"均 {rep.avg_tps:.0f} t/s", fg=t["cyan"])
         else:
             self._kpi_cards[3]["val"].configure(text="— t/s", fg=t["text_muted"])
-        if rep.freshness_invalid_reason:
-            f_txt, f_col = rep.freshness_invalid_reason, t["red"]
-        elif rep.freshness_remaining_sec is not None:
-            if rep.freshness_remaining_sec <= 0:
-                f_txt, f_col = "大上下文保鲜: 已过期", t["orange"]
-            else:
-                f_txt = f"保鲜剩 {format_countdown(rep.freshness_remaining_sec)}"
-                f_col = t["green"] if rep.freshness_remaining_sec > 60 else t["orange"]
-        else:
-            latest_p = f"新 {rep.latest_tps:.0f} t/s" if rep.latest_tps is not None else "常规上下文"
-            f_txt, f_col = latest_p, t["text_secondary"]
-        self._kpi_cards[3]["sub"].configure(text=f_txt, fg=f_col)
+        self._update_freshness_kpi(rep.freshness_remaining_sec, rep.freshness_invalid_reason, rep.latest_tps)
 
         self.win.update_idletasks()
         self._draw_context_chart(pts)
         self._draw_ttft_chart(pts)
         self._draw_cache_chart(pts)
 
-        if pts:
+        if pts and not self._hovering_chart:
             self._update_readout_for_point(pts[-1], prefix="最新步")
+
+    def _update_freshness_kpi(
+        self,
+        freshness_remaining_sec: Optional[int],
+        freshness_invalid_reason: str,
+        latest_tps: Optional[float],
+    ) -> None:
+        t = self.theme
+        if freshness_invalid_reason:
+            f_txt, f_col = freshness_invalid_reason, t["red"]
+        elif freshness_remaining_sec is not None:
+            if freshness_remaining_sec <= 0:
+                f_txt, f_col = "大上下文保鲜: 已过期", t["orange"]
+            else:
+                f_txt = f"保鲜剩 {format_countdown(freshness_remaining_sec)}"
+                f_col = t["green"] if freshness_remaining_sec > 60 else t["orange"]
+        else:
+            latest_p = f"新 {latest_tps:.0f} t/s" if latest_tps is not None else "常规上下文"
+            f_txt, f_col = latest_p, t["text_secondary"]
+        self._kpi_cards[3]["sub"].configure(text=f_txt, fg=f_col)
+
+    def _draw_model_band(
+        self,
+        cv: tk.Canvas,
+        pts: List[ConversationDetailPoint],
+        pad_l: int,
+        plot_w: int,
+        y0: float,
+        y1: float,
+        draw_switch_lines: bool = False,
+        plot_top: float = 0.0,
+        plot_bot: float = 0.0,
+    ) -> None:
+        """Draw a per-step colored model strip along the top edge and optional model-switch markers."""
+        n = len(pts)
+        if n == 0:
+            return
+        t = self.theme
+        if n == 1:
+            col = _model_band_color(pts[0].model, t)
+            cv.create_rectangle(pad_l, y0, pad_l + plot_w, y1, fill=col, outline="")
+            return
+        step_w = plot_w / float(n - 1)
+        last_lbl_x = -999.0
+        # Merge contiguous runs of the same model for crisp rendering
+        run_start = 0
+        for idx in range(1, n + 1):
+            is_end = idx == n
+            changed = (not is_end) and (pts[idx].model != pts[run_start].model)
+            if is_end or changed:
+                x_left = pad_l if run_start == 0 else (self._x_for_idx(run_start, n, pad_l, plot_w) - step_w * 0.5)
+                x_right = (pad_l + plot_w) if is_end else (self._x_for_idx(idx, n, pad_l, plot_w) - step_w * 0.5)
+                col = _model_band_color(pts[run_start].model, t)
+                cv.create_rectangle(max(pad_l, x_left), y0, min(pad_l + plot_w, x_right), y1, fill=col, outline="")
+                if changed and draw_switch_lines:
+                    sx = self._x_for_idx(idx, n, pad_l, plot_w)
+                    new_col = _model_band_color(pts[idx].model, t)
+                    cv.create_line(sx, plot_top, sx, plot_bot, fill=new_col, width=1.1, dash=(2, 3))
+                    if sx - last_lbl_x >= 54.0 and sx < pad_l + plot_w - 42.0:
+                        cv.create_text(
+                            sx + 2,
+                            y1 + 6,
+                            text=f"→{_short_model_tag(pts[idx].model)}",
+                            anchor="w",
+                            font=(MONO_FONT, 7, "bold"),
+                            fill=new_col,
+                        )
+                        last_lbl_x = sx
+                run_start = idx
 
     def _chart_geometry(self, cv: tk.Canvas) -> Tuple[int, int, int, int, int, int]:
         w = max(360, int(cv.winfo_width() if cv.winfo_width() > 20 else cv["width"]))
@@ -435,6 +578,7 @@ class ConversationDetailWindow:
         cv = self._charts["ctx"]["canvas"]
         cv.delete("all")
         w, h, pad_l, pad_r, pad_t, pad_b = self._chart_geometry(cv)
+        pad_t = 16
         plot_w = max(20, w - pad_l - pad_r)
         plot_h = max(20, h - pad_t - pad_b)
         self._chart_meta["ctx"] = {"pad_l": pad_l, "plot_w": plot_w, "pad_t": pad_t, "plot_h": plot_h}
@@ -442,6 +586,8 @@ class ConversationDetailWindow:
         if not pts:
             cv.create_text(w / 2, h / 2, text="暂无上下文轨迹数据", font=(UI_FONT, 8), fill=t["text_muted"])
             return
+
+        self._draw_model_band(cv, pts, pad_l, plot_w, y0=2, y1=6, draw_switch_lines=False)
 
         peak = max(p.total_tokens for p in pts)
         y_max = max(64_000, int(peak * 1.12))
@@ -485,6 +631,7 @@ class ConversationDetailWindow:
         cv = self._charts["ttft"]["canvas"]
         cv.delete("all")
         w, h, pad_l, pad_r, pad_t, pad_b = self._chart_geometry(cv)
+        pad_t = 22
         plot_w = max(20, w - pad_l - pad_r)
         plot_h = max(20, h - pad_t - pad_b)
         self._chart_meta["ttft"] = {"pad_l": pad_l, "plot_w": plot_w, "pad_t": pad_t, "plot_h": plot_h}
@@ -493,6 +640,18 @@ class ConversationDetailWindow:
         if not valid_vals:
             cv.create_text(w / 2, h / 2, text="当前范围无 SQLite 首字延迟记录", font=(UI_FONT, 8), fill=t["text_muted"])
             return
+
+        self._draw_model_band(
+            cv,
+            pts,
+            pad_l,
+            plot_w,
+            y0=2,
+            y1=7,
+            draw_switch_lines=True,
+            plot_top=float(pad_t),
+            plot_bot=float(pad_t + plot_h),
+        )
 
         sorted_vals = sorted(valid_vals)
         raw_max = sorted_vals[-1]
@@ -595,6 +754,7 @@ class ConversationDetailWindow:
         if event.x < pad_l - 6 or event.x > pad_l + plot_w + 6:
             self._clear_chart_crosshair()
             return
+        self._hovering_chart = True
         frac = max(0.0, min(1.0, (event.x - pad_l) / max(1.0, plot_w)))
         idx = int(round(frac * (len(pts) - 1))) if len(pts) > 1 else 0
         idx = max(0, min(len(pts) - 1, idx))
@@ -620,6 +780,7 @@ class ConversationDetailWindow:
         self._update_readout_for_point(pt)
 
     def _clear_chart_crosshair(self) -> None:
+        self._hovering_chart = False
         for ch in self._charts.values():
             try:
                 ch["canvas"].delete("crosshair")
@@ -644,8 +805,9 @@ class ConversationDetailWindow:
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f} t/s" if pt.tps is not None else "—"
         tag = reason_map.get(pt.reason, pt.reason)
+        mod_s = pt.model or "未知模型"
         msg = (
-            f"{prefix} #{pt.step_index} ({hm}) │ 请求体 {format_tokens(pt.total_tokens)} "
+            f"{prefix} #{pt.step_index} ({hm}) │ [{mod_s}] │ 请求体 {format_tokens(pt.total_tokens)} "
             f"({format_delta_tokens(pt.context_delta)}) │ 缓存 {pt.hit_rate:.1f}% [{tag}] │ 首字 {t_s} │ {p_s}"
         )
         t = self.theme

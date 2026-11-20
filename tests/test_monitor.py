@@ -1103,6 +1103,185 @@ class TestShortcutsAndIcons(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_account_switch_isolates_503_logs_primary_and_blocks_offline_label(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "acctiso1-1111" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+            ls_log = root / "language_server.log"
+            ledger_p = root / "account_ledger.json"
+
+            # Verify "离线" never pollutes ledger as "离***"
+            from core.account_ledger import AccountSwitchLedger
+            led = AccountSwitchLedger(ledger_path=ledger_p)
+            led.observe_online("离线", time.time())
+            led.observe_online("离***", time.time())
+            self.assertFalse(ledger_p.exists())
+
+            now = time.time()
+            t_old_acct = now - 600
+            t_new_acct = now - 60
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_old_acct))}  INFO [Antigravity 2.0] 写入系统凭据: old01@example.com\n"
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_new_acct))}  INFO [Antigravity 2.0] 写入系统凭据: fresh9@example.com\n",
+                encoding="utf-8",
+            )
+            # 4x 503 errors + 0% cache miss occurred on old01 BEFORE switching to fresh9
+            glog_old = time.strftime("%m%d %H:%M:%S", time.localtime(t_old_acct + 120))
+            ls_log.write_text(
+                "".join(
+                    f"ERROR: logging before google.Init: I{glog_old}.{100000 + i} 22456 run.go:315] Run: attempt {i+1} failed (UNAVAILABLE (code 503): No capacity available)\n"
+                    for i in range(4)
+                ),
+                encoding="utf-8",
+            )
+            (brain / "transcript.jsonl").write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_old_acct + 100)), "model": "gemini-4-argon-high", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_old_acct + 130)), "model": "gemini-4-argon-high", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 300}) + "\n",
+                encoding="utf-8",
+            )
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": ledger_p,
+                },
+                read_only=True,
+            )
+            from core.log_monitor import AccountQuotaInfo
+            engine._account_cache = AccountQuotaInfo(email_masked="fr***9@example.com", short_label="fr***9", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap = engine.poll(now_ts=now, force_account=False)
+            # Switching to fresh9 MUST isolate old01's 4x 503 logs and 0% cache bar!
+            self.assertEqual(snap.recent_503, 0)
+            self.assertEqual(snap.today_503, 0)
+            self.assertEqual(snap.machine_today_503, 4)
+            self.assertEqual(snap.grade, "T0")
+            self.assertEqual(snap.pressure, "normal")
+            self.assertIsNone(snap.primary_hit_rate)
+            self.assertIn("已切入 fr***9", snap.headline)
+
+    def test_t2_dynamic_recovery_with_per_model_ttft_and_multimodel_report(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "t2rec001-2222" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+
+            now = time.time()
+            t_err = now - 120  # 2 minutes ago: 4x 503 on Argon
+            glog_err = time.strftime("%m%d %H:%M:%S", time.localtime(t_err))
+            ls_log.write_text(
+                "".join(
+                    f"ERROR: logging before google.Init: I{glog_err}.{200000 + i} 22456 run.go:315] Run: attempt {i+1} failed (UNAVAILABLE (code 503): No capacity available)\n"
+                    for i in range(4)
+                ),
+                encoding="utf-8",
+            )
+            # Phase 1: only 1 Argon step before the 503s -> MUST stay T2 red!
+            tp = brain / "transcript.jsonl"
+            rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_err - 20)), "model": "gemini-4-argon-high", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 300},
+            ]
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            dbp = convs / "t2rec001-2222.db"
+            conn = sqlite3.connect(dbp)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(60000, 0, 300, ttft_s=52, strm_s=4),))
+            conn.commit()
+            conn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            from core.log_monitor import AccountQuotaInfo
+            engine._account_cache = AccountQuotaInfo(email_masked="de***2@example.com", short_label="de***2", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap1 = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap1.grade, "T2")
+            self.assertEqual(snap1.level, "red")
+
+            # Phase 2: user switches to Neon XHigh and runs 3 fast cached steps (TTFT ~6.5s) -> de-escalates from T2 red to WARN!
+            time.sleep(0.02)
+            for k in range(3):
+                rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": 2 + k,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_err + 25 + k * 20)),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000,
+                    "cache_read_tokens": 65000 + k * 2000,
+                    "output_tokens": 500,
+                })
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            conn = sqlite3.connect(dbp)
+            for k in range(3):
+                conn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (2 + k, _build_fake_gen_blob(2000, 65000 + k * 2000, 500, ttft_s=6, strm_s=3)))
+            conn.commit()
+            conn.close()
+
+            snap2 = engine.poll(now_ts=now + 2, force_account=False)
+            self.assertEqual(snap2.grade, "WARN")
+            self.assertEqual(snap2.level, "orange")
+            self.assertIn("已连跑 3 步正常", snap2.t2_recovery_note)
+            model_names = {m.model for m in snap2.model_stats}
+            self.assertIn("Neon XHigh", model_names)
+            self.assertIn("Argon High", model_names)
+
+            # Detail report must label each step's model clearly
+            det = engine.read_conversation_detail("t2rec001", now_ts=now + 2)
+            self.assertIsNotNone(det)
+            assert det is not None
+            rep_txt = format_detail_text_report(det)
+            self.assertIn("[Argon High]", rep_txt)
+            self.assertIn("[Neon XHigh]", rep_txt)
+            self.assertIn("含 2 种模型", rep_txt)
+
+            # Phase 3: 6+ normal steps and >10 minutes since last 503 -> smooth recovery all the way back to T0 green!
+            time.sleep(0.02)
+            t_later = t_err + 650
+            for k in range(4):
+                rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": 5 + k,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_err + 200 + k * 90)),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 2000,
+                    "cache_read_tokens": 75000 + k * 2000,
+                    "output_tokens": 500,
+                })
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            conn = sqlite3.connect(dbp)
+            for k in range(4):
+                conn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (5 + k, _build_fake_gen_blob(2000, 75000 + k * 2000, 500, ttft_s=7, strm_s=3)))
+            conn.commit()
+            conn.close()
+            engine._last_account_poll = t_later
+            snap3 = engine.poll(now_ts=t_later, force_account=False)
+            self.assertEqual(snap3.grade, "T0")
+            self.assertEqual(snap3.level, "green")
+            self.assertIn("已平复", snap3.sub_headline)
+
 
 if __name__ == "__main__":
     unittest.main()

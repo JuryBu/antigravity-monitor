@@ -40,12 +40,22 @@ def _parse_ts(raw: str) -> Optional[float]:
     return dt.timestamp()
 
 
+_INVALID_ACCOUNT_LABELS = frozenset({"", "离线", "离***", "offline", "unknown"})
+
+
+def _is_invalid_label(raw: str) -> bool:
+    clean = (raw or "").strip().lower()
+    return clean in _INVALID_ACCOUNT_LABELS or clean.startswith("离*")
+
+
 def _mask_short(raw: str) -> str:
     clean = raw.strip()
-    if not clean:
+    if _is_invalid_label(clean):
         return ""
     if "@" in clean:
         clean = clean.split("@", 1)[0]
+    if _is_invalid_label(clean):
+        return ""
     if "***" in clean:
         return clean
     if len(clean) == 1:
@@ -89,7 +99,7 @@ class AccountSwitchLedger:
                 lbl = _mask_short(str(item.get("label", "")))
             except (KeyError, TypeError, ValueError):
                 continue
-            if ts > 0 and lbl:
+            if ts > 0 and lbl and not _is_invalid_label(lbl):
                 events.append((ts, lbl))
         events.sort(key=lambda x: x[0])
         self._own_events = events[-120:]
@@ -112,8 +122,10 @@ class AccountSwitchLedger:
 
     def observe_online(self, short_label: str, now_ts: float) -> None:
         """Record an observed online masked account if it differs from the most recent known state."""
+        if _is_invalid_label(short_label):
+            return
         lbl = _mask_short(short_label)
-        if not lbl or lbl == "离线":
+        if not lbl or _is_invalid_label(lbl):
             return
         # Prune entries older than 7 days
         cutoff = now_ts - 7 * 86400

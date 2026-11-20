@@ -27,7 +27,7 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from core.account_ledger import AccountSwitchLedger
 from core.config_store import DEFAULT_CONFIG, sanitize_config
@@ -380,6 +380,23 @@ class LogEvent:
     category: str   # "503" | "timeout" | "403" | "retry"
     summary: str
     event_key: str
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class ModelPerfStats:
+    model: str
+    step_count: int
+    hit_count: int
+    abnormal_miss_count: int
+    ttft_avg_sec: Optional[float]
+    ttft_max_sec: Optional[float]
+    latest_ttft_sec: Optional[float]
+    tps_avg: Optional[float]
+    latest_timestamp: float
+    steps_after_last_t2: int = 0
+    ttft_after_last_t2_avg: Optional[float] = None
+    ttft_after_last_t2_latest: Optional[float] = None
 
 
 @dataclass
@@ -464,6 +481,14 @@ class MonitorSnapshot:
     target_conversation: Optional[ConversationSummary] = None
     target_conversation_query: str = ""
     min_freshness_title: str = ""
+    model_stats: List[ModelPerfStats] = field(default_factory=list)
+    log_scope_label: str = "全机"
+    machine_today_503: int = 0
+    machine_today_timeout: int = 0
+    machine_today_403: int = 0
+    machine_today_retry: int = 0
+    last_t2_error_ts: float = 0.0
+    t2_recovery_note: str = ""
 
 
 def compute_pressure(
@@ -730,8 +755,14 @@ class LanguageServerLogTailer:
 
         return None, "", line
 
-    def get_counts(self, now_ts: float, window_min: int) -> Tuple[Dict[str, int], Dict[str, int], List[LogEvent]]:
-        cutoff = now_ts - max(1, window_min) * 60
+    def get_counts(
+        self,
+        now_ts: float,
+        window_min: int,
+        account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+    ) -> Tuple[Dict[str, int], Dict[str, int], List[LogEvent]]:
+        cutoff = max(now_ts - max(1, window_min) * 60, account_since_ts)
         today_start = datetime.datetime.fromtimestamp(now_ts).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
@@ -742,13 +773,38 @@ class LanguageServerLogTailer:
 
         for ev in self._events:
             if ev.timestamp >= today_start:
-                today[ev.category] = today.get(ev.category, 0) + 1
+                if account_filter_fn is None or account_filter_fn(ev.timestamp):
+                    today[ev.category] = today.get(ev.category, 0) + 1
             if ev.timestamp >= cutoff:
                 recent[ev.category] = recent.get(ev.category, 0) + 1
                 if ev.category in ("503", "timeout", "403"):
                     in_window_notable.append(ev)
 
         return recent, today, in_window_notable[-3:]
+
+    def get_machine_today_counts(self, now_ts: float) -> Dict[str, int]:
+        today_start = datetime.datetime.fromtimestamp(now_ts).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+        today = {"503": 0, "timeout": 0, "403": 0, "retry": 0}
+        for ev in self._events:
+            if ev.timestamp >= today_start:
+                today[ev.category] = today.get(ev.category, 0) + 1
+        return today
+
+    def get_latest_error_ts(
+        self,
+        now_ts: float,
+        window_min: int,
+        categories: Tuple[str, ...] = ("503", "timeout"),
+        account_since_ts: float = 0.0,
+    ) -> float:
+        cutoff = max(now_ts - max(1, window_min) * 60, account_since_ts)
+        latest = 0.0
+        for ev in self._events:
+            if ev.timestamp >= cutoff and ev.category in categories and ev.timestamp > latest:
+                latest = ev.timestamp
+        return latest
 
 
 class AntigravityMonitorEngine:
@@ -1085,9 +1141,19 @@ class AntigravityMonitorEngine:
         if target_conv is not None and target_conv.conversation_id not in seen_ids:
             self._enrich_conv_from_db(target_conv)
 
-        # Prefer latest active MAIN conversation for headline/speed/cache bar so short-lived subagents never hijack it
-        main_convs = [c for c in top_convs if not c.is_subagent]
-        primary = main_convs[0] if main_convs else (top_convs[0] if top_convs else None)
+        # When switched between >=2 accounts today, anchor primary & recent health strictly to steps
+        # executed under the CURRENT active account so a freshly switched healthy account never inherits
+        # the previous account's 0.0% cache bar, T1 misses, or T2 503/timeout counts.
+        acct_cutoff_ts = (current_acct_since_ts - 2.0) if current_acct_since_ts > 0.0 else 0.0
+        acct_top_convs = (
+            [c for c in top_convs if c.latest_timestamp >= acct_cutoff_ts]
+            if current_acct_since_ts > 0.0
+            else top_convs
+        )
+
+        # Prefer latest active MAIN conversation of the CURRENT account for headline/speed/cache bar
+        main_convs = [c for c in acct_top_convs if not c.is_subagent]
+        primary = main_convs[0] if main_convs else (acct_top_convs[0] if acct_top_convs else None)
         active_family = (
             "3p"
             if (primary and any(k in primary.model_raw.lower() for k in ("claude", "fable", "opus", "sonnet", "gpt")))
@@ -1105,11 +1171,13 @@ class AntigravityMonitorEngine:
 
         if cur_acct_label:
             steps_scope_label = cur_acct_label
+            log_scope_label = cur_acct_label
             today_steps = account_today_steps
             main_today_steps = account_main_today_steps
             subagent_today_steps = account_subagent_today_steps
         else:
             steps_scope_label = "全机"
+            log_scope_label = "全机"
             today_steps = total_today_steps
             main_today_steps = total_main_today_steps
             subagent_today_steps = total_subagent_today_steps
@@ -1147,8 +1215,24 @@ class AntigravityMonitorEngine:
             min_fresh_ctx = head_f.context_tokens
             min_fresh_invalid = head_f.freshness_invalid_reason
 
+        acct_log_filter: Optional[Callable[[float], bool]] = None
+        if cur_acct_label and timeline:
+            acct_log_filter = (
+                lambda ev_ts: self._ledger.attribute_timestamp(ev_ts, timeline, fallback_label=cur_acct_label).lower()
+                == cur_acct_label.lower()
+            )
         recent_log, today_log, notable_events = self._log_tailer.get_counts(
-            now, self.config["log_sliding_window_min"]
+            now,
+            self.config["log_sliding_window_min"],
+            account_since_ts=current_acct_since_ts,
+            account_filter_fn=acct_log_filter,
+        )
+        machine_today_log = self._log_tailer.get_machine_today_counts(now)
+        last_t2_error_ts = self._log_tailer.get_latest_error_ts(
+            now,
+            self.config["log_sliding_window_min"],
+            categories=("503", "timeout"),
+            account_since_ts=current_acct_since_ts,
         )
 
         active_model = primary.model if primary else "等待请求"
@@ -1158,8 +1242,8 @@ class AntigravityMonitorEngine:
         primary_ttft = primary.ttft_sec if primary else None
         primary_speed = primary.speed_status if primary else "unknown"
 
-        recent_cutoff = now - self.config["log_sliding_window_min"] * 60
-        recent_active = [c for c in top_convs if c.latest_timestamp >= recent_cutoff]
+        recent_cutoff = max(now - self.config["log_sliding_window_min"] * 60, acct_cutoff_ts)
+        recent_active = [c for c in acct_top_convs if c.latest_timestamp >= recent_cutoff]
         has_live_transcript = any((now - c.latest_timestamp) <= 120.0 for c in top_convs)
         max_consec_miss = max((c.consec_miss for c in recent_active), default=0)
         any_single_miss = any(c.single_miss for c in recent_active)
@@ -1184,7 +1268,13 @@ class AntigravityMonitorEngine:
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
-        level, grade, headline, sub_headline = self._evaluate_health(
+        model_stats = self._compute_recent_model_stats(
+            recent_active=recent_active,
+            cutoff_ts=recent_cutoff,
+            last_t2_error_ts=last_t2_error_ts,
+        )
+
+        level, grade, headline, sub_headline, t2_recovery_note = self._evaluate_health(
             active_model=active_model,
             recent_log=recent_log,
             today_log=today_log,
@@ -1197,6 +1287,10 @@ class AntigravityMonitorEngine:
             has_live_transcript=has_live_transcript,
             severe_frequent_miss_conv=severe_frequent_miss_conv,
             unstable_recovery_conv=unstable_recovery_conv,
+            model_stats=model_stats,
+            last_t2_error_ts=last_t2_error_ts,
+            now_ts=now,
+            switched_acct_label=cur_acct_label if current_acct_since_ts > 0.0 else "",
         )
 
         pressure = compute_pressure(
@@ -1276,7 +1370,98 @@ class AntigravityMonitorEngine:
             target_conversation=target_conv,
             target_conversation_query=target_query,
             min_freshness_title=min_fresh_title,
+            model_stats=model_stats,
+            log_scope_label=log_scope_label,
+            machine_today_503=machine_today_log["503"],
+            machine_today_timeout=machine_today_log["timeout"],
+            machine_today_403=machine_today_log["403"],
+            machine_today_retry=machine_today_log["retry"],
+            last_t2_error_ts=last_t2_error_ts,
+            t2_recovery_note=t2_recovery_note,
         )
+
+    @staticmethod
+    def _compute_recent_model_stats(
+        recent_active: List[ConversationSummary],
+        cutoff_ts: float,
+        last_t2_error_ts: float = 0.0,
+    ) -> List[ModelPerfStats]:
+        """Aggregate per-model TTFT, TPS, cache hits, and post-503 recovery evidence."""
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for c in recent_active:
+            steps = c.recent_steps[-10:]
+            ttfts = c.recent_ttfts[-len(steps):] if c.recent_ttfts else []
+            tpss = c.recent_tps_list[-len(steps):] if c.recent_tps_list else []
+            t_off = len(steps) - len(ttfts)
+            p_off = len(steps) - len(tpss)
+            for idx, st in enumerate(steps):
+                if st.timestamp < cutoff_ts:
+                    continue
+                mname = format_model_name(st.model)
+                b = buckets.setdefault(
+                    mname,
+                    {
+                        "steps": 0,
+                        "hits": 0,
+                        "abn": 0,
+                        "ttfts": [],
+                        "tpss": [],
+                        "latest_ts": 0.0,
+                        "latest_ttft": None,
+                        "post_steps": 0,
+                        "post_ttfts": [],
+                        "post_latest_ts": 0.0,
+                        "post_latest_ttft": None,
+                    },
+                )
+                b["steps"] += 1
+                if st.classification == "hit":
+                    b["hits"] += 1
+                elif st.classification == "abnormal_miss":
+                    b["abn"] += 1
+                ti = idx - t_off
+                pi = idx - p_off
+                t_val = ttfts[ti] if 0 <= ti < len(ttfts) else None
+                p_val = tpss[pi] if 0 <= pi < len(tpss) else None
+                if t_val is not None:
+                    b["ttfts"].append(float(t_val))
+                if p_val is not None:
+                    b["tpss"].append(float(p_val))
+                if st.timestamp >= b["latest_ts"]:
+                    b["latest_ts"] = st.timestamp
+                    if t_val is not None:
+                        b["latest_ttft"] = float(t_val)
+                if last_t2_error_ts > 0.0 and st.timestamp > last_t2_error_ts + 1.0:
+                    b["post_steps"] += 1
+                    if t_val is not None:
+                        b["post_ttfts"].append(float(t_val))
+                        if st.timestamp >= b["post_latest_ts"]:
+                            b["post_latest_ts"] = st.timestamp
+                            b["post_latest_ttft"] = float(t_val)
+
+        out: List[ModelPerfStats] = []
+        for mname, b in buckets.items():
+            tl = b["ttfts"]
+            pl = b["tpss"]
+            ptl = b["post_ttfts"]
+            out.append(
+                ModelPerfStats(
+                    model=mname,
+                    step_count=int(b["steps"]),
+                    hit_count=int(b["hits"]),
+                    abnormal_miss_count=int(b["abn"]),
+                    ttft_avg_sec=(sum(tl) / len(tl)) if tl else None,
+                    ttft_max_sec=max(tl) if tl else None,
+                    latest_ttft_sec=b["latest_ttft"],
+                    tps_avg=(sum(pl) / len(pl)) if pl else None,
+                    latest_timestamp=float(b["latest_ts"]),
+                    steps_after_last_t2=int(b["post_steps"]),
+                    ttft_after_last_t2_avg=(sum(ptl) / len(ptl)) if ptl else None,
+                    ttft_after_last_t2_latest=b["post_latest_ttft"],
+                )
+            )
+        out.sort(key=lambda m: m.latest_timestamp, reverse=True)
+        return out
 
     def _classify_speed(
         self,
@@ -1307,12 +1492,16 @@ class AntigravityMonitorEngine:
         has_live_transcript: bool = True,
         severe_frequent_miss_conv: Optional[ConversationSummary] = None,
         unstable_recovery_conv: Optional[ConversationSummary] = None,
-    ) -> Tuple[str, str, str, str]:
+        model_stats: Optional[List[ModelPerfStats]] = None,
+        last_t2_error_ts: float = 0.0,
+        now_ts: float = 0.0,
+        switched_acct_label: str = "",
+    ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
         # stay quietly in standby instead of alerting on stale pre-shutdown log disconnects.
         if not is_online and not has_live_transcript:
-            return ("green", "IDLE", "离线待机 · Antigravity 未运行", "客户端未启动，已暂停实时异常告警")
+            return ("green", "IDLE", "离线待机 · Antigravity 未运行", "客户端未启动，已暂停实时异常告警", "")
 
         # Only evaluate live language_server.log T2/T3 alerts while Antigravity LS is actually online.
         eff_403 = recent_log["403"] if is_online else 0
@@ -1320,13 +1509,51 @@ class AntigravityMonitorEngine:
         eff_503 = recent_log["503"] if is_online else 0
 
         if eff_403 > 0:
-            return ("red", "T3", f"T3 封禁告警 · {active_model}", "检测到 403 TOS/权限拒绝，请立即停止使用当前账号")
+            return ("red", "T3", f"T3 封禁告警 · {active_model}", "检测到 403 TOS/权限拒绝，请立即停止使用当前账号", "")
+
+        # Dynamic T2 evaluation: inspect post-error successful steps & per-model TTFT instead of permanently
+        # locking the account in T2 for 30m after transient/single-model 503 bursts.
+        t2_active = False
+        t2_recovering_warn = ""
+        t2_recovered_info = ""
         if eff_timeout > 0 or eff_503 >= 2:
+            stats_list = model_stats or []
+            primary_ms = next((m for m in stats_list if m.model == active_model), None)
+            if primary_ms is None and stats_list:
+                primary_ms = max(stats_list, key=lambda m: (m.steps_after_last_t2, m.latest_timestamp))
+            post_steps = primary_ms.steps_after_last_t2 if primary_ms is not None else 0
+            post_ttft_avg = primary_ms.ttft_after_last_t2_avg if primary_ms is not None else None
+            post_ttft_latest = primary_ms.ttft_after_last_t2_latest if primary_ms is not None else None
+            post_model_name = primary_ms.model if primary_ms is not None else active_model
+            elapsed_since_err = (now_ts - last_t2_error_ts) if (now_ts > 0 and last_t2_error_ts > 0) else 0.0
+            ttft_severe = (
+                (post_ttft_latest is not None and post_ttft_latest >= 60.0)
+                or (post_ttft_avg is not None and post_ttft_avg >= 60.0)
+            )
+            ttft_ok = (
+                (post_ttft_latest is None or post_ttft_latest < 45.0)
+                and (post_ttft_avg is None or post_ttft_avg < 45.0)
+            )
+            err_desc = f"{eff_503} 次 503" + (f" / {eff_timeout} 次超时" if eff_timeout > 0 else "")
+            ttft_desc = f"，TTFT 均 {post_ttft_avg:.1f}s" if post_ttft_avg is not None else ""
+
+            if post_steps >= 6 and elapsed_since_err >= 600.0 and ttft_ok:
+                t2_recovered_info = f"前序 {err_desc} 已平复（{post_model_name} 事后连跑 {post_steps} 步正常{ttft_desc}）"
+            elif post_steps >= 2 and not ttft_severe and ttft_ok:
+                t2_recovering_warn = f"前序 {err_desc}，{post_model_name} 事后已连跑 {post_steps} 步正常{ttft_desc}"
+            else:
+                t2_active = True
+
+        if t2_active:
+            extra = ""
+            if primary is not None and primary.ttft_sec is not None:
+                extra = f"（当前 TTFT {primary.ttft_sec:.1f}s）"
             return (
                 "red",
                 "T2",
                 f"T2 限流黑洞 · {active_model}",
-                f"近 {win} 分钟触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时",
+                f"近 {win} 分钟触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时，事后未恢复稳定响应{extra}",
+                "",
             )
         if max_consec_miss >= 2:
             return (
@@ -1334,6 +1561,7 @@ class AntigravityMonitorEngine:
                 "T1",
                 f"T1 连续掉缓存 · {active_model}",
                 f"主活跃会话已连续 {max_consec_miss} 步 cr=0，建议检查账号或切回主力号",
+                t2_recovering_warn or t2_recovered_info,
             )
         if severe_frequent_miss_conv is not None:
             pct = int(round((severe_frequent_miss_conv.recent10_hit_ratio or 0.0) * 100))
@@ -1342,6 +1570,7 @@ class AntigravityMonitorEngine:
                 "T1",
                 f"T1 频繁掉缓存 · {active_model}",
                 f"近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
+                t2_recovering_warn or t2_recovered_info,
             )
         if today_steps >= self.config["daily_steps_alert"]:
             return (
@@ -1349,30 +1578,51 @@ class AntigravityMonitorEngine:
                 "WARN",
                 f"步数超红线 · {active_model}",
                 f"今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
+                t2_recovering_warn or t2_recovered_info,
             )
-        if any_single_miss or unstable_recovery_conv is not None or eff_503 == 1 or any_slow or today_steps >= self.config["daily_steps_warn"]:
+        if (
+            t2_recovering_warn
+            or any_single_miss
+            or unstable_recovery_conv is not None
+            or eff_503 == 1
+            or any_slow
+            or today_steps >= self.config["daily_steps_warn"]
+        ):
             reasons = []
+            if t2_recovering_warn:
+                reasons.append(t2_recovering_warn)
             if any_single_miss:
                 reasons.append("单步异常归零")
             elif unstable_recovery_conv is not None:
                 reasons.append(f"近10步 {unstable_recovery_conv.abnormal_in_recent10} 次掉缓存(观察恢复中)")
             if any_slow:
                 reasons.append("疑似暗限速")
-            if eff_503 == 1:
+            if eff_503 == 1 and not t2_recovering_warn:
                 reasons.append("偶发 1 次 503")
             if today_steps >= self.config["daily_steps_warn"]:
                 reasons.append(f"今日步数 {today_steps}")
-            return ("orange", "WARN", f"留意预警 · {active_model}", " / ".join(reasons))
+            return ("orange", "WARN", f"留意预警 · {active_model}", " / ".join(reasons), t2_recovering_warn)
 
         if primary is None:
-            return ("green", "T0", "T0 待命 · 暂无活跃会话", "纯本地只读监控已就绪")
+            if switched_acct_label:
+                return (
+                    "green",
+                    "T0",
+                    f"T0 待命 · 已切入 {switched_acct_label}",
+                    "新账号尚无新请求，前序账号异常与缓存状态已自动隔离",
+                    "",
+                )
+            return ("green", "T0", "T0 待命 · 暂无活跃会话", "纯本地只读监控已就绪", "")
+
+        if t2_recovered_info:
+            return ("green", "T0", f"T0 健康 · {active_model}", t2_recovered_info, t2_recovered_info)
 
         hist_503 = today_log["503"]
         if hist_503 > 0 and eff_503 == 0:
-            sub = f"近 {win} 分钟无新异常（今日历史 {hist_503} 条 503 已自动衰减）"
+            sub = f"近 {win} 分钟无新异常（当前号今日历史 {hist_503} 条 503 已自动衰减）"
         else:
             sub = f"近 {win} 分钟缓存与底层日志均健康"
-        return ("green", "T0", f"T0 健康 · {active_model}", sub)
+        return ("green", "T0", f"T0 健康 · {active_model}", sub, "")
 
     def _collect_new_alerts(
         self,
@@ -2132,18 +2382,39 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "speed_status": snap.primary_speed_status,
         },
         "errors_30m": {
+            "scope_label": snap.log_scope_label,
             "window_min": snap.sliding_window_min,
             "503": snap.recent_503,
             "timeout": snap.recent_timeout,
             "403": snap.recent_403,
             "retry": snap.recent_retry,
+            "t2_recovery_note": snap.t2_recovery_note,
         },
         "errors_today": {
+            "scope_label": snap.log_scope_label,
             "503": snap.today_503,
             "timeout": snap.today_timeout,
             "403": snap.today_403,
             "retry": snap.today_retry,
+            "machine_503": snap.machine_today_503,
+            "machine_timeout": snap.machine_today_timeout,
+            "machine_403": snap.machine_today_403,
+            "machine_retry": snap.machine_today_retry,
         },
+        "models_recent": [
+            {
+                "model": m.model,
+                "step_count": m.step_count,
+                "hit_count": m.hit_count,
+                "abnormal_miss_count": m.abnormal_miss_count,
+                "ttft_avg_sec": round(m.ttft_avg_sec, 2) if m.ttft_avg_sec is not None else None,
+                "ttft_max_sec": round(m.ttft_max_sec, 2) if m.ttft_max_sec is not None else None,
+                "latest_ttft_sec": round(m.latest_ttft_sec, 2) if m.latest_ttft_sec is not None else None,
+                "tps_avg": round(m.tps_avg, 2) if m.tps_avg is not None else None,
+                "steps_after_last_t2": m.steps_after_last_t2,
+            }
+            for m in snap.model_stats
+        ],
         "alerts": alerts_out,
         "counts": {
             "active_main": len(main_convs),
@@ -2182,9 +2453,11 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
     p95_t = f"{report.p95_ttft_sec:.1f}s" if report.p95_ttft_sec is not None else "—"
     max_t = f"{report.max_ttft_sec:.1f}s" if report.max_ttft_sec is not None else "—"
     avg_p = f"{report.avg_tps:.0f} t/s" if report.avg_tps is not None else "—"
+    distinct_models = list(dict.fromkeys(pt.model for pt in report.points if pt.model))
+    model_overview = f"{report.model} (含 {len(distinct_models)} 种模型: {', '.join(distinct_models[:4])})" if len(distinct_models) >= 2 else report.model
     title_part = f"{report.title} ({report.short_id})" if report.title else report.short_id
     lines = [
-        f"Antigravity 单对话长线体检 ({title_part} · {role} · {report.model})",
+        f"Antigravity 单对话长线体检 ({title_part} · {role} · {model_overview})",
         f"步数概况: 总计 {report.total_steps} 步 (今日 {report.today_steps} 步) | 压缩 {report.compact_count} 次",
         f"请求体规模: 当前 {format_tokens(report.latest_context_tokens)} ({format_delta_tokens(report.latest_context_delta)}) | 峰值 {format_tokens(report.peak_context_tokens)}",
         f"缓存统计: 有效命中率 {hit_ratio} (命中 {report.cache_hit_steps} / 异常归零 {report.abnormal_miss_steps} / 正常冷启 {report.expected_cold_steps})",
@@ -2196,7 +2469,7 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f}t/s" if pt.tps is not None else "—"
         lines.append(
-            f"  #{pt.step_index:<4} {hm} │ {format_tokens(pt.total_tokens):>6} ({format_delta_tokens(pt.context_delta):>7}) "
+            f"  #{pt.step_index:<4} {hm} │ [{pt.model}] │ {format_tokens(pt.total_tokens):>6} ({format_delta_tokens(pt.context_delta):>7}) "
             f"│ 缓存 {pt.hit_rate:5.1f}% │ 首字 {t_s:>6} │ {p_s:>6} [{pt.reason}]"
         )
     return mask_email("\n".join(lines))
@@ -2243,9 +2516,15 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         [
             f"实时性能: 缓存 {hit_str} | 吞吐 {tps_str} | TTFT {ttft_str}",
             f"步数统计: {steps_str}",
-            f"底层日志 (近 {snap.sliding_window_min}m / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
+            f"底层日志 ({snap.log_scope_label} · 近 {snap.sliding_window_min}m / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
         ]
     )
+    if len(snap.model_stats) >= 2:
+        ms_parts = []
+        for ms in snap.model_stats[:4]:
+            ta = f"均{ms.ttft_avg_sec:.1f}s/峰{ms.ttft_max_sec:.1f}s" if (ms.ttft_avg_sec is not None and ms.ttft_max_sec is not None) else "—"
+            ms_parts.append(f"{ms.model}({ms.step_count}步 TTFT {ta})")
+        lines.append("近 30m 分模型 TTFT: " + " | ".join(ms_parts))
     if snap.active_conversations:
         main_list = [c for c in snap.active_conversations if not c.is_subagent]
         sub_list = [c for c in snap.active_conversations if c.is_subagent]

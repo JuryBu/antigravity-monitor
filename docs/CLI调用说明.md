@@ -101,7 +101,8 @@ python -B main.py --json --readonly --conversation-id <id>
 
 - **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
 - **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`）。
-- **`errors_30m` / `errors_today`**：`503`、`timeout`（5m 流超时）、`403`、`retry` 计数（`errors_30m` 附 `window_min`）。
+- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（5m 流超时）、`403`、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；切换账号时前序账号的 503/超时不会连坐新号，同号内 503 后若当前模型连续稳定恢复响应且 TTFT 正常则自动从 `T2` 降级观察直至回绿。
+- **`models_recent`**：数组，按当前账号近 30 分钟内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg` 与 `steps_after_last_t2`（最近一次 503/超时后的成功步数）。
 - **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常时至少包含当前状态诊断条目。
 
 ### 4. `counts`、`active_conversations` 与 `target_conversation`
