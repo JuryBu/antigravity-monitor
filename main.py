@@ -165,16 +165,22 @@ def _spawn_restarted_self(no_tray: bool = False) -> None:
     subprocess.Popen(cmd, cwd=str(APP_ROOT), creationflags=flags)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    _configure_stdio_utf8()
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Antigravity 实时缓存与健康度桌面监控器")
     parser.add_argument("--cli", action="store_true", help="仅运行单次命令行脱敏体检摘要并退出（默认零写盘）")
     parser.add_argument("--json", action="store_true", help="输出结构化脱敏 JSON 体检快照并退出（默认零写盘）")
     parser.add_argument("--readonly", action="store_true", help="严格零写盘模式（不更新 account_ledger.json）")
     parser.add_argument("--conversation-id", default="", help="定向附带指定对话（完整 UUID 或前缀）的详细状态")
+    parser.add_argument("--account", default="", help="指定查看的脱敏账号标签（如 al***1、be***2，或 __all__ 查看全机）")
+    parser.add_argument("--range", dest="history_range", default="30m", choices=["30m", "6h", "today", "7d"], help="指定观测时间范围（默认 30m 实时）")
     parser.add_argument("--minimized", action="store_true", help="启动后静默最小化到系统托盘")
     parser.add_argument("--no-tray", action="store_true", help="禁用系统托盘（调试/截图模式）")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    _configure_stdio_utf8()
+    args = _parse_args(argv)
 
     from core.config_store import ConfigStore
     from core.log_monitor import (
@@ -208,7 +214,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if is_oneshot:
         try:
-            snap = engine.poll(force_account=True, target_conversation_id=args.conversation_id)
+            snap = engine.poll(
+                force_account=True,
+                target_conversation_id=args.conversation_id,
+                view_account=args.account,
+                history_range=args.history_range,
+            )
             if args.json:
                 print(format_json_snapshot(snap))
             else:

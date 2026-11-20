@@ -14,11 +14,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.config_store import ConfigStore
 from core.log_monitor import (
+    HISTORY_RANGE_SPECS,
     AntigravityMonitorEngine,
     MonitorSnapshot,
     format_countdown,
     format_delta_tokens,
     format_model_name,
+    format_relative_age,
     format_text_summary,
     format_tokens,
     truncate_display_width,
@@ -149,9 +151,11 @@ class AntigravityCapsuleApp:
         self._drag_moved: bool = False
 
         self._after_ids: List[str] = []
-        self._snapshot_queue: "queue.Queue[MonitorSnapshot]" = queue.Queue(maxsize=2)
+        self._snapshot_queue: "queue.Queue[Tuple[int, MonitorSnapshot]]" = queue.Queue(maxsize=2)
         self._stop_event = threading.Event()
         self._force_poll_event = threading.Event()
+        self._view_lock = threading.Lock()
+        self._view_gen: int = 0
         self._worker_thread: Optional[threading.Thread] = None
         self.tray = None
 
@@ -188,6 +192,8 @@ class AntigravityCapsuleApp:
         self._speed_hover_text: str = ""
         self._detail_win: Optional[ConversationDetailWindow] = None
         self._conv_filter: str = str(self.config.get("conv_filter", "main"))
+        self._view_account: str = ""
+        self._history_range: str = "30m"
         self._conv_list_rows: int = int(self.config.get("conv_list_rows", 5))
         self._conv_row_px: int = 24
         self._resize_origin_y: int = 0
@@ -296,8 +302,11 @@ class AntigravityCapsuleApp:
 
         head_row2 = tk.Frame(self._card_head)
         head_row2.pack(fill="x", pady=(5, 4))
-        self._lbl_acc_pill = tk.Label(head_row2, text="离线", font=(MONO_FONT, 9, "bold"), padx=6, pady=1)
-        self._lbl_acc_pill.pack(side="left", padx=(0, 8))
+        self._lbl_acc_pill = tk.Label(head_row2, text="离线 ▾", font=(MONO_FONT, 9, "bold"), padx=6, pady=1, cursor="hand2")
+        self._lbl_acc_pill.pack(side="left", padx=(0, 6))
+        self._lbl_acc_pill.bind("<Button-1>", self._show_account_selector_menu)
+        self._lbl_back_live = tk.Label(head_row2, text="↩ 当前", font=(UI_FONT, 7, "bold"), padx=5, pady=1, cursor="hand2")
+        self._lbl_back_live.bind("<Button-1>", lambda _e: self.reset_live_view())
         self._lbl_acc_5h = tk.Label(head_row2, text="5h —", font=(MONO_FONT, 9))
         self._lbl_acc_5h.pack(side="left", padx=(0, 10))
         self._lbl_acc_wk = tk.Label(head_row2, text="周 —", font=(MONO_FONT, 9))
@@ -306,6 +315,22 @@ class AntigravityCapsuleApp:
         self._lbl_theme_tag = tk.Label(head_row2, text="主题:星蓝 ⇄", font=(UI_FONT, 8), padx=6, pady=1, cursor="hand2")
         self._lbl_theme_tag.pack(side="right")
         self._lbl_theme_tag.bind("<Button-1>", lambda _e: self.cycle_theme())
+
+        head_row_scope = tk.Frame(self._card_head)
+        head_row_scope.pack(fill="x", pady=(0, 4))
+        self._lbl_range_prefix = tk.Label(head_row_scope, text="范围", font=(UI_FONT, 7))
+        self._lbl_range_prefix.pack(side="left", padx=(0, 4))
+        self._range_bar = tk.Frame(head_row_scope)
+        self._range_bar.pack(side="left")
+        self._range_buttons: Dict[str, tk.Label] = {}
+        for rk in ("30m", "6h", "today", "7d"):
+            r_short, _r_full = HISTORY_RANGE_SPECS[rk]
+            rb = tk.Label(self._range_bar, text=r_short, font=(UI_FONT, 7), padx=5, pady=1, cursor="hand2")
+            rb.pack(side="left", padx=(0, 3))
+            rb.bind("<Button-1>", lambda _e, k=rk: self.set_history_range(k))
+            self._range_buttons[rk] = rb
+        self._lbl_scope_hint = tk.Label(head_row_scope, text="自动跟随当前", font=(UI_FONT, 7), anchor="e")
+        self._lbl_scope_hint.pack(side="right")
 
         head_row3 = tk.Frame(self._card_head)
         head_row3.pack(fill="x", pady=(2, 3))
@@ -602,6 +627,7 @@ class AntigravityCapsuleApp:
         self._lbl_headline.configure(bg=t["card_bg"])
         self._lbl_clock.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_acc_pill.configure(bg=t["card_alt_bg"], fg=t["text_primary"])
+        self._lbl_back_live.configure(bg=t["btn_hover"], fg=t["cyan"])
         self._lbl_acc_5h.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_acc_wk.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_theme_tag.configure(
@@ -609,6 +635,10 @@ class AntigravityCapsuleApp:
             fg=t["text_secondary"],
             text="主题:星蓝 ⇄" if self.config["theme"] == "midnight_blue" else "主题:深炭 ⇄",
         )
+        self._lbl_range_prefix.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._range_bar.configure(bg=t["card_bg"])
+        self._lbl_scope_hint.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._refresh_range_buttons()
         self._lbl_steps_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_steps_val.configure(bg=t["card_bg"], fg=t["text_primary"])
         self._steps_canvas.configure(bg=t["card_bg"])
@@ -902,6 +932,88 @@ class AntigravityCapsuleApp:
     def request_immediate_poll(self) -> None:
         self._force_poll_event.set()
 
+    def _refresh_range_buttons(self) -> None:
+        t = self.theme
+        for rk, btn in self._range_buttons.items():
+            active = rk == self._history_range
+            btn.configure(
+                bg=t["btn_hover"] if active else t["card_alt_bg"],
+                fg=t["cyan"] if active else t["text_muted"],
+                font=(UI_FONT, 7, "bold") if active else (UI_FONT, 7),
+            )
+
+    def set_history_range(self, range_key: str) -> None:
+        if range_key not in HISTORY_RANGE_SPECS:
+            return
+        with self._view_lock:
+            if range_key == self._history_range:
+                return
+            self._history_range = range_key
+            self._view_gen += 1
+        self._refresh_range_buttons()
+        self.request_immediate_poll()
+
+    def set_view_account(self, account_label: str) -> None:
+        clean = (account_label or "").strip()
+        with self._view_lock:
+            if clean == self._view_account:
+                return
+            self._view_account = clean
+            self._view_gen += 1
+        self._pinned_conv_id = None
+        self.request_immediate_poll()
+
+    def reset_live_view(self) -> None:
+        with self._view_lock:
+            changed = bool(self._view_account) or (self._history_range != "30m")
+            self._view_account = ""
+            self._history_range = "30m"
+            if changed:
+                self._view_gen += 1
+        self._pinned_conv_id = None
+        self._refresh_range_buttons()
+        if changed:
+            self.request_immediate_poll()
+
+    def _show_account_selector_menu(self, event: tk.Event) -> None:
+        t = self.theme
+        snap = self._latest_snapshot
+        cur_online = snap.account.short_label if (snap and snap.account.online) else ""
+        known = list(snap.available_accounts) if snap else []
+        with self._view_lock:
+            cur_view = self._view_account
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=t["card_bg"],
+            fg=t["text_primary"],
+            activebackground=t["btn_hover"],
+            activeforeground=t["cyan"],
+            bd=1,
+        )
+        auto_lbl = f"● 自动跟随当前 ({cur_online})" if cur_online else "● 自动跟随当前账号"
+        if cur_view:
+            auto_lbl = auto_lbl.replace("● ", "   ")
+        menu.add_command(label=auto_lbl, command=lambda: self.set_view_account(""))
+        if known:
+            menu.add_separator()
+            for acc in known:
+                is_cur_online = bool(cur_online and acc.lower() == cur_online.lower())
+                if is_cur_online:
+                    # Selecting the active online account maps cleanly to auto-follow ("") to avoid ghost lock
+                    mark = "● " if (not cur_view or cur_view.lower() == acc.lower()) else "   "
+                    menu.add_command(label=f"{mark}{acc} (当前在线 · 自动跟随)", command=lambda: self.set_view_account(""))
+                else:
+                    mark = "● " if (cur_view and cur_view.lower() == acc.lower()) else "   "
+                    menu.add_command(label=f"{mark}{acc} (历史记录)", command=lambda a=acc: self.set_view_account(a))
+        menu.add_separator()
+        all_mark = "● " if cur_view == "__all__" else "   "
+        menu.add_command(label=f"{all_mark}全机合并视角", command=lambda: self.set_view_account("__all__"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def restart_app(self) -> None:
         cb = self._on_restart
         self.shutdown()
@@ -912,7 +1024,7 @@ class AntigravityCapsuleApp:
     def render_snapshot(self, snap: MonitorSnapshot) -> None:
         self._latest_snapshot = snap
         t = self.theme
-        if snap.grade == "IDLE":
+        if snap.grade in ("IDLE", "WAIT") or snap.level == "cyan":
             level_color = t["cyan"]
         elif snap.level == "green":
             level_color = t["green"]
@@ -925,12 +1037,15 @@ class AntigravityCapsuleApp:
         self._dot_canvas.itemconfig(self._dot_oval, fill=level_color)
         short_grade = {
             "IDLE": "离线待机",
+            "WAIT": "待采样",
             "T0": "T0 健康",
             "WARN": "留意预警",
             "T1": "T1 掉缓存",
             "T2": "T2 限流",
             "T3": "T3 封禁",
         }.get(snap.grade, snap.grade)
+        if snap.is_historical_rating and snap.grade in ("T0", "WARN", "T1", "T2", "T3"):
+            short_grade += "(历)"
         self._lbl_bar_status.configure(text=short_grade, fg=level_color)
 
         # Resolve pinned conversation focus (for multi-main-conversation workflows)
@@ -990,31 +1105,43 @@ class AntigravityCapsuleApp:
             disp_fresh_title = pinned_conv.title
             disp_fresh_ctx = pinned_conv.context_tokens
             disp_fresh_invalid = pinned_conv.freshness_invalid_reason
+            disp_fresh_consec = pinned_conv.consec_miss
         else:
             disp_fresh_sec = snap.min_freshness_sec
             disp_fresh_conv = snap.min_freshness_conv
             disp_fresh_title = snap.min_freshness_title
             disp_fresh_ctx = snap.min_freshness_ctx
             disp_fresh_invalid = snap.min_freshness_invalid_reason
+            disp_fresh_consec = snap.large_freshness_list[0].consec_miss if snap.large_freshness_list else 0
 
         # Freshness indicator must never look green when the active large conversation just dropped cache (cr=0)
         if disp_fresh_invalid:
-            fresh_color = t["red"] if snap.max_consec_miss >= 2 else t["orange"]
+            is_severe_fresh = disp_fresh_consec >= 2 or ("连掉" in disp_fresh_invalid)
+            fresh_color = t["red"] if is_severe_fresh else t["orange"]
             self._lbl_bar_fresh.configure(text="保鲜 失效", fg=fresh_color)
         else:
             fresh_txt = format_countdown(disp_fresh_sec)
             fresh_color = t["text_secondary"]
             if disp_fresh_sec is not None:
-                fresh_color = t["red"] if disp_fresh_sec <= 0 else (t["orange"] if disp_fresh_sec <= 60 else t["green"])
+                fresh_color = t["orange"] if disp_fresh_sec <= 60 else t["green"]
             self._lbl_bar_fresh.configure(text=f"保鲜 {fresh_txt}", fg=fresh_color)
 
-        acc_txt = snap.account.short_label
-        if snap.account.five_hour_pct is not None and snap.account.weekly_pct is not None:
-            acc_txt += f" {snap.account.five_hour_pct:.0f}%/周{snap.account.weekly_pct:.0f}%"
-        elif snap.account.five_hour_pct is not None:
-            acc_txt += f" {snap.account.five_hour_pct:.0f}%"
-        elif snap.account.weekly_pct is not None:
-            acc_txt += f" 周{snap.account.weekly_pct:.0f}%"
+        range_short = HISTORY_RANGE_SPECS.get(snap.history_range, ("", ""))[0]
+        if snap.is_custom_account_view:
+            view_lbl = snap.resolved_account or "全机"
+            acc_txt = f"回看 {view_lbl}"
+            if snap.history_range != "30m" and range_short:
+                acc_txt += f"·{range_short}"
+        else:
+            acc_txt = snap.account.short_label
+            if snap.account.five_hour_pct is not None and snap.account.weekly_pct is not None:
+                acc_txt += f" {snap.account.five_hour_pct:.0f}%/周{snap.account.weekly_pct:.0f}%"
+            elif snap.account.five_hour_pct is not None:
+                acc_txt += f" {snap.account.five_hour_pct:.0f}%"
+            elif snap.account.weekly_pct is not None:
+                acc_txt += f" 周{snap.account.weekly_pct:.0f}%"
+            if snap.history_range != "30m" and range_short:
+                acc_txt += f"·{range_short}"
         self._lbl_bar_acc.configure(text=acc_txt)
 
         step_bar_color = compute_steps_color(
@@ -1027,7 +1154,7 @@ class AntigravityCapsuleApp:
             hit_s = f"{snap.primary_hit_rate:.1f}%" if snap.primary_hit_rate is not None else "—"
             tps_s = f"{snap.primary_tps:.0f}t/s" if snap.primary_tps is not None else "—"
             tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {snap.today_steps}步"
-            self.tray.update_status(snap.level, tip)
+            self.tray.update_status(snap.level if snap.level in ("green", "orange", "red") else "green", tip)
 
             if self.config["notifications_enabled"] and snap.alerts:
                 for _key, title, msg in snap.alerts:
@@ -1039,18 +1166,56 @@ class AntigravityCapsuleApp:
         # Expanded Panel: Module 1
         self._lbl_headline.configure(text=snap.headline, fg=level_color)
         self._lbl_clock.configure(text=datetime.datetime.fromtimestamp(snap.generated_at).strftime("%H:%M:%S"))
-        self._lbl_acc_pill.configure(text=snap.account.short_label or "离线")
-        self._lbl_acc_5h.configure(
-            text=f"5h {snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "5h —",
-            fg=t["text_muted"] if snap.account.five_hour_pct is None else (t["green"] if snap.account.five_hour_pct >= 35 else t["orange"]),
-        )
-        self._lbl_acc_wk.configure(
-            text=f"周 {snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "周 —",
-            fg=t["text_secondary"],
-        )
+
+        if snap.is_custom_account_view:
+            pill_txt = f"{snap.resolved_account or '全机'} ▾"
+            self._lbl_acc_pill.configure(text=pill_txt, bg=t["btn_hover"], fg=t["cyan"])
+        else:
+            pill_txt = f"{snap.account.short_label or '离线'} ▾"
+            self._lbl_acc_pill.configure(text=pill_txt, bg=t["card_alt_bg"], fg=t["text_primary"])
+
+        show_back_live = bool(snap.is_custom_account_view or snap.history_range != "30m")
+        if show_back_live:
+            self._lbl_back_live.pack(side="left", padx=(0, 6), after=self._lbl_acc_pill)
+        else:
+            self._lbl_back_live.pack_forget()
+
+        if snap.is_custom_account_view:
+            self._lbl_acc_5h.configure(text="历史独立视角", fg=t["cyan"])
+            self._lbl_acc_wk.configure(text=f"共 {len(snap.available_accounts)} 号可选" if snap.available_accounts else "", fg=t["text_muted"])
+        else:
+            self._lbl_acc_5h.configure(
+                text=f"5h {snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "5h —",
+                fg=t["text_muted"] if snap.account.five_hour_pct is None else (t["green"] if snap.account.five_hour_pct >= 35 else t["orange"]),
+            )
+            self._lbl_acc_wk.configure(
+                text=f"周 {snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "周 —",
+                fg=t["text_secondary"],
+            )
+
+        self._refresh_range_buttons()
+        if snap.is_custom_account_view:
+            self._lbl_scope_hint.configure(
+                text=f"回看 {snap.resolved_account or '全机'} · {snap.history_range_label}",
+                fg=t["cyan"],
+            )
+        elif snap.history_range != "30m":
+            self._lbl_scope_hint.configure(text=f"{snap.steps_scope_label} · {snap.history_range_label}", fg=t["cyan"])
+        elif snap.is_historical_rating and snap.rating_anchor_ts > 0:
+            self._lbl_scope_hint.configure(
+                text=f"历史参考 · 上次活跃 {format_relative_age(snap.generated_at - snap.rating_anchor_ts)}",
+                fg=t["orange"] if snap.grade in ("T1", "T2", "T3", "WARN") else t["text_secondary"],
+            )
+        else:
+            self._lbl_scope_hint.configure(text="自动跟随当前", fg=t["text_muted"])
 
         pct = min(100, int(round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100)))
-        self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label})")
+        if snap.history_range in ("6h", "7d"):
+            self._lbl_steps_title.configure(
+                text=f"今日保护线 ({snap.steps_scope_label}) · {snap.history_range_label} {snap.range_steps} 步"
+            )
+        else:
+            self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label})")
         if snap.total_today_steps > snap.today_steps:
             steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {snap.total_today_steps}"
         else:
@@ -1061,6 +1226,10 @@ class AntigravityCapsuleApp:
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
 
         # Module 2: Speed & Freshness (reflects pinned conversation when active)
+        if snap.is_custom_account_view or snap.history_range != "30m":
+            self._lbl_speed_title.configure(text=f"吞吐诊断 ({snap.history_range_label})")
+        else:
+            self._lbl_speed_title.configure(text="实时吞吐诊断")
         if pinned_conv is not None:
             self._lbl_pin_badge.configure(text=f"📌{pinned_conv.short_id} ×")
             self._lbl_pin_badge.pack(side="left", padx=(6, 0))
@@ -1075,8 +1244,7 @@ class AntigravityCapsuleApp:
         self._speed_hover_text = self._build_model_stats_tooltip_text(snap)
 
         ttft_txt = f"TTFT {disp_ttft:.1f}s" if disp_ttft is not None else "TTFT —"
-        ttft_col = t["red"] if (disp_ttft or 0) >= 90 else (t["orange"] if (disp_ttft or 0) >= 45 else t["text_secondary"])
-        self._lbl_ttft.configure(text=ttft_txt, fg=ttft_col)
+        self._lbl_ttft.configure(text=ttft_txt, fg=self._ttft_color(disp_ttft))
         if disp_tps is not None:
             self._lbl_tps_big.configure(text=f"{disp_tps:.1f} tok/s", fg=t["orange"] if disp_speed == "slow" else t["text_primary"])
         else:
@@ -1090,7 +1258,11 @@ class AntigravityCapsuleApp:
             self._lbl_speed_badge.configure(text="待采样", bg=t["card_alt_bg"], fg=t["text_muted"])
 
         if disp_ttft_avg is not None and disp_ttft_max is not None:
-            stat_col = t["red"] if disp_ttft_max >= 90 else (t["orange"] if disp_ttft_max >= 45 else t["text_secondary"])
+            stat_col = (
+                t["red"]
+                if disp_ttft_avg >= 90
+                else (t["orange"] if (disp_ttft_avg >= 45 or disp_ttft_max >= 90) else t["text_secondary"])
+            )
             self._lbl_ttft_stats.configure(
                 text=f"近10步 TTFT 均 {disp_ttft_avg:.1f}s · 峰 {disp_ttft_max:.1f}s",
                 fg=stat_col,
@@ -1114,12 +1286,12 @@ class AntigravityCapsuleApp:
         )
         if disp_fresh_invalid:
             self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}")
-            inv_col = t["red"] if snap.max_consec_miss >= 2 else t["orange"]
+            inv_col = t["red"] if (disp_fresh_consec >= 2 or ("连掉" in disp_fresh_invalid)) else t["orange"]
             self._lbl_fresh_big.configure(text=disp_fresh_invalid, fg=inv_col)
         elif disp_fresh_sec is not None:
             self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}（{snap.freshness_window_sec}s窗）")
             if disp_fresh_sec <= 0:
-                self._lbl_fresh_big.configure(text="已过期", fg=t["red"])
+                self._lbl_fresh_big.configure(text="已过期", fg=t["orange"])
             elif disp_fresh_sec <= 60:
                 self._lbl_fresh_big.configure(text=f"剩 {format_countdown(disp_fresh_sec)}", fg=t["orange"])
             else:
@@ -1131,11 +1303,16 @@ class AntigravityCapsuleApp:
         # Module 3: 10-step micro bars
         self._draw_conversation_bars(snap)
 
-        # Module 4: Sliding-window log stats (per-account isolated recent / today; muted while offline)
-        logs_live = bool(snap.account.online) and snap.grade != "IDLE"
+        # Module 4: Sliding-window / historical-range log stats (per-account isolated; live in custom/history views)
+        logs_live = bool(snap.account.online or snap.is_custom_account_view or snap.history_range != "30m") and snap.grade != "IDLE"
         if logs_live:
+            win_title = (
+                "上次活跃30m"
+                if (snap.history_range == "30m" and snap.is_historical_rating and not snap.is_custom_account_view)
+                else snap.history_range_label
+            )
             self._lbl_logs_title.configure(
-                text=f"底层日志滑动窗监控（{snap.log_scope_label} · 近 {snap.sliding_window_min} 分钟 / 今日）"
+                text=f"底层日志监控（{snap.log_scope_label} · {win_title} / 今日）"
             )
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
             self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1)
@@ -1219,7 +1396,7 @@ class AntigravityCapsuleApp:
     def _build_model_stats_tooltip_text(self, snap: MonitorSnapshot) -> str:
         if not snap.model_stats:
             return ""
-        lines = [f"近 {snap.sliding_window_min} 分钟分模型实测 ({snap.log_scope_label}):"]
+        lines = [f"{snap.history_range_label}分模型实测 ({snap.log_scope_label}):"]
         for ms in snap.model_stats[:6]:
             ttft_s = (
                 f"均 {ms.ttft_avg_sec:4.1f}s / 峰 {ms.ttft_max_sec:4.1f}s"
@@ -1282,6 +1459,7 @@ class AntigravityCapsuleApp:
             "idle_rewarm": "闲置重热",
             "model_switch": "切模型",
             "compact_reset": "压缩重热",
+            "revert_reset": "回溯重热",
             "small_ctx": "小上下文",
             "first_cacheable": "首次入窗",
             "abnormal_zero": "掉缓存!",
@@ -1297,7 +1475,12 @@ class AntigravityCapsuleApp:
             ctx_s = f"{format_tokens(st.total_tokens):>6}"
             d_s = f"({format_delta_tokens(st.context_delta):>7})" if st.context_delta != 0 else "(    +0)"
             mod_s = format_model_name(st.model)
-            tag = reason_map.get(st.reason, st.reason)
+            if getattr(st, "is_revert", False) and st.reason == "cached":
+                tag = "回溯·命中"
+            elif getattr(st, "is_compact", False) and st.reason == "cached":
+                tag = "压缩·命中"
+            else:
+                tag = reason_map.get(st.reason, st.reason)
             step_rows.append((hm, mod_s, ctx_s, d_s, st.hit_rate, t_str, p_str, tag))
         show_per_step_model = len({r[1] for r in step_rows}) >= 2
         for rev_idx, (hm, mod_s, ctx_s, d_s, hr, t_str, p_str, tag) in enumerate(reversed(step_rows), 1):
@@ -1417,19 +1600,26 @@ class AntigravityCapsuleApp:
             def _on_closed() -> None:
                 self._detail_win = None
 
+            def _load_scoped_report(cid: str):
+                with self._view_lock:
+                    va = self._view_account
+                    hr = self._history_range
+                return self.engine.read_conversation_detail(cid, view_account=va, history_range=hr)
+
             self._detail_win = ConversationDetailWindow(
                 parent=self.root,
                 theme=self.theme,
-                load_report=self.engine.read_conversation_detail,
+                load_report=_load_scoped_report,
                 on_toggle_pin=self._toggle_pin_conversation,
                 is_pinned_fn=lambda cid: self._pinned_conv_id == cid,
                 on_closed=_on_closed,
                 apply_rounding_fn=_apply_win11_rounded_corners,
                 screen_bounds_fn=_get_virtual_screen_bounds,
+                slow_tps_threshold=float(self.config.get("slow_tps_threshold", 35.0)),
             )
-            self._detail_win.show_conversation(conv_id, place_near_parent=True)
+            self._detail_win.show_conversation(conv_id, place_near_parent=True, initial_snap=self._latest_snapshot)
         else:
-            self._detail_win.show_conversation(conv_id, place_near_parent=False)
+            self._detail_win.show_conversation(conv_id, place_near_parent=False, initial_snap=self._latest_snapshot)
 
     def _hide_conv_tooltip(self) -> None:
         if self._tooltip_win is not None:
@@ -1577,10 +1767,11 @@ class AntigravityCapsuleApp:
             for row_ui in self._conv_rows:
                 for key in all_keys:
                     row_ui[key].grid_remove()
+            scope_t = snap.history_range_label if (snap.is_custom_account_view or snap.history_range != "30m") else "近期"
             empty_msg = {
-                "main": "暂无近 24 小时活跃主对话",
-                "subagent": "当前无近 24 小时子代理记录",
-                "all": "暂无近 24 小时活跃对话记录",
+                "main": f"暂无{scope_t}活跃主对话",
+                "subagent": f"当前无{scope_t}子代理记录",
+                "all": f"暂无{scope_t}活跃对话记录",
             }.get(self._conv_filter, "暂无活跃对话记录")
             self._lbl_convs_empty.configure(text=empty_msg)
             self._lbl_convs_empty.grid(row=0, column=0, columnspan=9, sticky="w", pady=4)
@@ -1617,8 +1808,21 @@ class AntigravityCapsuleApp:
             mod_txt = f"子·{conv.model}" if (self._conv_filter == "all" and conv.is_subagent) else conv.model
             row_ui["model"].configure(text=mod_txt, fg=t["text_muted"] if conv.is_subagent else t["text_secondary"])
 
+            latest_step = conv.recent_steps[-1] if conv.recent_steps else None
+            latest_cls = latest_step.classification if latest_step else ""
+            latest_reason = latest_step.reason if latest_step else ""
+            latest_is_rev = bool(latest_step and (getattr(latest_step, "is_revert", False) or latest_reason == "revert_reset"))
+            latest_is_cmp = bool(
+                latest_step
+                and (not latest_is_rev)
+                and (getattr(latest_step, "is_compact", False) or latest_reason == "compact_reset")
+            )
+
             ctx_txt = format_tokens(conv.context_tokens)
-            if conv.latest_context_delta <= -32000:
+            if latest_is_rev:
+                ctx_txt += "↩"
+                ctx_col = t["orange"]
+            elif latest_is_cmp:
                 ctx_txt += "↓"
                 ctx_col = t["purple"]
             else:
@@ -1631,9 +1835,6 @@ class AntigravityCapsuleApp:
                 ttft_txt = "—"
             row_ui["ttft_val"].configure(text=ttft_txt, fg=self._ttft_color(conv.ttft_sec))
 
-            latest_step = conv.recent_steps[-1] if conv.recent_steps else None
-            latest_cls = latest_step.classification if latest_step else ""
-            latest_reason = latest_step.reason if latest_step else ""
             if conv.latest_hit_rate >= 70:
                 hit_col = t["green"]
             elif latest_reason == "compact_reset":
@@ -1726,26 +1927,39 @@ class AntigravityCapsuleApp:
         first = True
         while not self._stop_event.is_set():
             try:
-                snap = self.engine.poll(force_account=first)
+                # Clear wakeup flag BEFORE reading view state & polling so concurrent UI switches are never dropped
+                self._force_poll_event.clear()
+                with self._view_lock:
+                    va = self._view_account
+                    hr = self._history_range
+                    gen = self._view_gen
+                snap = self.engine.poll(
+                    force_account=first,
+                    view_account=va,
+                    history_range=hr,
+                )
                 first = False
                 try:
                     while not self._snapshot_queue.empty():
                         self._snapshot_queue.get_nowait()
                 except queue.Empty:
                     pass
-                self._snapshot_queue.put_nowait(snap)
+                self._snapshot_queue.put_nowait((gen, snap))
             except Exception:
                 pass
             interval = max(1.0, float(self.config.get("poll_interval_ms", 2500)) / 1000.0)
             self._force_poll_event.wait(timeout=interval)
-            self._force_poll_event.clear()
 
     def _ui_drain_tick(self) -> None:
         if self._closing:
             return
         try:
             while True:
-                snap = self._snapshot_queue.get_nowait()
+                gen, snap = self._snapshot_queue.get_nowait()
+                with self._view_lock:
+                    cur_gen = self._view_gen
+                if gen != cur_gen:
+                    continue
                 self.render_snapshot(snap)
         except queue.Empty:
             pass

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import urllib.parse
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -215,35 +216,39 @@ class ConversationDbReader:
         self.conversations_dir = Path(conversations_dir)
         self.max_cache_entries = max(2, int(max_cache_entries))
         self.tail_rows = max(4, int(tail_rows))
+        self._lock = threading.RLock()
         self._cache: OrderedDict[str, Tuple[str, ConversationDbSnapshot]] = OrderedDict()
+        self._full_cache: OrderedDict[str, Tuple[str, List[GenTelemetry]]] = OrderedDict()
+        self._max_full_cache_entries: int = max(8, int(max_cache_entries))
 
     def read(self, conversation_id: str) -> Optional[ConversationDbSnapshot]:
         if not conversation_id:
             return None
-        db_path = self.conversations_dir / f"{conversation_id}.db"
-        db_stamp = _file_stamp(db_path)
-        if not db_stamp:
-            self._cache.pop(conversation_id, None)
-            return None
+        with self._lock:
+            db_path = self.conversations_dir / f"{conversation_id}.db"
+            db_stamp = _file_stamp(db_path)
+            if not db_stamp:
+                self._cache.pop(conversation_id, None)
+                return None
 
-        wal_stamp = _file_stamp(Path(f"{db_path}-wal")) or "no-wal"
-        combined_key = f"{db_stamp}|{wal_stamp}"
-        cached = self._cache.get(conversation_id)
-        if cached is not None and cached[0] == combined_key:
+            wal_stamp = _file_stamp(Path(f"{db_path}-wal")) or "no-wal"
+            combined_key = f"{db_stamp}|{wal_stamp}"
+            cached = self._cache.get(conversation_id)
+            if cached is not None and cached[0] == combined_key:
+                self._cache.move_to_end(conversation_id)
+                return cached[1]
+
+            try:
+                snap = self._read_from_disk(conversation_id, db_path)
+            except sqlite3.Error:
+                # Preserve last good snapshot during transient WAL write lock contention.
+                return cached[1] if cached is not None else None
+
+            self._cache[conversation_id] = (combined_key, snap)
             self._cache.move_to_end(conversation_id)
-            return cached[1]
-
-        try:
-            snap = self._read_from_disk(conversation_id, db_path)
-        except sqlite3.Error:
-            # Preserve last good snapshot during transient WAL write lock contention.
-            return cached[1] if cached is not None else None
-
-        self._cache[conversation_id] = (combined_key, snap)
-        self._cache.move_to_end(conversation_id)
-        while len(self._cache) > self.max_cache_entries:
-            self._cache.popitem(last=False)
-        return snap
+            while len(self._cache) > self.max_cache_entries:
+                self._cache.popitem(last=False)
+            return snap
 
     def _read_from_disk(self, conversation_id: str, db_path: Path) -> ConversationDbSnapshot:
         uri = _sqlite_ro_uri(db_path)
@@ -306,42 +311,55 @@ class ConversationDbReader:
         )
 
     def read_full_history(self, conversation_id: str) -> List[GenTelemetry]:
-        """On-demand read of all gen_metadata rows in ascending idx order for detail charts.
-
-        Opens SQLite strictly read-only and closes immediately without polluting the polling LRU cache.
-        """
+        """Bounded (db+wal) stamp-cached read of all gen_metadata rows in ascending idx order."""
         if not conversation_id:
             return []
-        db_path = self.conversations_dir / f"{conversation_id}.db"
-        if not db_path.is_file():
-            return []
-        uri = _sqlite_ro_uri(db_path)
-        conn: Optional[sqlite3.Connection] = None
-        try:
-            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-            rows = conn.execute("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").fetchall()
-            parsed: List[GenTelemetry] = []
-            for idx, data in rows:
-                item = parse_gen_metadata_row(int(idx), bytes(data) if data else b"")
-                if item is not None and (item.total_in > 0 or item.output_tokens > 0):
-                    parsed.append(item)
-            return parsed
-        except sqlite3.Error:
-            return []
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+        with self._lock:
+            db_path = self.conversations_dir / f"{conversation_id}.db"
+            db_stamp = _file_stamp(db_path)
+            if not db_stamp:
+                self._full_cache.pop(conversation_id, None)
+                return []
+
+            wal_stamp = _file_stamp(Path(f"{db_path}-wal")) or "no-wal"
+            combined_key = f"{db_stamp}|{wal_stamp}"
+            cached = self._full_cache.get(conversation_id)
+            if cached is not None and cached[0] == combined_key:
+                self._full_cache.move_to_end(conversation_id)
+                return cached[1]
+
+            uri = _sqlite_ro_uri(db_path)
+            conn: Optional[sqlite3.Connection] = None
+            try:
+                conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+                rows = conn.execute("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").fetchall()
+                parsed: List[GenTelemetry] = []
+                for idx, data in rows:
+                    item = parse_gen_metadata_row(int(idx), bytes(data) if data else b"")
+                    if item is not None and (item.total_in > 0 or item.output_tokens > 0):
+                        parsed.append(item)
+                self._full_cache[conversation_id] = (combined_key, parsed)
+                self._full_cache.move_to_end(conversation_id)
+                while len(self._full_cache) > self._max_full_cache_entries:
+                    self._full_cache.popitem(last=False)
+                return parsed
+            except sqlite3.Error:
+                return cached[1] if cached is not None else []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
 
     def check_subagent_hint(self, conversation_id: str) -> bool:
         """Lightweight read-only subagent hint lookup without displacing the full snapshot LRU."""
         if not conversation_id:
             return False
-        cached = self._cache.get(conversation_id)
-        if cached is not None:
-            return cached[1].is_subagent_hint
+        with self._lock:
+            cached = self._cache.get(conversation_id)
+            if cached is not None:
+                return cached[1].is_subagent_hint
         db_path = self.conversations_dir / f"{conversation_id}.db"
         if not db_path.is_file():
             return False

@@ -1162,11 +1162,12 @@ class TestShortcutsAndIcons(unittest.TestCase):
             engine._account_cache = AccountQuotaInfo(email_masked="fr***9@example.com", short_label="fr***9", online=True, observed_at=now)
             engine._last_account_poll = now
             snap = engine.poll(now_ts=now, force_account=False)
-            # Switching to fresh9 MUST isolate old01's 4x 503 logs and 0% cache bar!
+            # Switching to fresh9 MUST isolate old01's 4x 503 logs and 0% cache bar,
+            # and stay objectively in WAIT (not blindly claim T0 healthy with zero samples).
             self.assertEqual(snap.recent_503, 0)
             self.assertEqual(snap.today_503, 0)
             self.assertEqual(snap.machine_today_503, 4)
-            self.assertEqual(snap.grade, "T0")
+            self.assertEqual(snap.grade, "WAIT")
             self.assertEqual(snap.pressure, "normal")
             self.assertIsNone(snap.primary_hit_rate)
             self.assertIn("已切入 fr***9", snap.headline)
@@ -1480,6 +1481,654 @@ class TestShortcutsAndIcons(unittest.TestCase):
             # Right-hand close button must stay strictly inside locked window width
             close_right = dw._btn_close.winfo_x() + dw._btn_close.winfo_width()
             self.assertLessEqual(close_right, dw._hdr.winfo_width() + 2)
+            dw.close()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+    def test_switch_back_to_historical_account_inherits_own_rating_and_view_filter(self) -> None:
+        import datetime
+        import os
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain_bad = root / "brain" / "badconv1-1111" / ".system_generated" / "logs"
+            brain_good = root / "brain" / "goodconv-2222" / ".system_generated" / "logs"
+            brain_bad.mkdir(parents=True)
+            brain_good.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+
+            # Pin to fixed midday (12:00 local) so test is 100% deterministic at any wall-clock time including 00:00-00:30
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            t_bad = now - 5400.0
+            t_good = now - 2400.0
+            t_back_bad = now - 20.0
+
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_bad))}  INFO [Antigravity 2.0] 写入系统凭据: bad01@example.com\n"
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_good))}  INFO [Antigravity 2.0] 写入系统凭据: good9@example.com\n"
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_back_bad))}  INFO [Antigravity 2.0] 写入系统凭据: bad01@example.com\n",
+                encoding="utf-8",
+            )
+            glog_bad = time.strftime("%m%d %H:%M:%S", time.localtime(t_bad + 130))
+            ls_log.write_text(
+                "".join(
+                    f"ERROR: logging before google.Init: I{glog_bad}.{100000 + i} 22456 run.go:315] Run: attempt {i+1} failed (UNAVAILABLE (code 503): No capacity available)\n"
+                    for i in range(3)
+                ),
+                encoding="utf-8",
+            )
+
+            # bad01 had 4 consecutive cr=0 steps earlier
+            bad_rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "bad"}]
+            for k in range(5):
+                bad_rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": k + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_bad + 30 + k * 20)),
+                    "model": "gemini-4-argon-high",
+                    "input_tokens": 120000 + k * 1000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                })
+            tp_bad = brain_bad / "transcript.jsonl"
+            tp_bad.write_text("\n".join(json.dumps(r) for r in bad_rows) + "\n", encoding="utf-8")
+            os.utime(tp_bad, (t_bad + 120, t_bad + 120))
+
+            # good9 had healthy cached steps later
+            good_rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "good"}]
+            for k in range(3):
+                good_rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": k + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_good + 30 + k * 20)),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 60000 if k == 0 else 2000,
+                    "cache_read_tokens": 0 if k == 0 else 60000,
+                    "output_tokens": 300,
+                })
+            tp_good = brain_good / "transcript.jsonl"
+            tp_good.write_text("\n".join(json.dumps(r) for r in good_rows) + "\n", encoding="utf-8")
+            os.utime(tp_good, (t_good + 80, t_good + 80))
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            # Case 1: Just switched back to bad01 with ZERO new requests yet -> MUST inherit bad01's own historical T2 rating & 3x 503!
+            engine._account_cache = AccountQuotaInfo(email_masked="ba***1@example.com", short_label="ba***1", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap_bad = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_bad.grade, "T2")
+            self.assertEqual(snap_bad.level, "red")
+            self.assertTrue(snap_bad.is_historical_rating)
+            self.assertEqual(snap_bad.recent_503, 3)
+            self.assertEqual(len(snap_bad.active_conversations), 1)
+            self.assertEqual(snap_bad.active_conversations[0].short_id, "badcon")
+            self.assertIn("ba***1", snap_bad.available_accounts)
+            self.assertIn("go***9", snap_bad.available_accounts)
+
+            # Case 2: Manually switch dashboard view to historical good9 while bad01 is logged in -> sees good9's own T0 & 0x 503!
+            snap_view_good = engine.poll(now_ts=now, force_account=False, view_account="go***9", history_range="today")
+            self.assertEqual(snap_view_good.grade, "T0")
+            self.assertEqual(snap_view_good.level, "green")
+            self.assertTrue(snap_view_good.is_custom_account_view)
+            self.assertEqual(snap_view_good.recent_503, 0)
+            self.assertEqual(len(snap_view_good.active_conversations), 1)
+            self.assertEqual(snap_view_good.active_conversations[0].short_id, "goodco")
+
+    def test_undo_revert_not_misclassified_as_compact_or_abnormal_and_aligns_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "revt0001-3333-4444"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+
+            now = time.time()
+            def iso(offset: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now + offset))
+
+            # Simulate real Antigravity Undo to this point:
+            # si=10 -> si=12 (200K) -> Undo back to si=8 -> new si=10 (110K, cr=0) + stale background GENERIC earlier ts
+            lines = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 7, "created_at": iso(-300), "content": "start"},
+                {"type": "PLANNER_RESPONSE", "step_index": 10, "created_at": iso(-290), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"type": "PLANNER_RESPONSE", "step_index": 12, "created_at": iso(-260), "model": "gemini-4-neon-xhigh", "input_tokens": 90000, "cache_read_tokens": 110000, "output_tokens": 400},
+                # Discarded old branch step si=14 (will be overwritten/removed from SQLite on Undo)
+                {"type": "PLANNER_RESPONSE", "step_index": 14, "created_at": iso(-230), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 200000, "output_tokens": 400},
+                # User clicks "Undo to this point" back to step 8 (forward timestamp, regressed step_index!)
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 8, "created_at": iso(-200), "content": "try another path"},
+                {"type": "PLANNER_RESPONSE", "step_index": 10, "created_at": iso(-195), "model": "gemini-4-neon-xhigh", "input_tokens": 112000, "cache_read_tokens": 0, "output_tokens": 350},
+                # Delayed background GENERIC from 4 hours earlier (must NOT falsely trigger revert!)
+                {"type": "GENERIC", "step_index": 2, "created_at": iso(-14400), "content": "old bg"},
+                {"type": "PLANNER_RESPONSE", "step_index": 12, "created_at": iso(-170), "model": "gemini-4-neon-xhigh", "input_tokens": 3000, "cache_read_tokens": 112000, "output_tokens": 350},
+            ]
+            (b_dir / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in lines) + "\n", encoding="utf-8")
+
+            # SQLite gen_metadata drops the undone si=14 (202K), keeping only 4 live branch records
+            dbp = convs / f"{cid}.db"
+            conn = sqlite3.connect(dbp)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(110000, 0, 300, ttft_s=11, strm_s=3),))
+            conn.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(90000, 110000, 400, ttft_s=12, strm_s=3),))
+            conn.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(112000, 0, 350, ttft_s=22, strm_s=3),))
+            conn.execute("INSERT INTO gen_metadata VALUES (4, ?)", (_build_fake_gen_blob(3000, 112000, 350, ttft_s=8, strm_s=3),))
+            conn.commit()
+            conn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            det = engine.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(det)
+            assert det is not None
+            self.assertEqual(det.revert_count, 1)
+            self.assertEqual(det.compact_count, 0)
+            self.assertEqual(det.abnormal_miss_steps, 0)
+            # Point[3] is the post-Undo si=10 step -> classified as revert_reset (expected_cold), aligned to ttft=22s!
+            self.assertEqual(det.points[3].reason, "revert_reset")
+            self.assertEqual(det.points[3].classification, "expected_cold")
+            self.assertTrue(det.points[3].is_revert)
+            self.assertAlmostEqual(det.points[3].ttft_sec or 0.0, 22.0, delta=0.5)
+            # Point[2] was the discarded old branch (202K) -> must stay None, NOT mis-aligned to previous step!
+            self.assertIsNone(det.points[2].ttft_sec)
+            # Point[4] after delayed old GENERIC -> still normal cache hit, NOT revert, aligned to ttft=8s
+            self.assertFalse(det.points[4].is_revert)
+            self.assertEqual(det.points[4].classification, "hit")
+            self.assertAlmostEqual(det.points[4].ttft_sec or 0.0, 8.0, delta=0.5)
+
+    def test_detail_window_range_60_vs_all_kpis_and_ttft_4tier_colors(self) -> None:
+        import tkinter as tk
+        from core.log_monitor import ConversationDetailPoint, ConversationDetailReport
+        from ui.detail_window import ConversationDetailWindow, summarize_detail_points, ttft_metric_color
+        from ui.themes import THEMES
+
+        theme = THEMES["midnight_blue"]
+        self.assertEqual(ttft_metric_color(10.0, theme), theme["green"])
+        self.assertEqual(ttft_metric_color(32.3, theme), theme["cyan"])
+        self.assertEqual(ttft_metric_color(60.0, theme), theme["orange"])
+        self.assertEqual(ttft_metric_color(120.0, theme), theme["red"])
+
+        now = time.time()
+        pts = []
+        # First 15 steps: abnormal misses, slow TTFT 120s, slow TPS 25
+        for i in range(15):
+            pts.append(
+                ConversationDetailPoint(
+                    step_index=i + 1,
+                    timestamp=now - (75 - i) * 30,
+                    model="Neon XHigh",
+                    total_tokens=100000 + i * 1000,
+                    context_delta=1000,
+                    input_tokens=100000 + i * 1000,
+                    cache_read_tokens=0,
+                    output_tokens=200,
+                    hit_rate=0.0,
+                    classification="abnormal_miss",
+                    reason="abnormal_zero",
+                    ttft_sec=120.0,
+                    tps=25.0,
+                )
+            )
+        # Last 60 steps: 100% cache hit, avg TTFT ~32.0s with 1 deep-thinking peak 152.3s, fast TPS 180
+        for j in range(60):
+            pts.append(
+                ConversationDetailPoint(
+                    step_index=16 + j,
+                    timestamp=now - (60 - j) * 20,
+                    model="Neon XHigh",
+                    total_tokens=120000 + j * 1500,
+                    context_delta=1500,
+                    input_tokens=1500,
+                    cache_read_tokens=118500 + j * 1500,
+                    output_tokens=300,
+                    hit_rate=98.8,
+                    classification="hit",
+                    reason="cached",
+                    ttft_sec=152.3 if j == 50 else 30.0,
+                    tps=180.0,
+                )
+            )
+        st60 = summarize_detail_points(pts[-60:])
+        st_all = summarize_detail_points(pts)
+        self.assertAlmostEqual(st60["cacheable_hit_ratio"] or 0.0, 1.0, places=3)
+        self.assertAlmostEqual(st_all["cacheable_hit_ratio"] or 0.0, 0.8, places=3)
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        try:
+            rep = ConversationDetailReport(
+                conversation_id="kpi0001-1111",
+                short_id="kpi000",
+                is_subagent=False,
+                model="Neon XHigh",
+                model_raw="gemini-4-neon-xhigh",
+                total_steps=75,
+                today_steps=75,
+                peak_context_tokens=pts[-1].total_tokens,
+                latest_context_tokens=pts[-1].total_tokens,
+                latest_context_delta=1500,
+                max_context_tokens=512000,
+                compact_count=0,
+                cache_hit_steps=60,
+                abnormal_miss_steps=15,
+                expected_cold_steps=0,
+                overall_cacheable_hit_ratio=0.8,
+                avg_ttft_sec=st_all["avg_ttft_sec"],
+                p95_ttft_sec=st_all["p95_ttft_sec"],
+                max_ttft_sec=st_all["max_ttft_sec"],
+                avg_tps=st_all["avg_tps"],
+                latest_tps=180.0,
+                latest_ttft_sec=30.0,
+                freshness_remaining_sec=120,
+                freshness_invalid_reason="",
+                freshness_window_sec=210,
+                points=pts,
+                title="长对话KPI联动测试",
+            )
+            dw = ConversationDetailWindow(
+                parent=root,
+                theme=theme,
+                load_report=lambda _cid: rep,
+                on_toggle_pin=lambda _cid: None,
+                is_pinned_fn=lambda _cid: False,
+            )
+            dw.show_conversation(rep.conversation_id, place_near_parent=True)
+            root.update()
+            # In "60" mode: cache must be 100.0%, TTFT avg ~32.0s must be CYAN (NOT red despite 152.3s peak!)
+            self.assertEqual(dw._kpi_cards[1]["val"].cget("text"), "100.0%")
+            self.assertEqual(dw._kpi_cards[2]["val"].cget("fg"), theme["cyan"])
+            self.assertEqual(dw._kpi_cards[2]["sub"].cget("fg"), theme["orange"])
+            self.assertEqual(dw._kpi_cards[3]["val"].cget("text"), "均 180 t/s")
+
+            # Switch to "all" mode: all KPI cards MUST update to full 75-step metrics!
+            dw._set_window_mode("all")
+            root.update()
+            self.assertEqual(dw._kpi_cards[1]["val"].cget("text"), "80.0%")
+            self.assertEqual(dw._kpi_cards[2]["val"].cget("fg"), theme["orange"])
+            self.assertEqual(dw._kpi_cards[3]["val"].cget("text"), "均 149 t/s")
+            dw.close()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+    def test_same_account_switch_back_isolates_yesterday_t1_from_today_live_session(self) -> None:
+        import datetime
+        import os
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "retn0001-1111-2222"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            t_yest = now - 26 * 3600.0
+            t_other = now - 10 * 3600.0
+            t_back = now - 300.0
+
+            def iso(ts_v: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(ts_v))
+
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{iso(t_yest - 60)}  INFO [Antigravity 2.0] 写入系统凭据: alpha1@example.com\n"
+                f"{iso(t_other)}  INFO [Antigravity 2.0] 写入系统凭据: beta22@example.com\n"
+                f"{iso(t_back)}  INFO [Antigravity 2.0] 写入系统凭据: alpha1@example.com\n",
+                encoding="utf-8",
+            )
+            # Yesterday alpha1 had 4 consecutive abnormal cr=0 misses; today after switching back alpha1 runs 3 healthy cached steps
+            rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(t_yest), "content": "yest"},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(t_yest + 10), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(t_yest + 30), "model": "gemini-4-neon-xhigh", "input_tokens": 122000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(t_yest + 50), "model": "gemini-4-neon-xhigh", "input_tokens": 124000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": iso(t_yest + 70), "model": "gemini-4-neon-xhigh", "input_tokens": 126000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 6, "created_at": iso(t_back + 30), "model": "gemini-4-neon-xhigh", "input_tokens": 128000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"type": "PLANNER_RESPONSE", "step_index": 7, "created_at": iso(t_back + 50), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 128000, "output_tokens": 300},
+                {"type": "PLANNER_RESPONSE", "step_index": 8, "created_at": iso(t_back + 70), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 130000, "output_tokens": 300},
+            ]
+            tp = b_dir / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            os.utime(tp, (t_back + 70, t_back + 70))
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            engine._account_cache = AccountQuotaInfo(email_masked="al***1@example.com", short_label="al***1", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T0")
+            self.assertEqual(snap.level, "green")
+            self.assertEqual(snap.max_consec_miss, 0)
+            self.assertEqual(snap.max_abnormal_recent10, 0)
+
+    def test_older_52h_account_auto_expands_7d_and_single_cold_step_preserves_prior_t1_warn(self) -> None:
+        import datetime
+        import os
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid_old = "old52h01-aaaa-bbbb"
+            b_old = root / "brain" / cid_old / ".system_generated" / "logs"
+            b_old.mkdir(parents=True)
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            t_52h = now - 52 * 3600.0
+            t_other = now - 40 * 3600.0
+            t_relogin = now - 30.0
+
+            def iso(ts_v: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(ts_v))
+
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{iso(t_52h - 60)}  INFO [Antigravity 2.0] 写入系统凭据: rest52@example.com\n"
+                f"{iso(t_other)}  INFO [Antigravity 2.0] 写入系统凭据: main88@example.com\n"
+                f"{iso(t_relogin)}  INFO [Antigravity 2.0] 写入系统凭据: rest52@example.com\n",
+                encoding="utf-8",
+            )
+            old_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(t_52h), "content": "probe"},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(t_52h + 20), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(t_52h + 40), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(t_52h + 60), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 200},
+            ]
+            tp_old = b_old / "transcript.jsonl"
+            tp_old.write_text("\n".join(json.dumps(r) for r in old_rows) + "\n", encoding="utf-8")
+            os.utime(tp_old, (t_52h + 60, t_52h + 60))
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            engine._account_cache = AccountQuotaInfo(email_masked="re***2@example.com", short_label="re***2", online=True, observed_at=now)
+            engine._last_account_poll = now
+
+            # Phase 1: 0 new steps after switching back to 52h-old T1 account -> MUST expand >48h to 7d and inherit T1 red!
+            snap1 = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap1.grade, "T1")
+            self.assertEqual(snap1.level, "red")
+            self.assertTrue(snap1.is_historical_rating)
+
+            # Phase 2: 1 pure expected_cold first-turn step (0 cacheable steps yet) -> MUST warn (NOT wash away prior T1 into T0!)
+            cid_new = "newcold1-cccc-dddd"
+            b_new = root / "brain" / cid_new / ".system_generated" / "logs"
+            b_new.mkdir(parents=True)
+            tp_new = b_new / "transcript.jsonl"
+            tp_new.write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(t_relogin + 5), "content": "hi"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(t_relogin + 10), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(tp_new, (t_relogin + 10, t_relogin + 10))
+            snap2 = engine.poll(now_ts=now + 2, force_account=False)
+            self.assertEqual(snap2.grade, "WARN")
+            self.assertEqual(snap2.level, "orange")
+            self.assertIn("前序历史曾连续", snap2.sub_headline)
+
+    def test_global_sqlite_alignment_prevents_cross_account_compaction_mismatch_and_caches_full_history(self) -> None:
+        import datetime
+        import os
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "xacct001-5555-6666"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            t1 = now - 3600.0
+            t2 = now - 1200.0
+
+            def iso(ts_v: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(ts_v))
+
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{iso(t1 - 60)}  INFO [Antigravity 2.0] 写入系统凭据: acc001@example.com\n"
+                f"{iso(t2)}  INFO [Antigravity 2.0] 写入系统凭据: acc002@example.com\n",
+                encoding="utf-8",
+            )
+            # acc001 ran at 180K -> 220K (TTFT 42s/48s); later acc002 compacted back to 180K (TTFT 5s)!
+            # Greedy sliced alignment would wrongly bind acc001's 180K step to acc002's 5s row; global alignment MUST bind 42s/48s!
+            rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(t1), "content": "go"},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(t1 + 10), "model": "gemini-4-neon-xhigh", "input_tokens": 180000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(t1 + 40), "model": "gemini-4-neon-xhigh", "input_tokens": 40000, "cache_read_tokens": 180000, "output_tokens": 400},
+                {"type": "CHECKPOINT", "step_index": 4, "created_at": iso(t2 + 5)},
+                {"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": iso(t2 + 15), "model": "gemini-4-neon-xhigh", "input_tokens": 180000, "cache_read_tokens": 0, "output_tokens": 600},
+                {"type": "PLANNER_RESPONSE", "step_index": 6, "created_at": iso(t2 + 40), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 180000, "output_tokens": 250},
+            ]
+            tp = b_dir / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            os.utime(tp, (t2 + 40, t2 + 40))
+
+            dbp = convs / f"{cid}.db"
+            conn = sqlite3.connect(dbp)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            conn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(180000, 0, 300, ttft_s=42, strm_s=4),))
+            conn.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(40000, 180000, 400, ttft_s=48, strm_s=4),))
+            conn.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(180000, 0, 600, ttft_s=5, strm_s=4),))
+            conn.execute("INSERT INTO gen_metadata VALUES (4, ?)", (_build_fake_gen_blob(2000, 180000, 250, ttft_s=6, strm_s=4),))
+            conn.commit()
+            conn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            engine._account_cache = AccountQuotaInfo(email_masked="ac***2@example.com", short_label="ac***2", online=True, observed_at=now, five_hour_pct=88.0, weekly_pct=60.0)
+            engine._last_account_poll = now
+
+            snap = engine.poll(now_ts=now, force_account=False, view_account="ac***1", history_range="7d")
+            self.assertEqual(len(snap.active_conversations), 1)
+            c1 = snap.active_conversations[0]
+            self.assertEqual(c1.total_step_count, 2)
+            self.assertEqual(c1.full_step_count, 4)
+            self.assertAlmostEqual(c1.ttft_sec or 0.0, 48.5, delta=0.6)
+            self.assertAlmostEqual(c1.ttft_avg_sec or 0.0, 45.5, delta=0.6)
+            # Custom account text summary must NOT leak online acc002's 5h/weekly quota!
+            txt = format_text_summary(snap)
+            self.assertIn("观察视角: ac***1", txt)
+            self.assertNotIn("88.0%", txt)
+            # Full-history SQLite cache should now be populated and hit on second call
+            self.assertIn(cid, engine._db_reader._full_cache)
+            det_scoped = engine.read_conversation_detail(cid, now_ts=now, view_account="ac***1", history_range="7d")
+            self.assertIsNotNone(det_scoped)
+            assert det_scoped is not None
+            self.assertEqual(det_scoped.total_steps, 2)
+            self.assertIn("ac***1", det_scoped.scope_label)
+
+    def test_first_turn_503_resend_not_revert_and_cached_revert_and_cached_compact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "edge0001-7777-8888"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            now = time.time()
+
+            def iso(off: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now + off))
+
+            rows = [
+                # Duplicate USER_INPUT before any PLANNER_RESPONSE (503 resend) -> MUST NOT trigger revert!
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-500), "content": "try 1"},
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-490), "content": "try 1 resend"},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(-480), "model": "gemini-4-neon-xhigh", "input_tokens": 450000, "cache_read_tokens": 0, "output_tokens": 300},
+                # True compaction with partial prefix cache hit (cr > 0, 450K -> 180K) -> is_compact=True, compact_count=1
+                {"type": "CHECKPOINT", "step_index": 3, "created_at": iso(-450)},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(-440), "model": "gemini-4-neon-xhigh", "input_tokens": 155000, "cache_read_tokens": 25000, "output_tokens": 300},
+                # True Undo revert that still hits earlier prefix cache (cr > 0) -> is_revert=True, reason="cached", [回溯·命中]
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 2, "created_at": iso(-400), "content": "undo and retry"},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(-395), "model": "gemini-4-neon-xhigh", "input_tokens": 20000, "cache_read_tokens": 100000, "output_tokens": 250},
+            ]
+            (b_dir / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            det = engine.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(det)
+            assert det is not None
+            self.assertFalse(det.points[0].is_revert)
+            self.assertTrue(det.points[1].is_compact)
+            self.assertFalse(det.points[1].is_revert)
+            self.assertEqual(det.compact_count, 1)
+            self.assertTrue(det.points[2].is_revert)
+            self.assertEqual(det.points[2].reason, "cached")
+            self.assertEqual(det.revert_count, 1)
+            rep_txt = format_detail_text_report(det)
+            self.assertIn("[回溯·命中]", rep_txt)
+            self.assertIn("[压缩·命中]", rep_txt)
+
+    def test_detail_window_sync_idempotency_under_filtered_view_and_cli_args(self) -> None:
+        import tkinter as tk
+        from core.log_monitor import AccountQuotaInfo, ConversationDetailPoint, ConversationDetailReport, ConversationSummary, MonitorSnapshot
+        from main import _parse_args
+        from ui.detail_window import ConversationDetailWindow
+        from ui.themes import THEMES
+
+        # 1. Verify CLI --account / --range parser
+        ns = _parse_args(["--json", "--readonly", "--account", "al***1", "--range", "7d"])
+        self.assertTrue(ns.json)
+        self.assertTrue(ns.readonly)
+        self.assertEqual(ns.account, "al***1")
+        self.assertEqual(ns.history_range, "7d")
+
+        # 2. Verify ConversationDetailWindow.sync_from_snapshot makes 0 redundant load_report calls under filtered view
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        try:
+            now = time.time()
+            pt = ConversationDetailPoint(
+                step_index=10, timestamp=now - 50, model="Neon XHigh",
+                total_tokens=150000, context_delta=2000, input_tokens=2000, cache_read_tokens=148000,
+                output_tokens=300, hit_rate=98.7, classification="hit", reason="cached", ttft_sec=12.0, tps=160.0,
+            )
+            rep = ConversationDetailReport(
+                conversation_id="idem0001-9999", short_id="idem00", is_subagent=False,
+                model="Neon XHigh", model_raw="gemini-4-neon-xhigh", total_steps=50, today_steps=10,
+                peak_context_tokens=150000, latest_context_tokens=150000, latest_context_delta=2000,
+                max_context_tokens=512000, compact_count=0, cache_hit_steps=50, abnormal_miss_steps=0,
+                expected_cold_steps=0, overall_cacheable_hit_ratio=1.0, avg_ttft_sec=12.0, p95_ttft_sec=12.0,
+                max_ttft_sec=12.0, avg_tps=160.0, latest_tps=160.0, latest_ttft_sec=12.0,
+                freshness_remaining_sec=None, freshness_invalid_reason="", freshness_window_sec=210,
+                points=[pt], title="防抖测试",
+            )
+            calls = {"n": 0}
+
+            def _loader(_cid: str) -> ConversationDetailReport:
+                calls["n"] += 1
+                return rep
+
+            conv_summary = ConversationSummary(
+                conversation_id="idem0001-9999", short_id="idem00", model="Neon XHigh",
+                model_raw="gemini-4-neon-xhigh", context_tokens=150000, max_context_tokens=512000,
+                latest_hit_rate=98.7, latest_cached_in=148000, latest_uncached_in=2000,
+                latest_timestamp=now - 50, recent_steps=[], consec_miss=0, consec_miss_start_step=0,
+                single_miss=False, wasted_cold_tokens=0, freshness_remaining_sec=None,
+                total_step_count=12, full_step_count=50,
+                full_latest_timestamp=now - 50, ttft_sec=12.0, tps=160.0, title="防抖测试",
+            )
+            snap_filtered = MonitorSnapshot(
+                generated_at=now, level="green", grade="T0", headline="T0", sub_headline="ok",
+                active_model="Neon XHigh", primary_hit_rate=98.7, primary_hit_classification="hit",
+                primary_tps=160.0, primary_ttft=12.0, primary_speed_status="ok",
+                min_freshness_sec=None, min_freshness_conv="", min_freshness_ctx=0,
+                min_freshness_invalid_reason="", today_steps=12, daily_steps_warn=960, daily_steps_alert=1200,
+                active_conversations=[conv_summary], large_freshness_list=[],
+                recent_503=0, today_503=0, recent_timeout=0, today_timeout=0,
+                recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+                recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+                account=AccountQuotaInfo(short_label="al***1", online=True),
+                sliding_window_min=30, freshness_window_sec=210,
+                view_account="al***1", resolved_account="al***1", is_custom_account_view=True,
+                history_range="7d", history_range_label="近 7 天",
+            )
+            dw = ConversationDetailWindow(
+                parent=root, theme=THEMES["midnight_blue"], load_report=_loader,
+                on_toggle_pin=lambda _c: None, is_pinned_fn=lambda _c: False, slow_tps_threshold=40.0,
+            )
+            dw.show_conversation("idem0001-9999", place_near_parent=True, initial_snap=snap_filtered)
+            self.assertEqual(calls["n"], 1)
+            for _ in range(5):
+                dw.sync_from_snapshot(snap_filtered)
+            # Zero redundant refreshes even though conv.total_step_count (12) != rep.total_steps (50)!
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("历史回看", dw._lbl_live_tag.cget("text"))
             dw.close()
         finally:
             try:

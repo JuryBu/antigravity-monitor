@@ -13,7 +13,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 COCKPIT_SWITCH_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+INFO\s+\[Antigravity[^\]]*\]\s+写入系统凭据:\s*(\S+)",
@@ -127,8 +127,8 @@ class AccountSwitchLedger:
         lbl = _mask_short(short_label)
         if not lbl or _is_invalid_label(lbl):
             return
-        # Prune entries older than 7 days
-        cutoff = now_ts - 7 * 86400
+        # Prune entries older than 10 days (covers 7d history range + 48h lookback anchor)
+        cutoff = now_ts - 10 * 86400
         self._own_events = [(ts, lab) for ts, lab in self._own_events if ts >= cutoff]
         if self._own_events and self._own_events[-1][1].lower() == lbl.lower():
             return
@@ -150,13 +150,17 @@ class AccountSwitchLedger:
         if self.cockpit_logs_dir is None or not self.cockpit_logs_dir.is_dir():
             return []
         try:
-            candidates = sorted(
-                self.cockpit_logs_dir.glob("app.log.*"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )[:3]
+            raw_files = list(self.cockpit_logs_dir.glob("app.log.*"))
         except OSError:
             return []
+        dated: List[Tuple[float, Path]] = []
+        for p in raw_files:
+            try:
+                dated.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        dated.sort(key=lambda item: item[0], reverse=True)
+        candidates = [p for _, p in dated[:12]]
 
         merged: List[Tuple[float, str]] = []
         for lp in candidates:
@@ -212,22 +216,76 @@ class AccountSwitchLedger:
             return []
         return [ts for ts, _ in tl[1:] if ts >= since_ts]
 
+    def list_known_accounts(
+        self,
+        since_ts: float,
+        current_label: str = "",
+    ) -> List[str]:
+        """Return known masked account labels ordered by most-recent appearance (current online first)."""
+        tl = self.get_timeline(since_ts)
+        ordered: List[str] = []
+        seen_low: set[str] = set()
+        cur_clean = _mask_short(current_label) if current_label else ""
+        if cur_clean:
+            ordered.append(cur_clean)
+            seen_low.add(cur_clean.lower())
+        for _ts, lbl in reversed(tl):
+            low = lbl.lower()
+            if low and low not in seen_low:
+                ordered.append(lbl)
+                seen_low.add(low)
+        return ordered
+
     def attribute_timestamp(
         self,
         step_ts: float,
         timeline: List[Tuple[float, str]],
         fallback_label: str = "",
+        _times_cache: Optional[List[float]] = None,
     ) -> str:
         """Determine which masked account owned ``step_ts`` based on the switch timeline."""
         if not timeline:
             return _mask_short(fallback_label)
-        times = [t for t, _ in timeline]
+        times = (
+            _times_cache
+            if (_times_cache is not None and len(_times_cache) == len(timeline))
+            else [t for t, _ in timeline]
+        )
         # Allow a tiny 2s grace margin for clock jitter between switch log and transcript write
         idx = bisect.bisect_right(times, step_ts + 2.0) - 1
         if idx >= 0:
             return timeline[idx][1]
         # Before the very first recorded entry: if only one account appears in the timeline, attribute to it
-        unique_accounts = {lbl.lower() for _, lbl in timeline}
-        if len(unique_accounts) == 1:
-            return timeline[0][1]
-        return ""
+        first_low = timeline[0][1].lower()
+        for _, lbl in timeline[1:]:
+            if lbl.lower() != first_low:
+                return ""
+        return timeline[0][1]
+
+    def build_account_matcher(
+        self,
+        target_account: str,
+        timeline: List[Tuple[float, str]],
+        fallback_label: str = "",
+    ) -> Callable[[float], bool]:
+        """Build a zero-allocation O(log N) predicate checking whether ``step_ts`` belongs to ``target_account``."""
+        target_low = (_mask_short(target_account) or target_account).strip().lower()
+        if not target_low:
+            return lambda _ts: True
+        if not timeline:
+            fb_low = (_mask_short(fallback_label) or fallback_label).strip().lower()
+            matched = fb_low == target_low
+            return (lambda _ts: True) if matched else (lambda _ts: False)
+        times = [t for t, _ in timeline]
+        labels_low = [lbl.lower() for _, lbl in timeline]
+        first_low = labels_low[0]
+        single_before_match = all(l == first_low for l in labels_low[1:]) and (first_low == target_low)
+        bisect_right = bisect.bisect_right
+
+        def _matches(ev_ts: float) -> bool:
+            idx = bisect_right(times, ev_ts + 2.0) - 1
+            if idx >= 0:
+                return labels_low[idx] == target_low
+            return single_before_match
+
+        return _matches

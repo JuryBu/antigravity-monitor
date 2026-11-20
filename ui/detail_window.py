@@ -57,6 +57,78 @@ def _short_model_tag(model_name: str) -> str:
     return m[:10]
 
 
+def ttft_metric_color(sec: Optional[float], theme: Dict[str, str]) -> str:
+    """Unified 4-tier TTFT color scale: green <15s, cyan 15-45s, orange 45-90s, red >=90s."""
+    if sec is None:
+        return theme["text_muted"]
+    if sec >= 90.0:
+        return theme["red"]
+    if sec >= 45.0:
+        return theme["orange"]
+    if sec >= 15.0:
+        return theme["cyan"]
+    return theme["green"]
+
+
+def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any]:
+    """Compute window-scoped KPI aggregates matching the active chart range ('60' vs 'all')."""
+    if not pts:
+        return {
+            "peak_context_tokens": 0,
+            "compact_count": 0,
+            "revert_count": 0,
+            "cache_hit_steps": 0,
+            "abnormal_miss_steps": 0,
+            "expected_cold_steps": 0,
+            "cacheable_hit_ratio": None,
+            "avg_ttft_sec": None,
+            "p95_ttft_sec": None,
+            "max_ttft_sec": None,
+            "avg_tps": None,
+            "latest_tps": None,
+        }
+    peak_ctx = max(p.total_tokens for p in pts)
+    revert_count = sum(1 for p in pts if getattr(p, "is_revert", False) or p.reason == "revert_reset")
+    compact_count = sum(
+        1
+        for p in pts
+        if (not getattr(p, "is_revert", False) and p.reason != "revert_reset")
+        and (
+            getattr(p, "is_compact", False)
+            or p.reason == "compact_reset"
+            or (p.context_delta <= -32000 and p.total_tokens < (p.total_tokens - p.context_delta) * 0.75)
+        )
+    )
+    hit_steps = sum(1 for p in pts if p.classification == "hit")
+    abn_steps = sum(1 for p in pts if p.classification == "abnormal_miss")
+    exp_cold_steps = sum(1 for p in pts if p.classification == "expected_cold")
+    cacheable_total = hit_steps + abn_steps
+    hit_ratio = (hit_steps / cacheable_total) if cacheable_total > 0 else None
+
+    ttfts = sorted(p.ttft_sec for p in pts if p.ttft_sec is not None)
+    avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
+    max_ttft = ttfts[-1] if ttfts else None
+    p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
+
+    tpss = [p.tps for p in pts if p.tps is not None]
+    avg_tps = (sum(tpss) / len(tpss)) if tpss else None
+    latest_tps = next((p.tps for p in reversed(pts) if p.tps is not None), None)
+    return {
+        "peak_context_tokens": peak_ctx,
+        "compact_count": compact_count,
+        "revert_count": revert_count,
+        "cache_hit_steps": hit_steps,
+        "abnormal_miss_steps": abn_steps,
+        "expected_cold_steps": exp_cold_steps,
+        "cacheable_hit_ratio": hit_ratio,
+        "avg_ttft_sec": avg_ttft,
+        "p95_ttft_sec": p95_ttft,
+        "max_ttft_sec": max_ttft,
+        "avg_tps": avg_tps,
+        "latest_tps": latest_tps,
+    }
+
+
 class ConversationDetailWindow:
     """Borderless themed Toplevel displaying full-history Context, TTFT, and Cache charts."""
 
@@ -70,6 +142,7 @@ class ConversationDetailWindow:
         on_closed: Optional[Callable[[], None]] = None,
         apply_rounding_fn: Optional[Callable[[int], None]] = None,
         screen_bounds_fn: Optional[Callable[[tk.Tk], Tuple[int, int, int, int]]] = None,
+        slow_tps_threshold: float = 35.0,
     ) -> None:
         self._parent = parent
         self.theme: Dict[str, str] = theme
@@ -79,13 +152,17 @@ class ConversationDetailWindow:
         self._on_closed = on_closed
         self._apply_rounding_fn = apply_rounding_fn
         self._screen_bounds_fn = screen_bounds_fn
+        self._slow_tps_threshold: float = max(1.0, float(slow_tps_threshold))
 
         self._conv_id: str = ""
         self._report: Optional[ConversationDetailReport] = None
+        self._current_wstats: Dict[str, Any] = {}
         self._window_mode: str = "60"  # "60" | "all"
         self._display_points: List[ConversationDetailPoint] = []
         self._chart_meta: Dict[str, Dict[str, Any]] = {}
         self._last_sync_sig: Optional[Tuple[Any, ...]] = None
+        self._last_view_key: Tuple[str, str] = ("", "30m")
+        self._is_historical_badge: bool = False
         self._hovering_chart: bool = False
         self._locked_size: Optional[Tuple[int, int]] = None
         self._last_canvas_sizes: Dict[str, Tuple[int, int]] = {}
@@ -164,9 +241,9 @@ class ConversationDetailWindow:
 
         # 3 long-range Canvas chart cards
         self._chart_specs = [
-            ("ctx", "请求体 / 上下文增长曲线", "顶带=每步模型 · 青线=上下文规模 · 紫虚线=压缩裁剪"),
+            ("ctx", "请求体 / 上下文增长曲线", "顶带=每步模型 · 青线=上下文 · 紫虚=压缩 · 橙虚=回溯"),
             ("ttft", "首字延迟 TTFT 与模型切换趋势", "绿<15s · 青15-45s · 橙45-90s · 红≥90s"),
-            ("cache", "缓存命中率长线轨迹", "绿命中 · 紫压缩重热 · 橙正常冷启 · 红异常掉缓存"),
+            ("cache", "缓存命中率长线轨迹", "绿命中 · 紫压缩重热 · 橙正常冷启/回溯 · 红异常掉缓存"),
         ]
         self._charts: Dict[str, Dict[str, Any]] = {}
         chart_heights = {"ctx": 118, "ttft": 112, "cache": 82}
@@ -227,7 +304,10 @@ class ConversationDetailWindow:
         self._lbl_sub.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._btn_close.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._range_bar.configure(bg=t["panel_bg"])
-        self._lbl_live_tag.configure(bg=t["green_bg"], fg=t["green"])
+        self._lbl_live_tag.configure(
+            bg=t["btn_hover"] if self._is_historical_badge else t["green_bg"],
+            fg=t["cyan"] if self._is_historical_badge else t["green"],
+        )
         self._kpi_row.configure(bg=t["panel_bg"])
         for kc in self._kpi_cards:
             kc["card"].configure(bg=t["card_bg"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
@@ -287,17 +367,55 @@ class ConversationDetailWindow:
         self.win.update_idletasks()
         return self._locked_size
 
-    def show_conversation(self, conv_id: str, place_near_parent: bool = True) -> None:
+    def _set_live_badge(self, is_historical: bool) -> None:
+        self._is_historical_badge = bool(is_historical)
+        t = self.theme
+        if self._is_historical_badge:
+            self._lbl_live_tag.configure(text="● 历史回看", bg=t["btn_hover"], fg=t["cyan"])
+        else:
+            self._lbl_live_tag.configure(text="● 实时", bg=t["green_bg"], fg=t["green"])
+
+    @staticmethod
+    def _build_sync_sig(conv: Any, snap: MonitorSnapshot) -> Tuple[Any, ...]:
+        return (
+            conv.conversation_id,
+            conv.total_step_count,
+            getattr(conv, "full_step_count", conv.total_step_count),
+            round(conv.latest_timestamp, 2),
+            round(getattr(conv, "full_latest_timestamp", conv.latest_timestamp), 2),
+            conv.context_tokens,
+            round(conv.latest_hit_rate, 1),
+            round(conv.ttft_sec, 2) if conv.ttft_sec is not None else None,
+            round(conv.tps, 1) if conv.tps is not None else None,
+            conv.model_raw,
+            conv.title,
+            snap.view_account,
+            snap.history_range,
+        )
+
+    def show_conversation(
+        self,
+        conv_id: str,
+        place_near_parent: bool = True,
+        initial_snap: Optional[MonitorSnapshot] = None,
+    ) -> None:
         if self._closed:
             return
         self._conv_id = conv_id
         self._last_sync_sig = None
         self._hovering_chart = False
+        if initial_snap is not None:
+            self._last_view_key = (initial_snap.view_account, initial_snap.history_range)
+            self._set_live_badge(bool(initial_snap.is_custom_account_view or initial_snap.history_range != "30m"))
         self._lock_window_size()
         self.win.deiconify()
         self.win.lift()
         self.win.update_idletasks()
         self.refresh()
+        if initial_snap is not None:
+            conv = next((c for c in initial_snap.active_conversations if c.conversation_id == conv_id), None)
+            if conv is not None:
+                self._last_sync_sig = self._build_sync_sig(conv, initial_snap)
         self.win.update_idletasks()
         if place_near_parent:
             self._place_window()
@@ -314,26 +432,30 @@ class ConversationDetailWindow:
         """Keep the open detail modal dynamically in sync with the main 2.5s poll loop."""
         if self._closed or not self._conv_id:
             return
+        is_hist_view = bool(snap.is_custom_account_view or snap.history_range != "30m")
+        self._set_live_badge(is_hist_view)
+        view_key = (snap.view_account, snap.history_range)
         conv = next((c for c in snap.active_conversations if c.conversation_id == self._conv_id), None)
         if conv is None:
+            if view_key != self._last_view_key:
+                self._last_view_key = view_key
+                self._last_sync_sig = None
+                self.refresh()
             return
-        sig = (
-            conv.total_step_count,
-            round(conv.latest_timestamp, 2),
-            conv.context_tokens,
-            round(conv.latest_hit_rate, 1),
-            round(conv.ttft_sec, 2) if conv.ttft_sec is not None else None,
-            round(conv.tps, 1) if conv.tps is not None else None,
-            conv.model_raw,
-            conv.title,
-        )
+        self._last_view_key = view_key
+        sig = self._build_sync_sig(conv, snap)
         if sig != self._last_sync_sig:
             self._last_sync_sig = sig
             self.refresh()
         else:
             # Zero-IO fast path: smoothly tick the freshness countdown without redrawing canvases
-            latest_tps = self._report.latest_tps if self._report is not None else conv.tps
-            self._update_freshness_kpi(conv.freshness_remaining_sec, conv.freshness_invalid_reason, latest_tps)
+            latest_tps = self._current_wstats.get("latest_tps")
+            if latest_tps is None:
+                latest_tps = self._report.latest_tps if self._report is not None else conv.tps
+            if is_hist_view:
+                self._update_freshness_kpi(None, "", latest_tps)
+            else:
+                self._update_freshness_kpi(conv.freshness_remaining_sec, conv.freshness_invalid_reason, latest_tps)
             self._sync_pin_button()
 
     def _on_chart_configure(self, chart_key: str) -> None:
@@ -445,8 +567,14 @@ class ConversationDetailWindow:
         rep = self._report
         self._sync_pin_button()
         if rep is None:
+            self._display_points = []
+            self._current_wstats = {}
             self._lbl_title.configure(text=f"{self._conv_id[:6]} · 未找到轨迹文件")
             self._lbl_sub.configure(text="")
+            for kc in self._kpi_cards:
+                kc["val"].configure(text="—", fg=t["text_muted"])
+                kc["sub"].configure(text="—", fg=t["text_muted"])
+            self._lbl_readout.configure(text="未找到该对话的轨迹文件或当前视角暂无可展示数据", fg=t["text_muted"])
             for ch in self._charts.values():
                 ch["canvas"].delete("all")
             return
@@ -457,28 +585,21 @@ class ConversationDetailWindow:
             self._lbl_role.configure(text="主对话", bg=t["green_bg"], fg=t["green"])
         distinct_models = list(dict.fromkeys(p.model for p in rep.points if p.model))
         model_tag = f"{rep.model} (含{len(distinct_models)}模)" if len(distinct_models) >= 2 else rep.model
+        scope_tag = f" · {rep.scope_label}" if getattr(rep, "scope_label", "") else ""
+        if getattr(rep, "scope_label", ""):
+            self._set_live_badge(True)
         if rep.title:
             disp_name = truncate_display_width(rep.title, 20)
             self._lbl_title.configure(text=disp_name)
-            self._lbl_sub.configure(text=f"{rep.short_id} · {model_tag} · {rep.total_steps}步(今{rep.today_steps})")
+            self._lbl_sub.configure(text=f"{rep.short_id} · {model_tag} · {rep.total_steps}步(今{rep.today_steps}){scope_tag}")
             self.win.title(f"{rep.title} ({rep.short_id}) - 长线体检")
         else:
             self._lbl_title.configure(text=f"{rep.short_id} · {model_tag}")
-            self._lbl_sub.configure(text=f"总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+            self._lbl_sub.configure(text=f"总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步){scope_tag}")
             self.win.title(f"{rep.short_id} - 长线体检")
 
         pts = rep.points[-60:] if (self._window_mode == "60" and len(rep.points) > 60) else list(rep.points)
         self._display_points = pts
-        self._last_sync_sig = (
-            rep.total_steps,
-            round(rep.points[-1].timestamp, 2) if rep.points else 0.0,
-            rep.latest_context_tokens,
-            round(rep.points[-1].hit_rate, 1) if rep.points else 0.0,
-            round(rep.latest_ttft_sec, 2) if rep.latest_ttft_sec is not None else None,
-            round(rep.latest_tps, 1) if rep.latest_tps is not None else None,
-            rep.model_raw,
-            rep.title,
-        )
 
         # Update dynamic model legend on TTFT chart header
         vis_models = list(dict.fromkeys(p.model for p in pts if p.model))
@@ -492,43 +613,92 @@ class ConversationDetailWindow:
         else:
             self._charts["ttft"]["legend"].configure(text="绿<15s · 青15-45s · 橙45-90s · 红≥90s")
 
-        # KPI 1: Context size & delta
+        # Recompute all 4 KPI cards strictly for the active window ('60' vs 'all')
+        wstats = summarize_detail_points(pts)
+        self._current_wstats = wstats
+        is_sliced_60 = self._window_mode == "60" and len(rep.points) > 60
+        if is_sliced_60:
+            self._kpi_cards[0]["title"].configure(text="请求体规模 (近60步)")
+            self._kpi_cards[1]["title"].configure(text="近 60 步缓存命中")
+            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT (近60步)")
+            self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜 (近60步)")
+        elif self._window_mode == "60":
+            self._kpi_cards[0]["title"].configure(text="请求体规模 / 变化")
+            self._kpi_cards[1]["title"].configure(text=f"近 60 步命中 (全{len(rep.points)}步)")
+            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT")
+            self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜")
+        else:
+            self._kpi_cards[0]["title"].configure(text="请求体规模 / 变化")
+            self._kpi_cards[1]["title"].configure(text="全程缓存有效命中")
+            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT (全程)")
+            self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜 (全程)")
+
+        # KPI 1: Context size & delta (window-scoped peak, compaction count & revert count)
         delta_s = format_delta_tokens(rep.latest_context_delta)
-        delta_col = t["purple"] if rep.latest_context_delta <= -32000 else t["cyan"]
+        latest_is_revert = bool(pts) and (getattr(pts[-1], "is_revert", False) or pts[-1].reason == "revert_reset")
+        latest_is_compact = (not latest_is_revert) and bool(pts) and (
+            getattr(pts[-1], "is_compact", False) or pts[-1].reason == "compact_reset"
+        )
+        delta_col = t["orange"] if latest_is_revert else (t["purple"] if latest_is_compact else t["cyan"])
         self._kpi_cards[0]["val"].configure(text=f"{format_tokens(rep.latest_context_tokens)} ({delta_s})", fg=delta_col)
+        rev_part = f" · 回溯 {wstats['revert_count']}" if wstats["revert_count"] > 0 else ""
         self._kpi_cards[0]["sub"].configure(
-            text=f"峰值 {format_tokens(rep.peak_context_tokens)} · 压缩 {rep.compact_count} 次",
+            text=f"峰值 {format_tokens(wstats['peak_context_tokens'])} · 压缩 {wstats['compact_count']}{rev_part}",
             fg=t["text_secondary"],
         )
 
-        # KPI 2: Cache hit ratio
-        if rep.overall_cacheable_hit_ratio is not None:
-            pct = rep.overall_cacheable_hit_ratio * 100.0
+        # KPI 2: Cache hit ratio (window-scoped; sub-row escalates orange for isolated miss, red for severe)
+        hit_ratio = wstats["cacheable_hit_ratio"]
+        abn = wstats["abnormal_miss_steps"]
+        if hit_ratio is not None:
+            pct = hit_ratio * 100.0
             c_col = t["green"] if pct >= 85 else (t["orange"] if pct >= 55 else t["red"])
             self._kpi_cards[1]["val"].configure(text=f"{pct:.1f}%", fg=c_col)
         else:
             self._kpi_cards[1]["val"].configure(text="—", fg=t["text_muted"])
+        sub_col = (
+            t["red"]
+            if (abn >= 4 or (hit_ratio is not None and hit_ratio < 0.85 and abn > 0))
+            else (t["orange"] if abn > 0 else t["text_secondary"])
+        )
         self._kpi_cards[1]["sub"].configure(
-            text=f"命中 {rep.cache_hit_steps} · 异常 {rep.abnormal_miss_steps} · 冷 {rep.expected_cold_steps}",
-            fg=t["red"] if rep.abnormal_miss_steps > 0 else t["text_secondary"],
+            text=f"命中 {wstats['cache_hit_steps']} · 异常 {abn} · 冷 {wstats['expected_cold_steps']}",
+            fg=sub_col,
         )
 
-        # KPI 3: TTFT
-        if rep.avg_ttft_sec is not None and rep.max_ttft_sec is not None:
-            t_col = t["red"] if rep.max_ttft_sec >= 90 else (t["orange"] if rep.avg_ttft_sec >= 45 else t["green"])
-            self._kpi_cards[2]["val"].configure(text=f"均 {rep.avg_ttft_sec:.1f}s", fg=t_col)
-            p95_s = f"{rep.p95_ttft_sec:.1f}s" if rep.p95_ttft_sec is not None else "—"
-            self._kpi_cards[2]["sub"].configure(text=f"P95 {p95_s} · 峰 {rep.max_ttft_sec:.1f}s", fg=t["text_secondary"])
+        # KPI 3: TTFT (mean colored strictly by mean on unified 4-tier scale; tail P95/max colored separately)
+        avg_ttft = wstats["avg_ttft_sec"]
+        p95_ttft = wstats["p95_ttft_sec"]
+        max_ttft = wstats["max_ttft_sec"]
+        if avg_ttft is not None and max_ttft is not None:
+            t_col = ttft_metric_color(avg_ttft, t)
+            self._kpi_cards[2]["val"].configure(text=f"均 {avg_ttft:.1f}s", fg=t_col)
+            p95_s = f"{p95_ttft:.1f}s" if p95_ttft is not None else "—"
+            tail_col = (
+                t["red"]
+                if (p95_ttft is not None and p95_ttft >= 90.0)
+                else (
+                    t["orange"]
+                    if (max_ttft >= 90.0 or (p95_ttft is not None and p95_ttft >= 45.0))
+                    else t["text_secondary"]
+                )
+            )
+            self._kpi_cards[2]["sub"].configure(text=f"P95 {p95_s} · 峰 {max_ttft:.1f}s", fg=tail_col)
         else:
             self._kpi_cards[2]["val"].configure(text="—", fg=t["text_muted"])
             self._kpi_cards[2]["sub"].configure(text="暂无 SQLite 速度记录", fg=t["text_muted"])
 
-        # KPI 4: TPS & Freshness
-        if rep.avg_tps is not None:
-            self._kpi_cards[3]["val"].configure(text=f"均 {rep.avg_tps:.0f} t/s", fg=t["cyan"])
+        # KPI 4: TPS & Freshness (mean TPS window-scoped; orange alert uses configured slow threshold)
+        avg_tps = wstats["avg_tps"]
+        if avg_tps is not None:
+            tps_col = t["orange"] if avg_tps < self._slow_tps_threshold else t["cyan"]
+            self._kpi_cards[3]["val"].configure(text=f"均 {avg_tps:.0f} t/s", fg=tps_col)
         else:
             self._kpi_cards[3]["val"].configure(text="— t/s", fg=t["text_muted"])
-        self._update_freshness_kpi(rep.freshness_remaining_sec, rep.freshness_invalid_reason, rep.latest_tps)
+        if self._is_historical_badge:
+            self._update_freshness_kpi(None, "", wstats["latest_tps"])
+        else:
+            self._update_freshness_kpi(rep.freshness_remaining_sec, rep.freshness_invalid_reason, wstats["latest_tps"])
 
         self.win.update_idletasks()
         self._draw_context_chart(pts)
@@ -546,7 +716,8 @@ class ConversationDetailWindow:
     ) -> None:
         t = self.theme
         if freshness_invalid_reason:
-            f_txt, f_col = freshness_invalid_reason, t["red"]
+            is_severe = "连掉" in freshness_invalid_reason
+            f_txt, f_col = freshness_invalid_reason, (t["red"] if is_severe else t["orange"])
         elif freshness_remaining_sec is not None:
             if freshness_remaining_sec <= 0:
                 f_txt, f_col = "大上下文保鲜: 已过期", t["orange"]
@@ -658,7 +829,7 @@ class ConversationDetailWindow:
             cv.create_line(pad_l, yy, pad_l + plot_w, yy, fill=t["divider"], dash=(2, 3))
             cv.create_text(pad_l - 6, yy, text=format_tokens(int(y_max * frac)), anchor="e", font=(MONO_FONT, 7), fill=t["text_muted"])
 
-        # Highlight compaction drops with purple dashed verticals (space out labels to avoid overlap)
+        # Highlight compaction drops (purple) & user Undo/revert branch points (orange)
         n = len(pts)
         coords: List[float] = []
         last_lbl_x = -999.0
@@ -666,7 +837,12 @@ class ConversationDetailWindow:
             x = self._x_for_idx(idx, n, pad_l, plot_w)
             y = pad_t + plot_h * (1.0 - min(1.0, pt.total_tokens / float(y_max)))
             coords.extend([x, y])
-            if pt.reason == "compact_reset":
+            if getattr(pt, "is_revert", False) or pt.reason == "revert_reset":
+                cv.create_line(x, pad_t, x, pad_t + plot_h, fill=t["orange"], width=1.2, dash=(2, 2))
+                if x - last_lbl_x >= 34.0 and x < pad_l + plot_w - 22.0:
+                    cv.create_text(x + 2, pad_t + 7, text="回溯", anchor="w", font=(UI_FONT, 7, "bold"), fill=t["orange"])
+                    last_lbl_x = x
+            elif getattr(pt, "is_compact", False) or pt.reason == "compact_reset":
                 cv.create_line(x, pad_t, x, pad_t + plot_h, fill=t["purple"], width=1.2, dash=(3, 2))
                 if x - last_lbl_x >= 34.0 and x < pad_l + plot_w - 22.0:
                     cv.create_text(x + 2, pad_t + 7, text="压缩", anchor="w", font=(UI_FONT, 7, "bold"), fill=t["purple"])
@@ -753,7 +929,7 @@ class ConversationDetailWindow:
             sec = float(pt.ttft_sec)
             clipped = sec > y_max
             yy = pad_t if clipped else (pad_t + plot_h * (1.0 - sec / y_max))
-            col = t["red"] if sec >= 90.0 else (t["orange"] if sec >= 45.0 else (t["cyan"] if sec >= 15.0 else t["green"]))
+            col = ttft_metric_color(sec, t)
             cv.create_rectangle(x - bar_w / 2.0, yy, x + bar_w / 2.0, y_base, fill=col, outline="")
             if clipped:
                 cv.create_rectangle(x - bar_w / 2.0, pad_t, x + bar_w / 2.0, pad_t + 2.5, fill=t["text_primary"], outline="")
@@ -860,6 +1036,7 @@ class ConversationDetailWindow:
             "idle_rewarm": "闲置重热",
             "model_switch": "切模型",
             "compact_reset": "压缩重热",
+            "revert_reset": "回溯重热",
             "small_ctx": "小上下文",
             "first_cacheable": "首次入窗",
             "abnormal_zero": "掉缓存!",
@@ -867,7 +1044,12 @@ class ConversationDetailWindow:
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f} t/s" if pt.tps is not None else "—"
-        tag = reason_map.get(pt.reason, pt.reason)
+        if getattr(pt, "is_revert", False) and pt.reason == "cached":
+            tag = "回溯·命中"
+        elif getattr(pt, "is_compact", False) and pt.reason == "cached":
+            tag = "压缩·命中"
+        else:
+            tag = reason_map.get(pt.reason, pt.reason)
         mod_s = pt.model or "未知模型"
         msg = (
             f"{prefix} #{pt.step_index} ({hm}) │ [{mod_s}] │ 请求体 {format_tokens(pt.total_tokens)} "
@@ -877,7 +1059,15 @@ class ConversationDetailWindow:
         fg = (
             t["red"]
             if pt.classification == "abnormal_miss"
-            else (t["purple"] if pt.reason == "compact_reset" else (t["orange"] if pt.classification == "expected_cold" else t["text_primary"]))
+            else (
+                t["orange"]
+                if (getattr(pt, "is_revert", False) or pt.reason == "revert_reset")
+                else (
+                    t["purple"]
+                    if (getattr(pt, "is_compact", False) or pt.reason == "compact_reset")
+                    else (t["orange"] if pt.classification == "expected_cold" else t["text_primary"])
+                )
+            )
         )
         self._lbl_readout.configure(text=msg, fg=fg)
 

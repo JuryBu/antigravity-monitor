@@ -19,17 +19,18 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
-from core.account_ledger import AccountSwitchLedger
+from core.account_ledger import AccountSwitchLedger, _mask_short
 from core.config_store import DEFAULT_CONFIG, sanitize_config
 from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, parse_pb_map
 
@@ -283,8 +284,10 @@ class StepRecord:
     total_tokens: int
     hit_rate: float
     classification: str  # "hit" | "expected_cold" | "abnormal_miss"
-    reason: str          # "cached" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "small_ctx" | "first_cacheable" | "abnormal_zero"
+    reason: str          # "cached" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "revert_reset" | "small_ctx" | "first_cacheable" | "abnormal_zero"
     context_delta: int = 0
+    is_revert: bool = False
+    is_compact: bool = False
 
 
 @dataclass
@@ -323,6 +326,10 @@ class ConversationSummary:
     latest_context_delta: int = 0
     total_step_count: int = 0
     title: str = ""
+    full_step_count: int = 0
+    full_latest_timestamp: float = 0.0
+    _scoped_steps_all: List[StepRecord] = field(default_factory=list, repr=False, compare=False)
+    _scoped_gens_all: List[Optional[Any]] = field(default_factory=list, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -341,6 +348,8 @@ class ConversationDetailPoint:
     ttft_sec: Optional[float] = None
     tps: Optional[float] = None
     streaming_sec: Optional[float] = None
+    is_revert: bool = False
+    is_compact: bool = False
 
 
 @dataclass
@@ -372,6 +381,8 @@ class ConversationDetailReport:
     freshness_window_sec: int
     points: List[ConversationDetailPoint] = field(default_factory=list)
     title: str = ""
+    revert_count: int = 0
+    scope_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -489,6 +500,38 @@ class MonitorSnapshot:
     machine_today_retry: int = 0
     last_t2_error_ts: float = 0.0
     t2_recovery_note: str = ""
+    available_accounts: List[str] = field(default_factory=list)
+    view_account: str = ""
+    resolved_account: str = ""
+    is_custom_account_view: bool = False
+    history_range: str = "30m"
+    history_range_label: str = "近 30 分钟"
+    is_historical_rating: bool = False
+    rating_anchor_ts: float = 0.0
+    range_steps: int = 0
+
+
+HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
+    "30m": ("实时30m", "近 30 分钟"),
+    "6h": ("近6h", "近 6 小时"),
+    "today": ("今日", "今日"),
+    "7d": ("近7天", "近 7 天"),
+}
+
+
+def format_relative_age(seconds: float) -> str:
+    sec = max(0, int(round(seconds)))
+    if sec < 60:
+        return f"{sec}秒前"
+    if sec < 3600:
+        return f"{sec // 60}分钟前"
+    if sec < 86400:
+        hrs = sec // 3600
+        mins = (sec % 3600) // 60
+        return f"{hrs}小时{mins}分前" if mins > 0 else f"{hrs}小时前"
+    days = sec // 86400
+    hrs = (sec % 86400) // 3600
+    return f"{days}天{hrs}小时前" if hrs > 0 else f"{days}天前"
 
 
 def compute_pressure(
@@ -593,6 +636,7 @@ def classify_steps(
     prev_ts: Optional[float] = None
     prev_model: Optional[str] = None
     prev_total: Optional[int] = None
+    prev_step_idx: Optional[int] = None
     switches = sorted(account_switches) if account_switches else []
 
     for idx, item in enumerate(raw_steps):
@@ -615,9 +659,22 @@ def classify_steps(
                     crossed_switch = True
                     break
 
+        after_revert = bool(item.get("after_revert", False))
+        if (
+            not after_revert
+            and prev_step_idx is not None
+            and raw_si is not None
+            and step_idx <= prev_step_idx
+            and (prev_ts is None or ts <= 0.0 or prev_ts <= 0.0 or ts >= prev_ts - 5.0)
+        ):
+            after_revert = True
+
         after_checkpoint = bool(item.get("after_checkpoint", False))
-        is_real_compact = prev_total is not None and prev_total >= min_cacheable_tokens and (
-            (after_checkpoint and total < prev_total * 0.85) or (total < prev_total * 0.75)
+        is_real_compact = (
+            not after_revert
+            and prev_total is not None
+            and prev_total >= min_cacheable_tokens
+            and ((after_checkpoint and total < prev_total * 0.85) or (total < prev_total * 0.75))
         )
         if cr > 0:
             cls, reason = "hit", "cached"
@@ -625,6 +682,8 @@ def classify_steps(
             cls, reason = "expected_cold", "first_turn"
         elif crossed_switch:
             cls, reason = "expected_cold", "account_switch"
+        elif after_revert:
+            cls, reason = "expected_cold", "revert_reset"
         elif is_real_compact:
             cls, reason = "expected_cold", "compact_reset"
         elif ts > 0 and prev_ts > 0 and (ts - prev_ts) > idle_rewarm_sec:
@@ -653,11 +712,17 @@ def classify_steps(
                 classification=cls,
                 reason=reason,
                 context_delta=ctx_delta,
+                is_revert=after_revert,
+                is_compact=is_real_compact,
             )
         )
-        prev_ts = ts
-        prev_model = model
-        prev_total = total
+        # Do not let an out-of-order delayed historical step clobber the forward cursor
+        is_delayed_ooo = prev_ts is not None and ts > 0.0 and prev_ts > 0.0 and ts < prev_ts - 5.0
+        if not is_delayed_ooo:
+            prev_ts = ts
+            prev_model = model
+            prev_total = total
+            prev_step_idx = step_idx
 
     return classified
 
@@ -808,8 +873,12 @@ class LanguageServerLogTailer:
         window_min: int,
         account_since_ts: float = 0.0,
         account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
     ) -> Tuple[Dict[str, int], Dict[str, int], List[LogEvent]]:
-        cutoff = max(now_ts - max(1, window_min) * 60, account_since_ts)
+        win_end = range_end_ts if range_end_ts is not None else now_ts
+        default_start = win_end - max(1, window_min) * 60
+        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
         today_start = datetime.datetime.fromtimestamp(now_ts).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
@@ -819,10 +888,11 @@ class LanguageServerLogTailer:
         in_window_notable: List[LogEvent] = []
 
         for ev in self._events:
+            if account_filter_fn is not None and not account_filter_fn(ev.timestamp):
+                continue
             if ev.timestamp >= today_start:
-                if account_filter_fn is None or account_filter_fn(ev.timestamp):
-                    today[ev.category] = today.get(ev.category, 0) + 1
-            if ev.timestamp >= cutoff:
+                today[ev.category] = today.get(ev.category, 0) + 1
+            if cutoff <= ev.timestamp <= win_end + 2.0:
                 recent[ev.category] = recent.get(ev.category, 0) + 1
                 if ev.category in ("503", "timeout", "403"):
                     in_window_notable.append(ev)
@@ -845,11 +915,34 @@ class LanguageServerLogTailer:
         window_min: int,
         categories: Tuple[str, ...] = ("503", "timeout"),
         account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
     ) -> float:
-        cutoff = max(now_ts - max(1, window_min) * 60, account_since_ts)
+        win_end = range_end_ts if range_end_ts is not None else now_ts
+        default_start = win_end - max(1, window_min) * 60
+        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
         latest = 0.0
         for ev in self._events:
-            if ev.timestamp >= cutoff and ev.category in categories and ev.timestamp > latest:
+            if account_filter_fn is not None and not account_filter_fn(ev.timestamp):
+                continue
+            if cutoff <= ev.timestamp <= win_end + 2.0 and ev.category in categories and ev.timestamp > latest:
+                latest = ev.timestamp
+        return latest
+
+    def get_latest_account_event_ts(
+        self,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        since_ts: float = 0.0,
+        categories: Tuple[str, ...] = ("503", "timeout", "403"),
+    ) -> float:
+        latest = 0.0
+        for ev in self._events:
+            if ev.timestamp < since_ts or ev.category not in categories:
+                continue
+            if account_filter_fn is not None and not account_filter_fn(ev.timestamp):
+                continue
+            if ev.timestamp > latest:
                 latest = ev.timestamp
         return latest
 
@@ -890,14 +983,16 @@ class AntigravityMonitorEngine:
 
         self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
         self.annotations_dir: Optional[Path] = Path(annotations_dir) if annotations_dir is not None else None
-        self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]] = {}
-        self._subagent_hint_cache: Dict[str, Tuple[int, bool]] = {}
+        self._lock = threading.RLock()
+        self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]]" = OrderedDict()
+        self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
+        self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
         self._conv_titles: Dict[str, str] = {}
-        self._annotation_title_cache: Dict[str, Tuple[Tuple[int, int], str]] = {}
+        self._annotation_title_cache: "OrderedDict[str, Tuple[Tuple[int, int], str]]" = OrderedDict()
         self._vscdb_titles_stamp: Optional[Tuple[int, int]] = None
         self._vscdb_titles_cache: Dict[str, str] = {}
         self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=36, tail_rows=16)
-        self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=200)
+        self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=1500)
         self._ledger = AccountSwitchLedger(
             ledger_path=ledger_path,
             cockpit_logs_dir=cockpit_logs_dir,
@@ -911,7 +1006,34 @@ class AntigravityMonitorEngine:
         self._emitted_alert_keys: Deque[str] = deque(maxlen=256)
 
     def update_config(self, config: Dict[str, Any]) -> None:
-        self.config = sanitize_config(config)
+        with self._lock:
+            self.config = sanitize_config(config)
+
+    def _classify_steps_cached(
+        self,
+        conv_id: str,
+        raw_steps: List[Dict[str, Any]],
+        switch_timestamps: List[float],
+    ) -> List[StepRecord]:
+        t_entry = self._transcript_cache.get(conv_id)
+        t_stamp = t_entry[0] if t_entry is not None else (0, len(raw_steps))
+        sw_sig = tuple(round(t, 1) for t in switch_timestamps[-24:])
+        idle_sec = int(self.config["idle_rewarm_sec"])
+        key = (conv_id, t_stamp, sw_sig, idle_sec)
+        cached = self._classified_cache.get(key)
+        if cached is not None:
+            self._classified_cache.move_to_end(key)
+            return cached
+        steps = classify_steps(
+            raw_steps,
+            idle_rewarm_sec=idle_sec,
+            account_switches=switch_timestamps,
+        )
+        self._classified_cache[key] = steps
+        self._classified_cache.move_to_end(key)
+        while len(self._classified_cache) > 256:
+            self._classified_cache.popitem(last=False)
+        return steps
 
     def _check_subagent_hint_cached(self, conv_id: str) -> bool:
         db_path = self.conversations_dir / f"{conv_id}.db"
@@ -922,12 +1044,41 @@ class AntigravityMonitorEngine:
             return False
         cached = self._subagent_hint_cache.get(conv_id)
         if cached is not None and cached[0] == mtime_ns:
+            self._subagent_hint_cache.move_to_end(conv_id)
             return cached[1]
         hint = self._db_reader.check_subagent_hint(conv_id)
         self._subagent_hint_cache[conv_id] = (mtime_ns, hint)
-        if len(self._subagent_hint_cache) > 512:
-            self._subagent_hint_cache.pop(next(iter(self._subagent_hint_cache)), None)
+        self._subagent_hint_cache.move_to_end(conv_id)
+        while len(self._subagent_hint_cache) > 512:
+            self._subagent_hint_cache.popitem(last=False)
         return hint
+
+    @staticmethod
+    def _recompute_conv_eval_stats(c: ConversationSummary, eval_since_ts: float) -> None:
+        """Restrict a conversation's miss/hit health counters to steps at or after ``eval_since_ts``."""
+        src_steps = c._scoped_steps_all or c.recent_steps
+        eval_steps = [s for s in src_steps if s.timestamp >= eval_since_ts - 2.0]
+        eval_recent10 = [s for s in c.recent_steps if s.timestamp >= eval_since_ts - 2.0]
+        consec_miss = 0
+        consec_start_step = eval_steps[-1].step_index if eval_steps else 0
+        for s in reversed(eval_steps):
+            if s.classification == "abnormal_miss":
+                consec_miss += 1
+                consec_start_step = s.step_index
+            else:
+                break
+        abnormal_steps_r10 = [s for s in eval_recent10 if s.classification == "abnormal_miss"]
+        abnormal_r10 = len(abnormal_steps_r10)
+        hits_r10 = sum(1 for s in eval_recent10 if s.classification == "hit")
+        cacheable_r10 = abnormal_r10 + hits_r10
+        c.consec_miss = consec_miss
+        c.consec_miss_start_step = consec_start_step
+        c.single_miss = consec_miss == 1
+        c.wasted_cold_tokens = sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss")
+        c.abnormal_in_recent10 = abnormal_r10
+        c.cacheable_in_recent10 = cacheable_r10
+        c.recent10_hit_ratio = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
+        c.first_abnormal_step_in_recent10 = abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0
 
     def _build_conversation_summary(
         self,
@@ -937,28 +1088,34 @@ class AntigravityMonitorEngine:
         has_subagent_marker: bool,
         now: float,
         switch_timestamps: List[float],
-        current_acct_since_ts: float,
-    ) -> Optional[ConversationSummary]:
-        steps = classify_steps(
-            raw_steps,
-            idle_rewarm_sec=self.config["idle_rewarm_sec"],
-            account_switches=switch_timestamps,
-        )
-        if not steps:
+        current_acct_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: float = 0.0,
+    ) -> Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]]:
+        all_steps = self._classify_steps_cached(conv_id, raw_steps, switch_timestamps)
+        if not all_steps:
             return None
 
-        latest = steps[-1]
-        recent10 = steps[-10:]
-        eval_steps = (
-            [s for s in steps if s.timestamp >= current_acct_since_ts - 2.0]
-            if current_acct_since_ts > 0.0
-            else steps
-        )
-        eval_recent10 = (
-            [s for s in recent10 if s.timestamp >= current_acct_since_ts - 2.0]
-            if current_acct_since_ts > 0.0
-            else recent10
-        )
+        scoped_indices: List[int] = []
+        for idx_s, s in enumerate(all_steps):
+            if account_filter_fn is not None and not account_filter_fn(s.timestamp):
+                continue
+            if range_start_ts > 0.0 and s.timestamp < range_start_ts:
+                continue
+            scoped_indices.append(idx_s)
+
+        if not scoped_indices:
+            return None
+
+        scoped_steps = [all_steps[i] for i in scoped_indices]
+        latest = scoped_steps[-1]
+        recent10 = scoped_steps[-10:]
+        if account_filter_fn is None and current_acct_since_ts > 0.0:
+            eval_steps = [s for s in scoped_steps if s.timestamp >= current_acct_since_ts - 2.0]
+            eval_recent10 = [s for s in recent10 if s.timestamp >= current_acct_since_ts - 2.0]
+        else:
+            eval_steps = scoped_steps
+            eval_recent10 = recent10
 
         consec_miss = 0
         consec_start_step = latest.step_index
@@ -981,16 +1138,21 @@ class AntigravityMonitorEngine:
         fresh_invalid = ""
         if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
             age = now - latest.timestamp
-            # Keep expired items visible for only 5 min past freshness window so stale sessions clear out cleanly
             if age <= self.config["freshness_window_sec"] + 300:
                 if latest.classification == "abnormal_miss" and (
-                    current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0
+                    account_filter_fn is not None
+                    or current_acct_since_ts <= 0.0
+                    or latest.timestamp >= current_acct_since_ts - 2.0
                 ):
                     fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
-                elif current_acct_since_ts <= 0.0 or latest.timestamp >= current_acct_since_ts - 2.0:
+                elif (
+                    account_filter_fn is not None
+                    or current_acct_since_ts <= 0.0
+                    or latest.timestamp >= current_acct_since_ts - 2.0
+                ):
                     fresh_rem = int(self.config["freshness_window_sec"] - age)
 
-        return ConversationSummary(
+        summary = ConversationSummary(
             conversation_id=conv_id,
             short_id=conv_id[:6],
             model=format_model_name(latest.model),
@@ -1014,17 +1176,77 @@ class AntigravityMonitorEngine:
             first_abnormal_step_in_recent10=first_abn_step_r10,
             is_subagent=(not has_user_explicit) and has_subagent_marker,
             latest_context_delta=latest.context_delta,
-            total_step_count=len(steps),
+            total_step_count=len(scoped_steps),
             title=self._resolve_conv_title(conv_id),
+            full_step_count=len(all_steps),
+            full_latest_timestamp=all_steps[-1].timestamp,
+            _scoped_steps_all=scoped_steps,
         )
+        return summary, all_steps, scoped_indices
 
-    def _enrich_conv_from_db(self, c: ConversationSummary) -> None:
+    def _enrich_conv_from_db(
+        self,
+        c: ConversationSummary,
+        all_steps: Optional[List[StepRecord]] = None,
+        scoped_indices: Optional[List[int]] = None,
+        account_scoped: bool = False,
+        need_full_window_gens: bool = False,
+    ) -> None:
         snap: Optional[ConversationDbSnapshot] = self._db_reader.read(c.conversation_id)
         if not snap:
             return
         if snap.is_subagent_hint and not self._transcript_cache.get(c.conversation_id, (None, [], False, False))[2]:
             c.is_subagent = True
-        valid_gens = [g for g in snap.recent if g.total_in > 0 or g.output_tokens > 0][-10:]
+        c.max_context_tokens = snap.max_context_tokens
+
+        tail_gens = [g for g in snap.recent if g.total_in > 0 or g.output_tokens > 0]
+        is_tail_truncated = bool(
+            all_steps is not None
+            and scoped_indices
+            and scoped_indices[-1] < len(all_steps) - 1
+        )
+        need_full = is_tail_truncated or (need_full_window_gens and len(c._scoped_steps_all) > len(tail_gens))
+
+        aligned_recent: List[Optional[Any]] = []
+        if not need_full and c.recent_steps and tail_gens:
+            # Fast zero-full-scan path for live un-truncated conversations: align directly against cached tail 16 rows
+            aligned_recent = _align_steps_with_gen_history(c.recent_steps, tail_gens)
+            if any(g is not None for g in aligned_recent):
+                c._scoped_gens_all = list(aligned_recent)
+            else:
+                need_full = True
+
+        if need_full and all_steps and scoped_indices:
+            # Global alignment on full all_steps -> project cleanly back to scoped_indices (immune to cross-account/compaction greedy mismatch)
+            full_gens = self._db_reader.read_full_history(c.conversation_id)
+            if full_gens:
+                full_aligned = _align_steps_with_gen_history(all_steps, full_gens)
+                scoped_gens = [full_aligned[i] for i in scoped_indices]
+                c._scoped_gens_all = scoped_gens
+                aligned_recent = scoped_gens[-len(c.recent_steps):] if c.recent_steps else []
+
+        if any(g is not None for g in aligned_recent):
+            c.recent_ttfts = [g.ttft_sec if g is not None else None for g in aligned_recent]
+            c.recent_tps_list = [g.tps if g is not None else None for g in aligned_recent]
+            valid_ttfts = [t for t in c.recent_ttfts if t is not None]
+            if valid_ttfts:
+                c.ttft_avg_sec = sum(valid_ttfts) / len(valid_ttfts)
+                c.ttft_max_sec = max(valid_ttfts)
+            latest_gen = next((g for g in reversed(aligned_recent) if g is not None), None)
+            if latest_gen is not None:
+                c.ttft_sec = latest_gen.ttft_sec
+                c.streaming_sec = latest_gen.streaming_sec
+                c.tps = latest_gen.tps
+                c.shard_tag = latest_gen.shard_tag
+                c.speed_status = self._classify_speed(
+                    latest_gen.output_tokens, latest_gen.tps, latest_gen.ttft_sec, c.context_tokens
+                )
+            return
+
+        if account_scoped or is_tail_truncated:
+            return
+
+        valid_gens = tail_gens[-10:]
         c.recent_ttfts = [g.ttft_sec for g in valid_gens]
         c.recent_tps_list = [g.tps for g in valid_gens]
         valid_ttfts = [t for t in c.recent_ttfts if t is not None]
@@ -1036,7 +1258,6 @@ class AntigravityMonitorEngine:
             c.ttft_sec = gen.ttft_sec
             c.streaming_sec = gen.streaming_sec
             c.tps = gen.tps
-            c.max_context_tokens = snap.max_context_tokens
             c.shard_tag = gen.shard_tag
             c.speed_status = self._classify_speed(gen.output_tokens, gen.tps, gen.ttft_sec, c.context_tokens)
 
@@ -1045,9 +1266,33 @@ class AntigravityMonitorEngine:
         now_ts: Optional[float] = None,
         force_account: bool = False,
         target_conversation_id: str = "",
+        view_account: str = "",
+        history_range: str = "30m",
+    ) -> MonitorSnapshot:
+        with self._lock:
+            return self._poll_locked(
+                now_ts=now_ts,
+                force_account=force_account,
+                target_conversation_id=target_conversation_id,
+                view_account=view_account,
+                history_range=history_range,
+            )
+
+    def _poll_locked(
+        self,
+        now_ts: Optional[float] = None,
+        force_account: bool = False,
+        target_conversation_id: str = "",
+        view_account: str = "",
+        history_range: str = "30m",
     ) -> MonitorSnapshot:
         now = now_ts if now_ts is not None else time.time()
         self._log_tailer.poll(now)
+
+        hr_key = (history_range or "30m").strip().lower()
+        if hr_key not in HISTORY_RANGE_SPECS:
+            hr_key = "30m"
+        _hr_short, hr_label = HISTORY_RANGE_SPECS[hr_key]
 
         # Poll account liveness first so switch ledger & per-account step attribution stay up-to-date
         hub_dropped = self._account_cache.online and self._active_hub_pid > 0 and not _is_windows_pid_alive(self._active_hub_pid)
@@ -1061,23 +1306,77 @@ class AntigravityMonitorEngine:
         today_start = datetime.datetime.fromtimestamp(now).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp()
-        lookback_cutoff = min(today_start - 3600, now - 24 * 3600)
+        win_sec = float(max(1, int(self.config["log_sliding_window_min"])) * 60)
 
-        timeline = self._ledger.get_timeline(today_start)
-        switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
+        timeline = self._ledger.get_timeline(min(today_start, now - 7 * 86400.0))
+        timeline_times = [t for t, _ in timeline]
         cur_acct_label = self._account_cache.short_label if self._account_cache.online else ""
-        # When switched between >=2 accounts today, evaluate T1 / wasted-cold only on steps after the latest switch
-        # so a previous degraded account's red streak never penalizes a freshly switched healthy account.
-        current_acct_since_ts = timeline[-1][0] if (cur_acct_label and len(timeline) >= 2) else 0.0
+        available_accounts = self._ledger.list_known_accounts(now - 7 * 86400.0, current_label=cur_acct_label)
+
+        raw_view = (view_account or "").strip()
+        if raw_view == "__all__":
+            req_view = "__all__"
+            resolved_account = ""
+            is_custom_account_view = True
+        elif raw_view:
+            norm_view = _mask_short(raw_view) or raw_view
+            # Match canonical casing from available_accounts when possible
+            canon = next((a for a in available_accounts if a.lower() == norm_view.lower()), norm_view)
+            req_view = canon
+            resolved_account = canon
+            is_custom_account_view = (not cur_acct_label) or (canon.lower() != cur_acct_label.lower())
+        else:
+            req_view = ""
+            resolved_account = cur_acct_label
+            is_custom_account_view = False
+
+        acct_filter_fn: Optional[Callable[[float], bool]] = None
+        if resolved_account and timeline:
+            acct_filter_fn = self._ledger.build_account_matcher(
+                resolved_account,
+                timeline,
+                fallback_label=cur_acct_label,
+            )
+        elif resolved_account and is_custom_account_view:
+            acct_filter_fn = lambda _ev_ts: False
+
+        # Determine whether the target account has older (>48h) timeline presence so 30m historical anchor never misses e.g. 52h-old T1 accounts
+        acct_has_older_tl = bool(
+            resolved_account
+            and any(lbl.lower() == resolved_account.lower() and ts < now - 40 * 3600.0 for ts, lbl in timeline)
+        )
+        if hr_key == "7d":
+            range_start_ts = now - 7 * 86400.0
+            lookback_cutoff = range_start_ts - 3600.0
+            max_older_convs = 160
+        elif hr_key == "today":
+            range_start_ts = today_start
+            lookback_cutoff = min(today_start - 3600.0, now - 48 * 3600.0)
+            max_older_convs = 48
+        elif hr_key == "6h":
+            range_start_ts = now - 6 * 3600.0
+            lookback_cutoff = min(today_start - 3600.0, now - 48 * 3600.0)
+            max_older_convs = 48
+        else:  # "30m"
+            range_start_ts = 0.0
+            if is_custom_account_view or acct_has_older_tl:
+                lookback_cutoff = now - 7 * 86400.0
+                max_older_convs = 160
+            else:
+                lookback_cutoff = min(today_start - 3600.0, now - 48 * 3600.0)
+                max_older_convs = 48
+
+        switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
+        current_acct_since_ts = timeline[-1][0] if (resolved_account and not is_custom_account_view and len(timeline) >= 2) else 0.0
 
         target_query = (target_conversation_id or "").strip()
         target_query_low = target_query.lower()
 
-        # Scan all today-touched transcripts without truncating at 40 so swarm runs never undercount
-        all_recent = self._iter_recent_transcripts(lookback_cutoff, today_start)
-        convs: List[ConversationSummary] = []
-        target_conv: Optional[ConversationSummary] = None
+        all_recent = self._iter_recent_transcripts(lookback_cutoff, today_start, max_older=max_older_convs)
+        convs_bundle: List[Tuple[ConversationSummary, List[StepRecord], List[int]]] = []
+        target_bundle: Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]] = None
         collected_main_count = 0
+        has_any_live_transcript = False
 
         total_today_steps = 0
         total_main_today_steps = 0
@@ -1085,42 +1384,47 @@ class AntigravityMonitorEngine:
         account_today_steps = 0
         account_main_today_steps = 0
         account_subagent_today_steps = 0
+        range_steps = 0
         last_1h_steps = 0
         hourly_counts: Dict[int, int] = {}
         one_hour_cutoff = now - 3600.0
+        eff_range_step_cutoff = range_start_ts if range_start_ts > 0.0 else (now - win_sec)
 
         for idx_conv, (conv_id, tp) in enumerate(all_recent):
             raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(conv_id, tp)
             if not raw_steps:
                 continue
 
-            today_timestamps = [
-                float(s.get("timestamp", 0.0) or 0.0)
-                for s in raw_steps
-                if float(s.get("timestamp", 0.0) or 0.0) >= today_start
-            ]
+            last_raw_ts = float(raw_steps[-1].get("timestamp", 0.0) or 0.0)
+            if (now - last_raw_ts) <= 120.0:
+                has_any_live_transcript = True
+
             if has_user_explicit:
                 is_sub_conv = False
             elif has_subagent_marker:
                 is_sub_conv = True
-            elif today_timestamps:
-                is_sub_conv = self._check_subagent_hint_cached(conv_id)
             else:
-                is_sub_conv = False
+                is_sub_conv = self._check_subagent_hint_cached(conv_id)
 
-            for sts in today_timestamps:
-                total_today_steps += 1
-                if is_sub_conv:
-                    total_subagent_today_steps += 1
-                else:
-                    total_main_today_steps += 1
+            for s in raw_steps:
+                sts = float(s.get("timestamp", 0.0) or 0.0)
+                if sts <= 0.0:
+                    continue
+                if sts >= today_start:
+                    total_today_steps += 1
+                    if is_sub_conv:
+                        total_subagent_today_steps += 1
+                    else:
+                        total_main_today_steps += 1
 
-                in_scope = True
-                if cur_acct_label:
-                    owner = self._ledger.attribute_timestamp(sts, timeline, fallback_label=cur_acct_label)
-                    in_scope = owner.lower() == cur_acct_label.lower()
-                if in_scope:
-                    if cur_acct_label:
+                in_scope = True if acct_filter_fn is None else acct_filter_fn(sts)
+                if not in_scope:
+                    continue
+
+                if sts >= eff_range_step_cutoff:
+                    range_steps += 1
+                if sts >= today_start:
+                    if resolved_account:
                         account_today_steps += 1
                         if is_sub_conv:
                             account_subagent_today_steps += 1
@@ -1135,83 +1439,90 @@ class AntigravityMonitorEngine:
                 target_query_low
                 and (conv_id.lower() == target_query_low or conv_id.lower().startswith(target_query_low))
             )
-            # Keep top 24 overall AND always protect up to 12 MAIN conversations + target conversation
-            # so a burst of swarm subagents can never push active main conversations out of T1 evaluation!
-            want_summary = idx_conv < 24 or (not is_sub_conv and collected_main_count < 12) or matches_target
+            scan_limit = 96 if (acct_filter_fn is not None or hr_key != "30m") else 24
+            want_summary = idx_conv < scan_limit or (not is_sub_conv and collected_main_count < 16) or matches_target
             if not want_summary:
                 continue
 
-            summary = self._build_conversation_summary(
+            built = self._build_conversation_summary(
                 conv_id=conv_id,
                 raw_steps=raw_steps,
                 has_user_explicit=has_user_explicit,
                 has_subagent_marker=has_subagent_marker or is_sub_conv,
                 now=now,
                 switch_timestamps=switch_timestamps,
-                current_acct_since_ts=current_acct_since_ts,
+                current_acct_since_ts=0.0 if acct_filter_fn is not None else current_acct_since_ts,
+                account_filter_fn=acct_filter_fn,
+                range_start_ts=range_start_ts,
             )
-            if summary is None:
+            if built is None:
                 continue
-            convs.append(summary)
-            if not summary.is_subagent:
+            convs_bundle.append(built)
+            if not built[0].is_subagent:
                 collected_main_count += 1
-            if matches_target and (target_conv is None or conv_id.lower() == target_query_low):
-                target_conv = summary
+            if matches_target and (target_bundle is None or conv_id.lower() == target_query_low):
+                target_bundle = built
 
-        # Fallback: if --conversation-id targets an older conversation outside lookback_cutoff, load it directly
-        if target_query_low and target_conv is None:
+        if target_query_low and target_bundle is None:
             resolved_tp = self._resolve_conversation_transcript(target_query)
             if resolved_tp is not None:
                 res_id, res_path = resolved_tp
                 raw_steps, has_ue, has_sm = self._read_transcript_cached(res_id, res_path)
                 if raw_steps:
-                    target_conv = self._build_conversation_summary(
+                    target_bundle = self._build_conversation_summary(
                         conv_id=res_id,
                         raw_steps=raw_steps,
                         has_user_explicit=has_ue,
                         has_subagent_marker=has_sm,
                         now=now,
                         switch_timestamps=switch_timestamps,
-                        current_acct_since_ts=current_acct_since_ts,
+                        current_acct_since_ts=0.0,
+                        account_filter_fn=None,
+                        range_start_ts=0.0,
                     )
 
-        convs.sort(key=lambda c: c.latest_timestamp, reverse=True)
-        # Preserve up to 12 main conversations + fill remaining slots up to 24 by recency
-        protected_mains = [c for c in convs if not c.is_subagent][:12]
-        seen_ids = {c.conversation_id for c in protected_mains}
-        top_convs: List[ConversationSummary] = list(protected_mains)
-        for c in convs:
-            if len(top_convs) >= 24:
+        convs_bundle.sort(key=lambda b: b[0].latest_timestamp, reverse=True)
+        protected_mains = [b for b in convs_bundle if not b[0].is_subagent][:12]
+        seen_ids = {b[0].conversation_id for b in protected_mains}
+        top_bundles: List[Tuple[ConversationSummary, List[StepRecord], List[int]]] = list(protected_mains)
+        for b in convs_bundle:
+            if len(top_bundles) >= 24:
                 break
-            if c.conversation_id not in seen_ids:
-                top_convs.append(c)
-                seen_ids.add(c.conversation_id)
-        top_convs.sort(key=lambda c: c.latest_timestamp, reverse=True)
+            if b[0].conversation_id not in seen_ids:
+                top_bundles.append(b)
+                seen_ids.add(b[0].conversation_id)
+        top_bundles.sort(key=lambda b: b[0].latest_timestamp, reverse=True)
 
-        for c in top_convs:
-            self._enrich_conv_from_db(c)
-        if target_conv is not None and target_conv.conversation_id not in seen_ids:
-            self._enrich_conv_from_db(target_conv)
+        is_acct_scoped = acct_filter_fn is not None
+        need_wide_gens = hr_key != "30m"
+        for c, all_st, sc_idx in top_bundles:
+            self._enrich_conv_from_db(
+                c,
+                all_steps=all_st,
+                scoped_indices=sc_idx,
+                account_scoped=is_acct_scoped,
+                need_full_window_gens=need_wide_gens,
+            )
+        target_conv: Optional[ConversationSummary] = target_bundle[0] if target_bundle is not None else None
+        if target_bundle is not None and target_bundle[0].conversation_id not in seen_ids:
+            self._enrich_conv_from_db(
+                target_bundle[0],
+                all_steps=target_bundle[1],
+                scoped_indices=target_bundle[2],
+                account_scoped=False,
+            )
 
-        # When switched between >=2 accounts today, anchor primary & recent health strictly to steps
-        # executed under the CURRENT active account so a freshly switched healthy account never inherits
-        # the previous account's 0.0% cache bar, T1 misses, or T2 503/timeout counts.
-        acct_cutoff_ts = (current_acct_since_ts - 2.0) if current_acct_since_ts > 0.0 else 0.0
-        acct_top_convs = (
-            [c for c in top_convs if c.latest_timestamp >= acct_cutoff_ts]
-            if current_acct_since_ts > 0.0
-            else top_convs
-        )
+        top_convs = [b[0] for b in top_bundles]
+        convs = [b[0] for b in convs_bundle]
 
-        # Prefer latest active MAIN conversation of the CURRENT account for headline/speed/cache bar
-        main_convs = [c for c in acct_top_convs if not c.is_subagent]
-        primary = main_convs[0] if main_convs else (acct_top_convs[0] if acct_top_convs else None)
+        main_convs = [c for c in top_convs if not c.is_subagent]
+        primary = main_convs[0] if main_convs else (top_convs[0] if top_convs else None)
         active_family = (
             "3p"
             if (primary and any(k in primary.model_raw.lower() for k in ("claude", "fable", "opus", "sonnet", "gpt")))
             else "gemini"
         )
-        if active_family != self._last_quota_family:
+        if not is_custom_account_view and active_family != self._last_quota_family:
             self._last_quota_family = active_family
             if self._account_cache.pools:
                 self._sync_account_active_pool(self._account_cache, active_family)
@@ -1221,9 +1532,9 @@ class AntigravityMonitorEngine:
                 if self._account_cache.online and self._account_cache.short_label:
                     self._ledger.observe_online(self._account_cache.short_label, now)
 
-        if cur_acct_label:
-            steps_scope_label = cur_acct_label
-            log_scope_label = cur_acct_label
+        if resolved_account:
+            steps_scope_label = resolved_account
+            log_scope_label = resolved_account
             today_steps = account_today_steps
             main_today_steps = account_main_today_steps
             subagent_today_steps = account_subagent_today_steps
@@ -1240,19 +1551,21 @@ class AntigravityMonitorEngine:
             peak_hr, peak_hour_steps = max(hourly_counts.items(), key=lambda kv: (kv[1], kv[0]))
             peak_hour_label = f"{peak_hr:02d}:00-{(peak_hr + 1) % 24:02d}:00"
 
-        # Large-context freshness tracks MAIN conversations only (retired subagents never hijack freshness)
-        # Priority: 0) active invalid cr=0 -> 1) still-warm (remaining > 0, soonest expiring first) -> 2) recently expired (most recent first)
-        large_freshness = [
-            c
-            for c in convs
-            if (not c.is_subagent) and (c.freshness_remaining_sec is not None or c.freshness_invalid_reason)
-        ]
-        large_freshness.sort(
-            key=lambda c: (
-                0 if c.freshness_invalid_reason else (1 if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else 2),
-                c.freshness_remaining_sec if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else (-c.latest_timestamp),
+        # Large-context freshness applies ONLY to live real-time current-account monitoring (never jump green countdown in historical views)
+        if is_custom_account_view or hr_key != "30m":
+            large_freshness: List[ConversationSummary] = []
+        else:
+            large_freshness = [
+                c
+                for c in convs
+                if (not c.is_subagent) and (c.freshness_remaining_sec is not None or c.freshness_invalid_reason)
+            ]
+            large_freshness.sort(
+                key=lambda c: (
+                    0 if c.freshness_invalid_reason else (1 if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else 2),
+                    c.freshness_remaining_sec if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else (-c.latest_timestamp),
+                )
             )
-        )
 
         min_fresh_sec: Optional[int] = None
         min_fresh_conv = ""
@@ -1267,42 +1580,169 @@ class AntigravityMonitorEngine:
             min_fresh_ctx = head_f.context_tokens
             min_fresh_invalid = head_f.freshness_invalid_reason
 
-        acct_log_filter: Optional[Callable[[float], bool]] = None
-        if cur_acct_label and timeline:
-            acct_log_filter = (
-                lambda ev_ts: self._ledger.attribute_timestamp(ev_ts, timeline, fallback_label=cur_acct_label).lower()
-                == cur_acct_label.lower()
-            )
-        recent_log, today_log, notable_events = self._log_tailer.get_counts(
-            now,
-            self.config["log_sliding_window_min"],
-            account_since_ts=current_acct_since_ts,
-            account_filter_fn=acct_log_filter,
-        )
         machine_today_log = self._log_tailer.get_machine_today_counts(now)
-        last_t2_error_ts = self._log_tailer.get_latest_error_ts(
-            now,
-            self.config["log_sliding_window_min"],
-            categories=("503", "timeout"),
-            account_since_ts=current_acct_since_ts,
-        )
 
-        active_model = primary.model if primary else "等待请求"
-        primary_hit = primary.latest_hit_rate if primary else None
-        primary_hit_cls = primary.recent_steps[-1].classification if (primary and primary.recent_steps) else ""
-        primary_tps = primary.tps if primary else None
-        primary_ttft = primary.ttft_sec if primary else None
-        primary_speed = primary.speed_status if primary else "unknown"
+        is_historical_rating = False
+        rating_anchor_ts = now
+        historical_tag = ""
+        prior_hist_warning = ""
 
-        recent_cutoff = max(now - self.config["log_sliding_window_min"] * 60, acct_cutoff_ts)
-        recent_active = [c for c in acct_top_convs if c.latest_timestamp >= recent_cutoff]
-        has_live_transcript = any((now - c.latest_timestamp) <= 120.0 for c in top_convs)
+        if hr_key == "30m":
+            live_win_start = now - win_sec
+            live_eval_floor = max(live_win_start, current_acct_since_ts) if current_acct_since_ts > 0.0 else live_win_start
+            live_log, today_log, live_notable = self._log_tailer.get_counts(
+                now,
+                self.config["log_sliding_window_min"],
+                account_filter_fn=acct_filter_fn,
+                range_start_ts=live_win_start,
+                range_end_ts=now,
+            )
+            live_active = [c for c in top_convs if c.latest_timestamp >= live_win_start]
+            has_live_acct_activity = bool(live_active) or (live_log["503"] + live_log["timeout"] + live_log["403"] > 0)
+
+            if has_live_acct_activity:
+                # Recompute miss counters strictly inside current live session floor so yesterday's misses never leak into today's live T1!
+                for c in live_active:
+                    self._recompute_conv_eval_stats(c, live_eval_floor)
+                recent_active = live_active
+                recent_log = live_log
+                notable_events = live_notable
+                eval_cutoff_ts = live_eval_floor
+                eval_end_ts = now
+                last_t2_error_ts = self._log_tailer.get_latest_error_ts(
+                    now,
+                    self.config["log_sliding_window_min"],
+                    categories=("503", "timeout"),
+                    account_filter_fn=acct_filter_fn,
+                    range_start_ts=live_win_start,
+                    range_end_ts=now,
+                )
+                # Guard against 1-step pure expected_cold (0 cacheable verification) washing away an account's prior historical T1/T2!
+                live_cacheable = sum(c.cacheable_in_recent10 for c in live_active)
+                if live_cacheable == 0 and (live_log["503"] + live_log["timeout"] + live_log["403"] == 0):
+                    # Check if this account had prior degraded history before live_eval_floor
+                    prior_steps_ts = max(
+                        (
+                            s.timestamp
+                            for c in top_convs
+                            for s in c._scoped_steps_all
+                            if s.timestamp < live_eval_floor - 2.0
+                        ),
+                        default=0.0,
+                    )
+                    prior_err_ts = self._log_tailer.get_latest_account_event_ts(
+                        account_filter_fn=acct_filter_fn,
+                        since_ts=lookback_cutoff,
+                    )
+                    if prior_err_ts >= live_eval_floor - 2.0:
+                        prior_err_ts = 0.0
+                    p_anchor = max(prior_steps_ts, prior_err_ts)
+                    if p_anchor > 0.0:
+                        p_win_s = p_anchor - win_sec
+                        p_log, _, _ = self._log_tailer.get_counts(
+                            now,
+                            self.config["log_sliding_window_min"],
+                            account_filter_fn=acct_filter_fn,
+                            range_start_ts=p_win_s,
+                            range_end_ts=p_anchor,
+                        )
+                        p_consec = 0
+                        for c in top_convs:
+                            p_st = [s for s in c._scoped_steps_all if p_win_s <= s.timestamp <= p_anchor + 2.0]
+                            cm = 0
+                            for s in reversed(p_st):
+                                if s.classification == "abnormal_miss":
+                                    cm += 1
+                                else:
+                                    break
+                            p_consec = max(p_consec, cm)
+                        if p_log["403"] > 0:
+                            prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），首步冷启尚未验真"
+                        elif p_log["timeout"] > 0 or p_log["503"] >= 2:
+                            prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                        elif p_consec >= 2:
+                            prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                if is_custom_account_view:
+                    is_historical_rating = True
+                    historical_tag = f"历史视角 · {resolved_account or '全机'}"
+            else:
+                latest_step_ts = top_convs[0].latest_timestamp if top_convs else 0.0
+                latest_err_ts = self._log_tailer.get_latest_account_event_ts(
+                    account_filter_fn=acct_filter_fn,
+                    since_ts=lookback_cutoff,
+                )
+                anchor_ts = max(latest_step_ts, latest_err_ts)
+                if anchor_ts > 0.0:
+                    is_historical_rating = True
+                    rating_anchor_ts = anchor_ts
+                    eval_cutoff_ts = anchor_ts - win_sec
+                    eval_end_ts = anchor_ts
+                    recent_active = [c for c in top_convs if c.latest_timestamp >= eval_cutoff_ts]
+                    for c in recent_active:
+                        self._recompute_conv_eval_stats(c, eval_cutoff_ts)
+                    recent_log, today_log, notable_events = self._log_tailer.get_counts(
+                        now,
+                        self.config["log_sliding_window_min"],
+                        account_filter_fn=acct_filter_fn,
+                        range_start_ts=eval_cutoff_ts,
+                        range_end_ts=eval_end_ts,
+                    )
+                    last_t2_error_ts = self._log_tailer.get_latest_error_ts(
+                        now,
+                        self.config["log_sliding_window_min"],
+                        categories=("503", "timeout"),
+                        account_filter_fn=acct_filter_fn,
+                        range_start_ts=eval_cutoff_ts,
+                        range_end_ts=eval_end_ts,
+                    )
+                    historical_tag = f"历史参考 · {format_relative_age(now - anchor_ts)}"
+                else:
+                    recent_active = []
+                    recent_log = live_log
+                    notable_events = []
+                    eval_cutoff_ts = live_win_start
+                    eval_end_ts = now
+                    last_t2_error_ts = 0.0
+        else:
+            is_historical_rating = True
+            eval_cutoff_ts = range_start_ts
+            eval_end_ts = now
+            recent_active = list(top_convs)
+            recent_log, today_log, notable_events = self._log_tailer.get_counts(
+                now,
+                self.config["log_sliding_window_min"],
+                account_filter_fn=acct_filter_fn,
+                range_start_ts=eval_cutoff_ts,
+                range_end_ts=eval_end_ts,
+            )
+            last_t2_error_ts = self._log_tailer.get_latest_error_ts(
+                now,
+                self.config["log_sliding_window_min"],
+                categories=("503", "timeout"),
+                account_filter_fn=acct_filter_fn,
+                range_start_ts=eval_cutoff_ts,
+                range_end_ts=eval_end_ts,
+            )
+            rating_anchor_ts = max(
+                top_convs[0].latest_timestamp if top_convs else 0.0,
+                last_t2_error_ts,
+            ) or now
+            historical_tag = f"{hr_label}汇总"
+
+        eval_mains = [c for c in recent_active if not c.is_subagent]
+        eval_primary = eval_mains[0] if eval_mains else (recent_active[0] if recent_active else primary)
+        active_model = eval_primary.model if eval_primary else "等待请求"
+        primary_hit = eval_primary.latest_hit_rate if eval_primary else None
+        primary_hit_cls = eval_primary.recent_steps[-1].classification if (eval_primary and eval_primary.recent_steps) else ""
+        primary_tps = eval_primary.tps if eval_primary else None
+        primary_ttft = eval_primary.ttft_sec if eval_primary else None
+        primary_speed = eval_primary.speed_status if eval_primary else "unknown"
+
         max_consec_miss = max((c.consec_miss for c in recent_active), default=0)
         any_single_miss = any(c.single_miss for c in recent_active)
         any_slow = any(c.speed_status == "slow" for c in recent_active[:2])
         wasted_total = sum(c.wasted_cold_tokens for c in recent_active)
         max_abnormal_r10 = max((c.abnormal_in_recent10 for c in recent_active), default=0)
-        # Prevent intermittent T1 accounts (e.g. 8/10 misses + 1 lucky hit) from washing back to T0 green
         severe_frequent_miss_conv = next(
             (
                 c
@@ -1322,10 +1762,12 @@ class AntigravityMonitorEngine:
 
         model_stats = self._compute_recent_model_stats(
             recent_active=recent_active,
-            cutoff_ts=recent_cutoff,
+            cutoff_ts=eval_cutoff_ts,
             last_t2_error_ts=last_t2_error_ts,
+            use_full_scoped=(hr_key != "30m"),
         )
 
+        eff_online = self._account_cache.online or is_custom_account_view or (hr_key != "30m")
         level, grade, headline, sub_headline, t2_recovery_note = self._evaluate_health(
             active_model=active_model,
             recent_log=recent_log,
@@ -1334,38 +1776,50 @@ class AntigravityMonitorEngine:
             any_single_miss=any_single_miss,
             any_slow=any_slow,
             today_steps=today_steps,
-            primary=primary,
-            is_online=self._account_cache.online,
-            has_live_transcript=has_live_transcript,
+            primary=eval_primary,
+            is_online=eff_online,
+            has_live_transcript=has_any_live_transcript,
             severe_frequent_miss_conv=severe_frequent_miss_conv,
             unstable_recovery_conv=unstable_recovery_conv,
             model_stats=model_stats,
             last_t2_error_ts=last_t2_error_ts,
-            now_ts=now,
-            switched_acct_label=cur_acct_label if current_acct_since_ts > 0.0 else "",
+            now_ts=eval_end_ts,
+            switched_acct_label=resolved_account if (resolved_account and not is_custom_account_view and current_acct_since_ts > 0.0) else "",
+            custom_empty_acct=resolved_account if is_custom_account_view else "",
+            is_historical=is_historical_rating,
+            historical_tag=historical_tag,
+            history_range_label=hr_label,
+            prior_hist_warning=prior_hist_warning,
         )
 
-        pressure = compute_pressure(
-            grade=grade,
-            today_steps=today_steps,
-            daily_steps_warn=self.config["daily_steps_warn"],
-            daily_steps_alert=self.config["daily_steps_alert"],
-        )
+        # Offline + custom/history lookup yielding no records -> offline_unknown (exit 2) rather than normal (exit 0)
+        if grade == "WAIT" and not self._account_cache.online:
+            pressure = "offline_unknown"
+        else:
+            pressure = compute_pressure(
+                grade=grade,
+                today_steps=today_steps,
+                daily_steps_warn=self.config["daily_steps_warn"],
+                daily_steps_alert=self.config["daily_steps_alert"],
+            )
 
-        alerts = self._collect_new_alerts(
-            grade=grade,
-            notable_events=notable_events,
-            recent_active=recent_active,
-            max_consec_miss=max_consec_miss,
-            today_steps=today_steps,
-            steps_scope_label=steps_scope_label,
-            is_online=self._account_cache.online,
-            severe_frequent_miss_conv=severe_frequent_miss_conv,
-        )
+        if is_custom_account_view or hr_key != "30m" or is_historical_rating:
+            alerts: List[Tuple[str, str, str]] = []
+        else:
+            alerts = self._collect_new_alerts(
+                grade=grade,
+                notable_events=notable_events,
+                recent_active=recent_active,
+                max_consec_miss=max_consec_miss,
+                today_steps=today_steps,
+                steps_scope_label=steps_scope_label,
+                is_online=self._account_cache.online,
+                severe_frequent_miss_conv=severe_frequent_miss_conv,
+            )
 
-        primary_ttft_avg = primary.ttft_avg_sec if primary else None
-        primary_ttft_max = primary.ttft_max_sec if primary else None
-        primary_recent_ttfts = list(primary.recent_ttfts) if primary else []
+        primary_ttft_avg = eval_primary.ttft_avg_sec if eval_primary else None
+        primary_ttft_max = eval_primary.ttft_max_sec if eval_primary else None
+        primary_recent_ttfts = list(eval_primary.recent_ttfts) if eval_primary else []
 
         return MonitorSnapshot(
             generated_at=now,
@@ -1430,6 +1884,15 @@ class AntigravityMonitorEngine:
             machine_today_retry=machine_today_log["retry"],
             last_t2_error_ts=last_t2_error_ts,
             t2_recovery_note=t2_recovery_note,
+            available_accounts=available_accounts,
+            view_account=req_view,
+            resolved_account=resolved_account,
+            is_custom_account_view=is_custom_account_view,
+            history_range=hr_key,
+            history_range_label=hr_label,
+            is_historical_rating=is_historical_rating,
+            rating_anchor_ts=rating_anchor_ts,
+            range_steps=range_steps,
         )
 
     @staticmethod
@@ -1437,13 +1900,20 @@ class AntigravityMonitorEngine:
         recent_active: List[ConversationSummary],
         cutoff_ts: float,
         last_t2_error_ts: float = 0.0,
+        use_full_scoped: bool = False,
     ) -> List[ModelPerfStats]:
         """Aggregate per-model TTFT, TPS, cache hits, and post-503 recovery evidence."""
         buckets: Dict[str, Dict[str, Any]] = {}
         for c in recent_active:
-            steps = c.recent_steps[-10:]
-            ttfts = c.recent_ttfts[-len(steps):] if c.recent_ttfts else []
-            tpss = c.recent_tps_list[-len(steps):] if c.recent_tps_list else []
+            if use_full_scoped and c._scoped_steps_all:
+                steps = c._scoped_steps_all
+                gens = c._scoped_gens_all if len(c._scoped_gens_all) == len(steps) else []
+                ttfts = [g.ttft_sec if g is not None else None for g in gens] if gens else c.recent_ttfts
+                tpss = [g.tps if g is not None else None for g in gens] if gens else c.recent_tps_list
+            else:
+                steps = c.recent_steps[-10:]
+                ttfts = c.recent_ttfts[-len(steps):] if c.recent_ttfts else []
+                tpss = c.recent_tps_list[-len(steps):] if c.recent_tps_list else []
             t_off = len(steps) - len(ttfts)
             p_off = len(steps) - len(tpss)
             for idx, st in enumerate(steps):
@@ -1548,20 +2018,35 @@ class AntigravityMonitorEngine:
         last_t2_error_ts: float = 0.0,
         now_ts: float = 0.0,
         switched_acct_label: str = "",
+        custom_empty_acct: str = "",
+        is_historical: bool = False,
+        historical_tag: str = "",
+        history_range_label: str = "近 30 分钟",
+        prior_hist_warning: str = "",
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
+        scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
+        hist_prefix = f"[{historical_tag}] " if (is_historical and historical_tag) else ""
+        hist_head_tag = " (历史)" if is_historical else ""
+
         # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
         # stay quietly in standby instead of alerting on stale pre-shutdown log disconnects.
         if not is_online and not has_live_transcript:
             return ("green", "IDLE", "离线待机 · Antigravity 未运行", "客户端未启动，已暂停实时异常告警", "")
 
-        # Only evaluate live language_server.log T2/T3 alerts while Antigravity LS is actually online.
+        # Only evaluate live language_server.log T2/T3 alerts while online or inspecting history.
         eff_403 = recent_log["403"] if is_online else 0
         eff_timeout = recent_log["timeout"] if is_online else 0
         eff_503 = recent_log["503"] if is_online else 0
 
         if eff_403 > 0:
-            return ("red", "T3", f"T3 封禁告警 · {active_model}", "检测到 403 TOS/权限拒绝，请立即停止使用当前账号", "")
+            return (
+                "red",
+                "T3",
+                f"T3 封禁告警{hist_head_tag} · {active_model}",
+                f"{hist_prefix}检测到 403 TOS/权限拒绝，请立即停止使用该账号",
+                "",
+            )
 
         # Dynamic T2 evaluation: inspect post-error successful steps & per-model TTFT instead of permanently
         # locking the account in T2 for 30m after transient/single-model 503 bursts.
@@ -1599,20 +2084,20 @@ class AntigravityMonitorEngine:
         if t2_active:
             extra = ""
             if primary is not None and primary.ttft_sec is not None:
-                extra = f"（当前 TTFT {primary.ttft_sec:.1f}s）"
+                extra = f"（TTFT {primary.ttft_sec:.1f}s）"
             return (
                 "red",
                 "T2",
-                f"T2 限流黑洞 · {active_model}",
-                f"近 {win} 分钟触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时，事后未恢复稳定响应{extra}",
+                f"T2 限流黑洞{hist_head_tag} · {active_model}",
+                f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时，事后未恢复稳定响应{extra}",
                 "",
             )
         if max_consec_miss >= 2:
             return (
                 "red",
                 "T1",
-                f"T1 连续掉缓存 · {active_model}",
-                f"主活跃会话已连续 {max_consec_miss} 步 cr=0，建议检查账号或切回主力号",
+                f"T1 连续掉缓存{hist_head_tag} · {active_model}",
+                f"{hist_prefix}活跃会话已连续 {max_consec_miss} 步 cr=0，建议检查账号或切回主力号",
                 t2_recovering_warn or t2_recovered_info,
             )
         if severe_frequent_miss_conv is not None:
@@ -1620,20 +2105,21 @@ class AntigravityMonitorEngine:
             return (
                 "red",
                 "T1",
-                f"T1 频繁掉缓存 · {active_model}",
-                f"近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
+                f"T1 频繁掉缓存{hist_head_tag} · {active_model}",
+                f"{hist_prefix}近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
                 t2_recovering_warn or t2_recovered_info,
             )
         if today_steps >= self.config["daily_steps_alert"]:
             return (
                 "red",
                 "WARN",
-                f"步数超红线 · {active_model}",
-                f"今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
+                f"步数超红线{hist_head_tag} · {active_model}",
+                f"{hist_prefix}今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
                 t2_recovering_warn or t2_recovered_info,
             )
         if (
-            t2_recovering_warn
+            prior_hist_warning
+            or t2_recovering_warn
             or any_single_miss
             or unstable_recovery_conv is not None
             or eff_503 == 1
@@ -1641,6 +2127,8 @@ class AntigravityMonitorEngine:
             or today_steps >= self.config["daily_steps_warn"]
         ):
             reasons = []
+            if prior_hist_warning:
+                reasons.append(prior_hist_warning)
             if t2_recovering_warn:
                 reasons.append(t2_recovering_warn)
             if any_single_miss:
@@ -1653,28 +2141,36 @@ class AntigravityMonitorEngine:
                 reasons.append("偶发 1 次 503")
             if today_steps >= self.config["daily_steps_warn"]:
                 reasons.append(f"今日步数 {today_steps}")
-            return ("orange", "WARN", f"留意预警 · {active_model}", " / ".join(reasons), t2_recovering_warn)
+            return ("orange", "WARN", f"留意预警{hist_head_tag} · {active_model}", f"{hist_prefix}" + " / ".join(reasons), t2_recovering_warn)
 
         if primary is None:
-            if switched_acct_label:
+            if custom_empty_acct:
                 return (
-                    "green",
-                    "T0",
-                    f"T0 待命 · 已切入 {switched_acct_label}",
-                    "新账号尚无新请求，前序账号异常与缓存状态已自动隔离",
+                    "cyan",
+                    "WAIT",
+                    f"历史视角 · {custom_empty_acct} 暂无记录",
+                    f"{hist_prefix}{scope_win_txt}该账号无可用对话或日志记录",
                     "",
                 )
-            return ("green", "T0", "T0 待命 · 暂无活跃会话", "纯本地只读监控已就绪", "")
+            if switched_acct_label:
+                return (
+                    "cyan",
+                    "WAIT",
+                    f"待采样 · 已切入 {switched_acct_label}",
+                    f"{hist_prefix}该账号暂无历史与实时采样，前序账号异常已隔离，发出首步后自动定级",
+                    "",
+                )
+            return ("cyan", "WAIT", f"待采样{hist_head_tag} · 暂无会话记录", f"{hist_prefix}{scope_win_txt}暂无可用采样记录", "")
 
         if t2_recovered_info:
-            return ("green", "T0", f"T0 健康 · {active_model}", t2_recovered_info, t2_recovered_info)
+            return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", f"{hist_prefix}{t2_recovered_info}", t2_recovered_info)
 
         hist_503 = today_log["503"]
         if hist_503 > 0 and eff_503 == 0:
-            sub = f"近 {win} 分钟无新异常（当前号今日历史 {hist_503} 条 503 已自动衰减）"
+            sub = f"{hist_prefix}{scope_win_txt}无新异常（该号今日历史 {hist_503} 条 503 已衰减）"
         else:
-            sub = f"近 {win} 分钟缓存与底层日志均健康"
-        return ("green", "T0", f"T0 健康 · {active_model}", sub, "")
+            sub = f"{hist_prefix}{scope_win_txt}缓存与底层日志均健康"
+        return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", sub, "")
 
     def _collect_new_alerts(
         self,
@@ -1737,34 +2233,41 @@ class AntigravityMonitorEngine:
                 fresh.append(item)
         return fresh
 
-    def _iter_recent_transcripts(self, lookback_cutoff: float, today_start: float) -> List[Tuple[str, Path]]:
+    def _iter_recent_transcripts(
+        self,
+        lookback_cutoff: float,
+        today_start: float,
+        max_older: int = 16,
+    ) -> List[Tuple[str, Path]]:
         if not self.brain_dir.is_dir():
             return []
-        today_items: List[Tuple[float, str, Path]] = []
-        older_items: List[Tuple[float, str, Path]] = []
+        today_items: List[Tuple[float, str, str]] = []
+        older_items: List[Tuple[float, str, str]] = []
+        join = os.path.join
+        stat = os.stat
         try:
             with os.scandir(self.brain_dir) as it:
                 for entry in it:
                     if not entry.is_dir():
                         continue
-                    tp = Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                    tp_str = join(entry.path, ".system_generated", "logs", "transcript.jsonl")
                     try:
-                        st = tp.stat()
+                        st = stat(tp_str)
                     except OSError:
                         continue
                     if st.st_size <= 0 or st.st_mtime < lookback_cutoff:
                         continue
                     if st.st_mtime >= today_start:
-                        today_items.append((st.st_mtime, entry.name, tp))
+                        today_items.append((st.st_mtime, entry.name, tp_str))
                     else:
-                        older_items.append((st.st_mtime, entry.name, tp))
+                        older_items.append((st.st_mtime, entry.name, tp_str))
         except OSError:
             return []
 
         today_items.sort(key=lambda item: item[0], reverse=True)
         older_items.sort(key=lambda item: item[0], reverse=True)
-        merged = today_items + older_items[:16]
-        return [(cid, tp) for _, cid, tp in merged]
+        merged = today_items + older_items[:max(16, int(max_older))]
+        return [(cid, Path(tp_str)) for _, cid, tp_str in merged]
 
     def _read_transcript_cached(self, conv_id: str, tp: Path) -> Tuple[List[Dict[str, Any]], bool, bool]:
         try:
@@ -1776,12 +2279,16 @@ class AntigravityMonitorEngine:
         stamp = (st.st_mtime_ns, st.st_size)
         cached = self._transcript_cache.get(conv_id)
         if cached is not None and cached[0] == stamp:
+            self._transcript_cache.move_to_end(conv_id)
             return cached[1], cached[2], cached[3]
 
         parsed: List[Dict[str, Any]] = []
         has_user_explicit = False
         has_subagent_marker = False
         pending_checkpoint = False
+        pending_revert = False
+        seen_planner_idx: Optional[int] = None
+        max_step_ts: float = 0.0
         try:
             with tp.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -1798,6 +2305,28 @@ class AntigravityMonitorEngine:
                                 pending_checkpoint = True
                         except json.JSONDecodeError:
                             pass
+                    if '"USER_INPUT"' in line and '"PLANNER_RESPONSE"' not in line:
+                        try:
+                            u_obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if u_obj.get("type") == "USER_INPUT":
+                            u_si = u_obj.get("step_index")
+                            u_ts = parse_iso_timestamp(str(u_obj.get("created_at", "") or ""))
+                            # Only treat regressed USER_INPUT as a real Undo/revert after at least one PLANNER_RESPONSE
+                            # has already completed (avoids false positives on first-turn 503 resend duplicates).
+                            if (
+                                isinstance(u_si, int)
+                                and seen_planner_idx is not None
+                                and u_ts is not None
+                                and u_si <= seen_planner_idx
+                                and (max_step_ts <= 0.0 or u_ts >= max_step_ts - 5.0)
+                            ):
+                                pending_revert = True
+                                seen_planner_idx = u_si
+                                if u_ts > max_step_ts:
+                                    max_step_ts = u_ts
+                        continue
                     if '"PLANNER_RESPONSE"' not in line or '"input_tokens"' not in line:
                         continue
                     try:
@@ -1807,25 +2336,49 @@ class AntigravityMonitorEngine:
                     if obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
                         continue
                     ts = parse_iso_timestamp(str(obj.get("created_at", "") or "")) or st.st_mtime
+                    raw_si = obj.get("step_index")
+                    is_rev = pending_revert
+                    if isinstance(raw_si, int):
+                        if is_rev:
+                            seen_planner_idx = raw_si
+                            if ts > max_step_ts:
+                                max_step_ts = ts
+                        elif (
+                            seen_planner_idx is not None
+                            and raw_si <= seen_planner_idx
+                            and (max_step_ts <= 0.0 or ts >= max_step_ts - 5.0)
+                        ):
+                            is_rev = True
+                            seen_planner_idx = raw_si
+                            if ts > max_step_ts:
+                                max_step_ts = ts
+                        elif seen_planner_idx is None or (raw_si > seen_planner_idx and ts >= max_step_ts - 60.0):
+                            seen_planner_idx = raw_si
+                            if ts > max_step_ts:
+                                max_step_ts = ts
+                    elif ts > max_step_ts:
+                        max_step_ts = ts
                     parsed.append(
                         {
-                            "step_index": obj.get("step_index") if obj.get("step_index") is not None else len(parsed),
+                            "step_index": raw_si if raw_si is not None else len(parsed),
                             "timestamp": ts,
                             "model": obj.get("model", ""),
                             "input_tokens": obj.get("input_tokens", 0),
                             "cache_read_tokens": obj.get("cache_read_tokens", 0),
                             "output_tokens": obj.get("output_tokens", 0),
                             "after_checkpoint": pending_checkpoint,
+                            "after_revert": is_rev,
                         }
                     )
                     pending_checkpoint = False
+                    pending_revert = False
         except OSError:
             return (cached[1], cached[2], cached[3]) if cached is not None else ([], False, False)
 
         self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
-        if len(self._transcript_cache) > 256:
-            oldest_key = next(iter(self._transcript_cache))
-            self._transcript_cache.pop(oldest_key, None)
+        self._transcript_cache.move_to_end(conv_id)
+        while len(self._transcript_cache) > 384:
+            self._transcript_cache.popitem(last=False)
         return parsed, has_user_explicit, has_subagent_marker
 
     def _resolve_conversation_transcript(self, query: str) -> Optional[Tuple[str, Path]]:
@@ -1861,117 +2414,188 @@ class AntigravityMonitorEngine:
         self,
         conversation_id: str,
         now_ts: Optional[float] = None,
+        view_account: str = "",
+        history_range: str = "30m",
     ) -> Optional[ConversationDetailReport]:
         """On-demand full-history report (context growth, TTFT, TPS, cache) for one conversation."""
-        resolved = self._resolve_conversation_transcript(conversation_id)
-        if resolved is None:
-            return None
-        conv_id, tp = resolved
-        now = now_ts if now_ts is not None else time.time()
-        raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(conv_id, tp)
-        if not raw_steps:
-            return None
+        with self._lock:
+            resolved = self._resolve_conversation_transcript(conversation_id)
+            if resolved is None:
+                return None
+            conv_id, tp = resolved
+            now = now_ts if now_ts is not None else time.time()
+            raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(conv_id, tp)
+            if not raw_steps:
+                return None
 
-        today_start = datetime.datetime.fromtimestamp(now).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).timestamp()
-        first_ts = float(raw_steps[0].get("timestamp", 0.0) or 0.0)
-        switch_timestamps = self._ledger.get_switch_timestamps(min(today_start - 3600, first_ts or now - 86400))
+            today_start = datetime.datetime.fromtimestamp(now).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+            first_ts = float(raw_steps[0].get("timestamp", 0.0) or 0.0)
+            tl_since = min(today_start - 3600.0, first_ts or (now - 7 * 86400.0))
+            switch_timestamps = self._ledger.get_switch_timestamps(tl_since)
 
-        steps = classify_steps(
-            raw_steps,
-            idle_rewarm_sec=self.config["idle_rewarm_sec"],
-            account_switches=switch_timestamps,
-        )
-        if not steps:
-            return None
+            all_steps = self._classify_steps_cached(conv_id, raw_steps, switch_timestamps)
+            if not all_steps:
+                return None
 
-        gens = self._db_reader.read_full_history(conv_id)
-        is_subagent = (not has_user_explicit) and (has_subagent_marker or self._check_subagent_hint_cached(conv_id))
-        aligned_gens = _align_steps_with_gen_history(steps, gens)
+            gens = self._db_reader.read_full_history(conv_id)
+            is_subagent = (not has_user_explicit) and (has_subagent_marker or self._check_subagent_hint_cached(conv_id))
+            aligned_gens = _align_steps_with_gen_history(all_steps, gens)
 
-        points: List[ConversationDetailPoint] = []
-        max_ctx_limit = 0
-        for st, gen in zip(steps, aligned_gens):
-            if gen is not None and gen.max_context_tokens > max_ctx_limit:
-                max_ctx_limit = gen.max_context_tokens
-            points.append(
-                ConversationDetailPoint(
-                    step_index=st.step_index,
-                    timestamp=st.timestamp,
-                    model=format_model_name(st.model),
-                    total_tokens=st.total_tokens,
-                    context_delta=st.context_delta,
-                    input_tokens=st.input_tokens,
-                    cache_read_tokens=st.cache_read_tokens,
-                    output_tokens=st.output_tokens,
-                    hit_rate=st.hit_rate,
-                    classification=st.classification,
-                    reason=st.reason,
-                    ttft_sec=gen.ttft_sec if gen is not None else None,
-                    tps=gen.tps if gen is not None else None,
-                    streaming_sec=gen.streaming_sec if gen is not None else None,
-                )
-            )
+            raw_view = (view_account or "").strip()
+            hr_key = (history_range or "30m").strip().lower()
+            if hr_key not in HISTORY_RANGE_SPECS:
+                hr_key = "30m"
+            hr_short, _hr_label = HISTORY_RANGE_SPECS[hr_key]
+            use_acct_filter = bool(raw_view) and raw_view != "__all__"
+            use_range_filter = hr_key != "30m"
 
-        latest = steps[-1]
-        today_steps = sum(1 for s in steps if s.timestamp >= today_start)
-        peak_ctx = max(s.total_tokens for s in steps)
-        compact_count = sum(1 for s in steps if s.reason == "compact_reset" or (s.context_delta <= -32000 and s.total_tokens < (s.total_tokens - s.context_delta) * 0.75))
-        hit_steps = sum(1 for s in steps if s.classification == "hit")
-        abn_steps = sum(1 for s in steps if s.classification == "abnormal_miss")
-        exp_cold_steps = sum(1 for s in steps if s.classification == "expected_cold")
-        cacheable_total = hit_steps + abn_steps
-        overall_ratio = (hit_steps / cacheable_total) if cacheable_total > 0 else None
+            scope_label = ""
+            if use_acct_filter or use_range_filter:
+                acct_filter_fn: Optional[Callable[[float], bool]] = None
+                norm_view = ""
+                if use_acct_filter:
+                    norm_view = _mask_short(raw_view) or raw_view
+                    timeline = self._ledger.get_timeline(min(today_start, first_ts or (now - 7 * 86400.0)))
+                    fb_lbl = self._account_cache.short_label if self._account_cache.online else ""
+                    acct_filter_fn = self._ledger.build_account_matcher(
+                        norm_view,
+                        timeline,
+                        fallback_label=fb_lbl,
+                    )
 
-        ttfts = sorted(p.ttft_sec for p in points if p.ttft_sec is not None)
-        avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
-        max_ttft = ttfts[-1] if ttfts else None
-        p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
-        tpss = [p.tps for p in points if p.tps is not None]
-        avg_tps = (sum(tpss) / len(tpss)) if tpss else None
-        latest_tps = next((p.tps for p in reversed(points) if p.tps is not None), None)
-        latest_ttft = next((p.ttft_sec for p in reversed(points) if p.ttft_sec is not None), None)
-
-        fresh_rem: Optional[int] = None
-        fresh_invalid = ""
-        if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
-            age = now - latest.timestamp
-            if age <= self.config["freshness_window_sec"] + 300:
-                if latest.classification == "abnormal_miss":
-                    fresh_invalid = "本步 cr=0 无热缓存"
+                if hr_key == "7d":
+                    range_start_ts = now - 7 * 86400.0
+                elif hr_key == "today":
+                    range_start_ts = today_start
+                elif hr_key == "6h":
+                    range_start_ts = now - 6 * 3600.0
                 else:
-                    fresh_rem = int(self.config["freshness_window_sec"] - age)
+                    range_start_ts = 0.0
 
-        return ConversationDetailReport(
-            conversation_id=conv_id,
-            short_id=conv_id[:6],
-            is_subagent=is_subagent,
-            model=format_model_name(latest.model),
-            model_raw=latest.model,
-            total_steps=len(points),
-            today_steps=today_steps,
-            peak_context_tokens=peak_ctx,
-            latest_context_tokens=latest.total_tokens,
-            latest_context_delta=latest.context_delta,
-            max_context_tokens=max_ctx_limit,
-            compact_count=compact_count,
-            cache_hit_steps=hit_steps,
-            abnormal_miss_steps=abn_steps,
-            expected_cold_steps=exp_cold_steps,
-            overall_cacheable_hit_ratio=overall_ratio,
-            avg_ttft_sec=avg_ttft,
-            p95_ttft_sec=p95_ttft,
-            max_ttft_sec=max_ttft,
-            avg_tps=avg_tps,
-            latest_tps=latest_tps,
-            latest_ttft_sec=latest_ttft,
-            freshness_remaining_sec=fresh_rem,
-            freshness_invalid_reason=fresh_invalid,
-            freshness_window_sec=self.config["freshness_window_sec"],
-            points=points,
-            title=self._resolve_conv_title(conv_id),
-        )
+                filtered_pairs = [
+                    (st, gen)
+                    for st, gen in zip(all_steps, aligned_gens)
+                    if (acct_filter_fn is None or acct_filter_fn(st.timestamp))
+                    and (range_start_ts <= 0.0 or st.timestamp >= range_start_ts)
+                ]
+                if filtered_pairs:
+                    steps = [p[0] for p in filtered_pairs]
+                    sel_gens = [p[1] for p in filtered_pairs]
+                    parts = []
+                    if use_acct_filter:
+                        parts.append(norm_view)
+                    if use_range_filter:
+                        parts.append(hr_short)
+                    scope_label = " · ".join(parts)
+                else:
+                    steps = all_steps
+                    sel_gens = aligned_gens
+                    scope_label = "完整对话"
+            else:
+                steps = all_steps
+                sel_gens = aligned_gens
+
+            points: List[ConversationDetailPoint] = []
+            max_ctx_limit = 0
+            for st, gen in zip(steps, sel_gens):
+                if gen is not None and gen.max_context_tokens > max_ctx_limit:
+                    max_ctx_limit = gen.max_context_tokens
+                points.append(
+                    ConversationDetailPoint(
+                        step_index=st.step_index,
+                        timestamp=st.timestamp,
+                        model=format_model_name(st.model),
+                        total_tokens=st.total_tokens,
+                        context_delta=st.context_delta,
+                        input_tokens=st.input_tokens,
+                        cache_read_tokens=st.cache_read_tokens,
+                        output_tokens=st.output_tokens,
+                        hit_rate=st.hit_rate,
+                        classification=st.classification,
+                        reason=st.reason,
+                        ttft_sec=gen.ttft_sec if gen is not None else None,
+                        tps=gen.tps if gen is not None else None,
+                        streaming_sec=gen.streaming_sec if gen is not None else None,
+                        is_revert=st.is_revert,
+                        is_compact=st.is_compact,
+                    )
+                )
+
+            latest = steps[-1]
+            today_steps = sum(1 for s in steps if s.timestamp >= today_start)
+            peak_ctx = max(s.total_tokens for s in steps)
+            revert_count = sum(1 for s in steps if s.is_revert or s.reason == "revert_reset")
+            compact_count = sum(
+                1
+                for s in steps
+                if (not s.is_revert and s.reason != "revert_reset")
+                and (s.is_compact or s.reason == "compact_reset")
+            )
+            hit_steps = sum(1 for s in steps if s.classification == "hit")
+            abn_steps = sum(1 for s in steps if s.classification == "abnormal_miss")
+            exp_cold_steps = sum(1 for s in steps if s.classification == "expected_cold")
+            cacheable_total = hit_steps + abn_steps
+            overall_ratio = (hit_steps / cacheable_total) if cacheable_total > 0 else None
+
+            ttfts = sorted(p.ttft_sec for p in points if p.ttft_sec is not None)
+            avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
+            max_ttft = ttfts[-1] if ttfts else None
+            p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
+            tpss = [p.tps for p in points if p.tps is not None]
+            avg_tps = (sum(tpss) / len(tpss)) if tpss else None
+            latest_tps = next((p.tps for p in reversed(points) if p.tps is not None), None)
+            latest_ttft = next((p.ttft_sec for p in reversed(points) if p.ttft_sec is not None), None)
+
+            consec_miss = 0
+            for s in reversed(steps):
+                if s.classification == "abnormal_miss":
+                    consec_miss += 1
+                else:
+                    break
+
+            fresh_rem: Optional[int] = None
+            fresh_invalid = ""
+            if not scope_label and latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
+                age = now - latest.timestamp
+                if age <= self.config["freshness_window_sec"] + 300:
+                    if latest.classification == "abnormal_miss":
+                        fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
+                    else:
+                        fresh_rem = int(self.config["freshness_window_sec"] - age)
+
+            return ConversationDetailReport(
+                conversation_id=conv_id,
+                short_id=conv_id[:6],
+                is_subagent=is_subagent,
+                model=format_model_name(latest.model),
+                model_raw=latest.model,
+                total_steps=len(points),
+                today_steps=today_steps,
+                peak_context_tokens=peak_ctx,
+                latest_context_tokens=latest.total_tokens,
+                latest_context_delta=latest.context_delta,
+                max_context_tokens=max_ctx_limit,
+                compact_count=compact_count,
+                cache_hit_steps=hit_steps,
+                abnormal_miss_steps=abn_steps,
+                expected_cold_steps=exp_cold_steps,
+                overall_cacheable_hit_ratio=overall_ratio,
+                avg_ttft_sec=avg_ttft,
+                p95_ttft_sec=p95_ttft,
+                max_ttft_sec=max_ttft,
+                avg_tps=avg_tps,
+                latest_tps=latest_tps,
+                latest_ttft_sec=latest_ttft,
+                freshness_remaining_sec=fresh_rem,
+                freshness_invalid_reason=fresh_invalid,
+                freshness_window_sec=self.config["freshness_window_sec"],
+                points=points,
+                title=self._resolve_conv_title(conv_id),
+                revert_count=revert_count,
+                scope_label=scope_label,
+            )
 
     def _poll_hub_titles(self, port: int, token: str) -> None:
         """Fetch live conversation titles from the active local Hub (strictly read-only)."""
@@ -2079,6 +2703,7 @@ class AntigravityMonitorEngine:
         stamp = (st.st_mtime_ns, st.st_size)
         cached = self._annotation_title_cache.get(conv_id)
         if cached is not None and cached[0] == stamp:
+            self._annotation_title_cache.move_to_end(conv_id)
             return cached[1]
         try:
             # Annotation files are tiny metadata files (<16 KB); bound read defensively
@@ -2088,6 +2713,9 @@ class AntigravityMonitorEngine:
             return cached[1] if cached is not None else ""
         title = parse_pbtxt_title(raw)
         self._annotation_title_cache[conv_id] = (stamp, title)
+        self._annotation_title_cache.move_to_end(conv_id)
+        while len(self._annotation_title_cache) > 512:
+            self._annotation_title_cache.popitem(last=False)
         return title
 
     def _resolve_conv_title(self, conv_id: str) -> str:
@@ -2295,35 +2923,48 @@ class AntigravityMonitorEngine:
             pass
 
 
-def _align_steps_with_gen_history(steps: List[StepRecord], gens: List[Any]) -> List[Optional[Any]]:
-    """Align full transcript StepRecords with SQLite GenTelemetry rows using reverse token matching."""
+def _align_steps_with_gen_history(
+    steps: List[StepRecord],
+    gens: List[Any],
+    max_gap_scan: int = 16,
+) -> List[Optional[Any]]:
+    """Align transcript StepRecords with SQLite GenTelemetry rows, resilient to Undo/revert & account slices."""
     if not steps:
         return []
     if not gens:
         return [None] * len(steps)
-    if len(steps) == len(gens):
-        return list(gens)
 
     aligned: List[Optional[Any]] = [None] * len(steps)
     gi = len(gens) - 1
+    gap_lim = max(16, int(max_gap_scan))
     for si in range(len(steps) - 1, -1, -1):
         if gi < 0:
             break
         st = steps[si]
-        tol = max(64, int(st.total_tokens * 0.02))
+        # Tight 0.2% tolerance prevents adjacent 200K vs 202K steps from colliding after Undo branch drops
+        tol_in = max(16, int(st.total_tokens * 0.002))
+        tol_cr = max(16, int(max(st.cache_read_tokens, st.total_tokens) * 0.005))
         matched_idx = -1
-        scan_lo = max(-1, gi - 8)
+        scan_lo = max(-1, gi - gap_lim)
+        # Pass 1: exact/tight match on total_in + cached_in + output_tokens
         for cand in range(gi, scan_lo, -1):
             g = gens[cand]
-            if abs(g.total_in - st.total_tokens) <= tol and abs(g.cached_in - st.cache_read_tokens) <= tol:
+            out_ok = (st.output_tokens <= 0 or g.output_tokens <= 0) or abs(g.output_tokens - st.output_tokens) <= max(16, int(st.output_tokens * 0.08))
+            if abs(g.total_in - st.total_tokens) <= tol_in and abs(g.cached_in - st.cache_read_tokens) <= tol_cr and out_ok:
                 matched_idx = cand
                 break
+        # Pass 2: fallback for slight SQLite/transcript cached_in accounting drift (must still match total_in & output_tokens tightly)
+        if matched_idx < 0:
+            pass2_lo = max(-1, gi - min(gap_lim, 6))
+            for cand in range(gi, pass2_lo, -1):
+                g = gens[cand]
+                out_ok = (st.output_tokens <= 0 or g.output_tokens <= 0) or abs(g.output_tokens - st.output_tokens) <= max(16, int(st.output_tokens * 0.05))
+                if abs(g.total_in - st.total_tokens) <= tol_in and out_ok and abs(g.cached_in - st.cache_read_tokens) <= max(256, int(st.total_tokens * 0.05)):
+                    matched_idx = cand
+                    break
         if matched_idx >= 0:
             aligned[si] = gens[matched_idx]
             gi = matched_idx - 1
-        elif abs(len(steps) - len(gens)) <= 3:
-            aligned[si] = gens[gi]
-            gi -= 1
     return aligned
 
 
@@ -2414,6 +3055,17 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
         "headline": snap.headline,
         "sub_headline": snap.sub_headline,
         "active_model": snap.active_model,
+        "view": {
+            "view_account": snap.view_account,
+            "resolved_account": snap.resolved_account,
+            "available_accounts": list(snap.available_accounts),
+            "is_custom_account_view": snap.is_custom_account_view,
+            "history_range": snap.history_range,
+            "history_range_label": snap.history_range_label,
+            "is_historical_rating": snap.is_historical_rating,
+            "rating_anchor_time_local": _epoch_to_iso_local(snap.rating_anchor_ts) if snap.rating_anchor_ts > 0 else None,
+            "range_steps": snap.range_steps,
+        },
         "account": {
             "short_label": snap.account.short_label,
             "email_masked": snap.account.email_masked,
@@ -2540,9 +3192,11 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
     distinct_models = list(dict.fromkeys(pt.model for pt in report.points if pt.model))
     model_overview = f"{report.model} (含 {len(distinct_models)} 种模型: {', '.join(distinct_models[:4])})" if len(distinct_models) >= 2 else report.model
     title_part = f"{report.title} ({report.short_id})" if report.title else report.short_id
+    scope_part = f" · 视角 {report.scope_label}" if getattr(report, "scope_label", "") else ""
+    rev_s = f" | 回溯 {report.revert_count} 次" if report.revert_count > 0 else ""
     lines = [
-        f"Antigravity 单对话长线体检 ({title_part} · {role} · {model_overview})",
-        f"步数概况: 总计 {report.total_steps} 步 (今日 {report.today_steps} 步) | 压缩 {report.compact_count} 次",
+        f"Antigravity 单对话长线体检 ({title_part} · {role} · {model_overview}{scope_part})",
+        f"步数概况: 总计 {report.total_steps} 步 (今日 {report.today_steps} 步) | 压缩 {report.compact_count} 次{rev_s}",
         f"请求体规模: 当前 {format_tokens(report.latest_context_tokens)} ({format_delta_tokens(report.latest_context_delta)}) | 峰值 {format_tokens(report.peak_context_tokens)}",
         f"缓存统计: 有效命中率 {hit_ratio} (命中 {report.cache_hit_steps} / 异常归零 {report.abnormal_miss_steps} / 正常冷启 {report.expected_cold_steps})",
         f"速度统计: TTFT 均 {avg_t} / P95 {p95_t} / 峰 {max_t} | 平均吞吐 {avg_p}",
@@ -2552,9 +3206,15 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f}t/s" if pt.tps is not None else "—"
+        if pt.is_revert and pt.reason == "cached":
+            r_tag = "回溯·命中"
+        elif getattr(pt, "is_compact", False) and pt.reason == "cached":
+            r_tag = "压缩·命中"
+        else:
+            r_tag = pt.reason
         lines.append(
             f"  #{pt.step_index:<4} {hm} │ [{pt.model}] │ {format_tokens(pt.total_tokens):>6} ({format_delta_tokens(pt.context_delta):>7}) "
-            f"│ 缓存 {pt.hit_rate:5.1f}% │ 首字 {t_s:>6} │ {p_s:>6} [{pt.reason}]"
+            f"│ 缓存 {pt.hit_rate:5.1f}% │ 首字 {t_s:>6} │ {p_s:>6} [{r_tag}]"
         )
     return mask_email("\n".join(lines))
 
@@ -2581,26 +3241,31 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         f"Antigravity 实时体检摘要 ({ts_str})",
         f"健康评级: [{snap.grade}] {snap.headline} | 压力: {snap.pressure}",
         f"状态说明: {snap.sub_headline}",
-        f"当前账号: {snap.account.short_label} | 5h 额度 {acc_5h} | 周额度 {acc_wk}",
     ]
-    if snap.account.pools:
-        pool_parts = []
-        for pname in ("gemini", "3p"):
-            pool = snap.account.pools.get(pname)
-            if pool is None:
-                continue
-            p5 = f"{pool.five_hour_pct:.1f}%" if pool.five_hour_pct is not None else "—"
-            pw = f"{pool.weekly_pct:.0f}%" if pool.weekly_pct is not None else "—"
-            rst = f" 重置 {pool.five_hour_reset_at}" if pool.five_hour_reset_at else ""
-            pool_parts.append(f"{pname}: 5h {p5} / 周 {pw}{rst}")
-        if pool_parts:
-            lines.append("分池配额: " + " | ".join(pool_parts))
+    if snap.is_custom_account_view:
+        online_s = snap.account.short_label if snap.account.online else "离线"
+        lines.append(f"观察视角: {snap.resolved_account or '全机'} ({snap.history_range_label}) | 当前在线: {online_s}")
+    else:
+        range_suffix = f" | 范围 {snap.history_range_label}" if snap.history_range != "30m" else ""
+        lines.append(f"当前账号: {snap.account.short_label} | 5h 额度 {acc_5h} | 周额度 {acc_wk}{range_suffix}")
+        if snap.account.pools:
+            pool_parts = []
+            for pname in ("gemini", "3p"):
+                pool = snap.account.pools.get(pname)
+                if pool is None:
+                    continue
+                p5 = f"{pool.five_hour_pct:.1f}%" if pool.five_hour_pct is not None else "—"
+                pw = f"{pool.weekly_pct:.0f}%" if pool.weekly_pct is not None else "—"
+                rst = f" 重置 {pool.five_hour_reset_at}" if pool.five_hour_reset_at else ""
+                pool_parts.append(f"{pname}: 5h {p5} / 周 {pw}{rst}")
+            if pool_parts:
+                lines.append("分池配额: " + " | ".join(pool_parts))
 
     lines.extend(
         [
             f"实时性能: 缓存 {hit_str} | 吞吐 {tps_str} | TTFT {ttft_str}",
             f"步数统计: {steps_str}",
-            f"底层日志 ({snap.log_scope_label} · 近 {snap.sliding_window_min}m / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
+            f"底层日志 ({snap.log_scope_label} · {snap.history_range_label} / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
         ]
     )
     if len(snap.model_stats) >= 2:
@@ -2608,7 +3273,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         for ms in snap.model_stats[:4]:
             ta = f"均{ms.ttft_avg_sec:.1f}s/峰{ms.ttft_max_sec:.1f}s" if (ms.ttft_avg_sec is not None and ms.ttft_max_sec is not None) else "—"
             ms_parts.append(f"{ms.model}({ms.step_count}步 TTFT {ta})")
-        lines.append("近 30m 分模型 TTFT: " + " | ".join(ms_parts))
+        lines.append(f"{snap.history_range_label}分模型 TTFT: " + " | ".join(ms_parts))
     if snap.active_conversations:
         main_list = [c for c in snap.active_conversations if not c.is_subagent]
         sub_list = [c for c in snap.active_conversations if c.is_subagent]

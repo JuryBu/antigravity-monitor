@@ -37,6 +37,8 @@ python -B main.py --json --readonly --conversation-id <id>
 | `--cli` | 输出脱敏纯文本体检摘要后立即退出；默认启用严格只读（零写盘） |
 | `--readonly` | 显式声明严格零写盘（`--cli` 与 `--json` 已默认启用，不会写入或替换 `account_ledger.json` 与 `config.json`） |
 | `--conversation-id <id>` | 定向附带指定对话（支持完整 UUID 或不区分大小写的前缀匹配）的实时上下文大小、最新请求体增量（`latest_context_delta`）、缓存命中、TTFT、保鲜倒计时及近 10 步明细，即使该对话不在最近 24 条活跃会话内也会按需定位读取 |
+| `--account <label>` | 定向查看某单独历史账号（如 `al***1`、`be***2`，或 `__all__` 查看全机合并视图）的专属评级、对话、步数与日志；省略则自动跟随当前在线账号（刚换号尚无新步时自动沿用该号最近历史活跃数据定级） |
+| `--range {30m,6h,today,7d}` | 指定观测时间范围，默认 `30m`（实时模式）；可选 `6h` / `today` / `7d` 历史范围 |
 
 ---
 
@@ -46,9 +48,9 @@ python -B main.py --json --readonly --conversation-id <id>
 
 | 退出码 | 对应 `pressure` | 含义与判定条件 |
 |---|---|---|
-| `0` | `normal` | 健康正常：`grade == "T0"`，且当前口径今日步数低于黄线预警值（默认 `960`） |
+| `0` | `normal` | 健康正常或在线新号待采样：`grade` 为 `T0` 或在线无异常 `WAIT`，且当前口径今日步数低于黄线预警值（默认 `960`） |
 | `1` | `warn` / `red` / `degraded` | 需降频或存在异常：触及今日步数黄线（`warn`，默认 `>= 960`）、触及今日步数红线（`red`，默认 `>= 1200`）、单步异常掉缓存/疑似暗限速/偶发 1 次 503（`WARN`），或连续/频繁掉缓存与限流封禁（`T1` / `T2` / `T3`，`degraded`） |
-| `2` | `offline_unknown` | 离线、证据不足或参数/采集失败：`grade == "IDLE"`（客户端未在线且无近 2 分钟实时轨迹），或命令行参数错误、运行期读取异常（此时 `--json` 仍保证输出合法 JSON，含 `"ok": false` 与 `"error"`） |
+| `2` | `offline_unknown` | 离线、证据不足或参数/采集失败：`grade == "IDLE"`（客户端未在线且无近 2 分钟实时轨迹）、离线指定无记录账号，或命令行参数错误、运行期读取异常（此时 `--json` 仍保证输出合法 JSON，含 `"ok": false` 与 `"error"`） |
 
 ---
 
@@ -63,12 +65,13 @@ python -B main.py --json --readonly --conversation-id <id>
 | `observed_at` | `string` | UTC ISO-8601 采样时间戳（如 `2026-11-20T07:30:00Z`） |
 | `observed_at_local` | `string` | 本机时区 ISO-8601 时间戳 |
 | `observed_at_ts` | `number` | Unix 秒级时间戳 |
-| `grade` | `string` | 详细健康等级：`IDLE \| T0 \| WARN \| T1 \| T2 \| T3` |
-| `level` | `string` | 视觉灯号：`green \| orange \| red` |
+| `grade` | `string` | 详细健康等级：`IDLE \| WAIT \| T0 \| WARN \| T1 \| T2 \| T3`（`WAIT` 表示刚切入尚无历史与实时采样的冷账号待采样态） |
+| `level` | `string` | 视觉灯号：`green \| cyan \| orange \| red` |
 | `pressure` | `string` | 面向自动路由的 5 档综合压力：`normal \| warn \| red \| degraded \| offline_unknown`（步数破红线 `>= 1200` 独立标为 `red`，不与一般 `warn` 混淆） |
 | `exit_code` | `integer` | 与进程退出码一致：`0 \| 1 \| 2` |
 | `headline` / `sub_headline` | `string` | 一句话状态结论与详细原因 |
 | `active_model` | `string` | 主活跃对话的简称模型名（优先锁定主对话，不被短期子代理抢占） |
+| `view` | `object` | 当前视角元信息：`view_account`、`resolved_account`、`available_accounts`、`is_custom_account_view`、`history_range`、`history_range_label`、`is_historical_rating`、`rating_anchor_time_local`、`range_steps` |
 
 ### 1. `account`（当前账号与分池配额）
 
