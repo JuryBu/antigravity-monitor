@@ -10,6 +10,7 @@ Reads only local files and localhost Language Server status endpoints:
 
 from __future__ import annotations
 
+import base64
 import ctypes
 from ctypes import wintypes
 import datetime
@@ -19,6 +20,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,7 +31,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from core.account_ledger import AccountSwitchLedger
 from core.config_store import DEFAULT_CONFIG, sanitize_config
-from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot
+from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, parse_pb_map
 
 EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 RETRY_RE = re.compile(r"(?:^|[\s\[/\\])run\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
@@ -191,6 +193,25 @@ def format_countdown(seconds: Optional[int]) -> str:
     return f"{mins}:{secs:02d}"
 
 
+def truncate_display_width(text: str, max_cols: int = 18) -> str:
+    """Truncate text by terminal/UI visual columns (CJK wide chars count as 2, ASCII as 1)."""
+    clean = " ".join((text or "").split())
+    if not clean or max_cols <= 2:
+        return clean
+    cols = 0
+    out: List[str] = []
+    for ch in clean:
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cols + w > max_cols:
+            while out and cols + 1 > max_cols:
+                rem = out.pop()
+                cols -= 2 if unicodedata.east_asian_width(rem) in ("W", "F") else 1
+            return "".join(out).rstrip() + "…"
+        out.append(ch)
+        cols += w
+    return clean
+
+
 def parse_iso_timestamp(raw: str) -> Optional[float]:
     if not raw:
         return None
@@ -301,6 +322,7 @@ class ConversationSummary:
     is_subagent: bool = False
     latest_context_delta: int = 0
     total_step_count: int = 0
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -349,6 +371,7 @@ class ConversationDetailReport:
     freshness_invalid_reason: str
     freshness_window_sec: int
     points: List[ConversationDetailPoint] = field(default_factory=list)
+    title: str = ""
 
 
 @dataclass(frozen=True)
@@ -440,6 +463,7 @@ class MonitorSnapshot:
     peak_hour_label: str = ""
     target_conversation: Optional[ConversationSummary] = None
     target_conversation_query: str = ""
+    min_freshness_title: str = ""
 
 
 def compute_pressure(
@@ -482,6 +506,7 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "cockpit_quota_db": home / ".antigravity_cockpit" / "platform-quota-history-v1.sqlite",
         "cockpit_logs_dir": home / ".antigravity_cockpit" / "logs",
         "ledger_path": Path(__file__).resolve().parent.parent / "account_ledger.json",
+        "vscdb_path": appdata / "Antigravity" / "User" / "globalStorage" / "state.vscdb",
     }
 
 
@@ -747,15 +772,22 @@ class AntigravityMonitorEngine:
         self.cockpit_quota_db = Path(base_paths["cockpit_quota_db"])
         cockpit_logs_dir = base_paths.get("cockpit_logs_dir")
         ledger_path = base_paths.get("ledger_path")
-        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir,
-        # avoid reading the host's real Cockpit logs or polluting the real local ledger file.
+        vscdb_path = base_paths.get("vscdb_path")
+        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path,
+        # avoid reading the host's real Cockpit logs, VSCode state DB, or polluting the real local ledger file.
         if paths and "ledger_path" not in paths:
             ledger_path = None
         if paths and "cockpit_logs_dir" not in paths:
             cockpit_logs_dir = None
+        if paths and "vscdb_path" not in paths:
+            vscdb_path = None
 
+        self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
         self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]] = {}
         self._subagent_hint_cache: Dict[str, Tuple[int, bool]] = {}
+        self._conv_titles: Dict[str, str] = {}
+        self._vscdb_titles_stamp: Optional[Tuple[int, int]] = None
+        self._vscdb_titles_cache: Dict[str, str] = {}
         self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=36, tail_rows=16)
         self._log_tailer = LanguageServerLogTailer(self.ls_log_path, max_events=200)
         self._ledger = AccountSwitchLedger(
@@ -875,6 +907,7 @@ class AntigravityMonitorEngine:
             is_subagent=(not has_user_explicit) and has_subagent_marker,
             latest_context_delta=latest.context_delta,
             total_step_count=len(steps),
+            title=self._resolve_conv_title(conv_id),
         )
 
     def _enrich_conv_from_db(self, c: ConversationSummary) -> None:
@@ -1103,12 +1136,14 @@ class AntigravityMonitorEngine:
 
         min_fresh_sec: Optional[int] = None
         min_fresh_conv = ""
+        min_fresh_title = ""
         min_fresh_ctx = 0
         min_fresh_invalid = ""
         if large_freshness:
             head_f = large_freshness[0]
             min_fresh_sec = head_f.freshness_remaining_sec
             min_fresh_conv = head_f.short_id
+            min_fresh_title = head_f.title
             min_fresh_ctx = head_f.context_tokens
             min_fresh_invalid = head_f.freshness_invalid_reason
 
@@ -1240,6 +1275,7 @@ class AntigravityMonitorEngine:
             peak_hour_label=peak_hour_label,
             target_conversation=target_conv,
             target_conversation_query=target_query,
+            min_freshness_title=min_fresh_title,
         )
 
     def _classify_speed(
@@ -1632,7 +1668,108 @@ class AntigravityMonitorEngine:
             freshness_invalid_reason=fresh_invalid,
             freshness_window_sec=self.config["freshness_window_sec"],
             points=points,
+            title=self._resolve_conv_title(conv_id),
         )
+
+    def _poll_hub_titles(self, port: int, token: str) -> None:
+        """Fetch live conversation titles from the active local Hub (strictly read-only)."""
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories",
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-codeium-csrf-token": token,
+                    "Connect-Protocol-Version": "1",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=1.2) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            summaries = data.get("trajectorySummaries") or {}
+            if isinstance(summaries, dict):
+                for cid, entry in summaries.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    summary = str(entry.get("summary") or "").strip()
+                    if summary:
+                        self._conv_titles[str(cid)] = summary
+        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+            pass
+
+    def _load_vscdb_titles_cached(self) -> Dict[str, str]:
+        """Read-only offline fallback for conversation titles from Antigravity state.vscdb."""
+        if self.vscdb_path is None or not self.vscdb_path.is_file():
+            return self._vscdb_titles_cache
+        try:
+            st = self.vscdb_path.stat()
+        except OSError:
+            return self._vscdb_titles_cache
+        stamp = (st.st_mtime_ns, st.st_size)
+        if self._vscdb_titles_stamp == stamp:
+            return self._vscdb_titles_cache
+
+        titles: Dict[str, str] = {}
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            resolved = self.vscdb_path.resolve().as_posix()
+            encoded = urllib.parse.quote(resolved, safe="/:")
+            uri = f"file:///{encoded}?mode=ro" if not encoded.startswith("/") else f"file://{encoded}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=0.3)
+            for key in ("antigravityUnifiedStateSync.trajectorySummaries", "unifiedStateSync.trajectorySummaries"):
+                row = conn.execute("SELECT value FROM ItemTable WHERE key = ? LIMIT 1", (key,)).fetchone()
+                if not row or not row[0]:
+                    continue
+                val_str = row[0] if isinstance(row[0], str) else bytes(row[0]).decode("utf-8", errors="ignore")
+                try:
+                    raw = base64.b64decode(val_str)
+                except Exception:
+                    continue
+                top = parse_pb_map(raw)
+                for item in top.get(1) or []:
+                    if not isinstance(item, bytes):
+                        continue
+                    em = parse_pb_map(item)
+                    cid_b = em.get(1, [b""])[0]
+                    inner_b = em.get(2, [b""])[0]
+                    if not (isinstance(cid_b, bytes) and isinstance(inner_b, bytes)):
+                        continue
+                    cid = cid_b.decode("utf-8", errors="ignore").strip()
+                    if not cid or cid in titles:
+                        continue
+                    im = parse_pb_map(inner_b)
+                    b64_b = im.get(1, [b""])[0]
+                    if not isinstance(b64_b, bytes):
+                        continue
+                    try:
+                        sub = parse_pb_map(base64.b64decode(b64_b))
+                    except Exception:
+                        continue
+                    t_b = sub.get(1, [b""])[0]
+                    if isinstance(t_b, bytes):
+                        title = t_b.decode("utf-8", errors="ignore").strip()
+                        if title:
+                            titles[cid] = title
+        except sqlite3.Error:
+            return self._vscdb_titles_cache
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+        self._vscdb_titles_stamp = stamp
+        self._vscdb_titles_cache = titles
+        return titles
+
+    def _resolve_conv_title(self, conv_id: str) -> str:
+        if not conv_id:
+            return ""
+        title = self._conv_titles.get(conv_id, "")
+        if title:
+            return title
+        vtitles = self._load_vscdb_titles_cached()
+        return vtitles.get(conv_id, "")
 
     @staticmethod
     def _classify_model_pool(label: str, model_id: str = "") -> str:
@@ -1726,6 +1863,7 @@ class AntigravityMonitorEngine:
 
                     info.pools = pools
                     self._sync_account_active_pool(info, active_family)
+                    self._poll_hub_titles(port, token)
                     break
                 except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
                     continue
@@ -1859,6 +1997,7 @@ def _serialize_conversation_summary(c: ConversationSummary, include_steps: bool 
     data: Dict[str, Any] = {
         "conversation_id": c.conversation_id,
         "short_id": c.short_id,
+        "title": c.title,
         "is_subagent": c.is_subagent,
         "model": c.model,
         "model_raw": c.model_raw,
@@ -2043,8 +2182,9 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
     p95_t = f"{report.p95_ttft_sec:.1f}s" if report.p95_ttft_sec is not None else "—"
     max_t = f"{report.max_ttft_sec:.1f}s" if report.max_ttft_sec is not None else "—"
     avg_p = f"{report.avg_tps:.0f} t/s" if report.avg_tps is not None else "—"
+    title_part = f"{report.title} ({report.short_id})" if report.title else report.short_id
     lines = [
-        f"Antigravity 单对话长线体检 ({report.short_id} · {role} · {report.model})",
+        f"Antigravity 单对话长线体检 ({title_part} · {role} · {report.model})",
         f"步数概况: 总计 {report.total_steps} 步 (今日 {report.today_steps} 步) | 压缩 {report.compact_count} 次",
         f"请求体规模: 当前 {format_tokens(report.latest_context_tokens)} ({format_delta_tokens(report.latest_context_delta)}) | 峰值 {format_tokens(report.peak_context_tokens)}",
         f"缓存统计: 有效命中率 {hit_ratio} (命中 {report.cache_hit_steps} / 异常归零 {report.abnormal_miss_steps} / 正常冷启 {report.expected_cold_steps})",
@@ -2052,7 +2192,7 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
         "最近 12 步明细（新 → 旧）:",
     ]
     for pt in reversed(report.points[-12:]):
-        hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%H:%M:%S") if pt.timestamp > 0 else "--:--:--"
+        hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f}t/s" if pt.tps is not None else "—"
         lines.append(
@@ -2123,8 +2263,9 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
             tf = f" TTFT {c.ttft_sec:.1f}s" if c.ttft_sec is not None else ""
             if c.ttft_avg_sec is not None and c.ttft_max_sec is not None and len([x for x in c.recent_ttfts if x is not None]) >= 2:
                 tf += f"(均{c.ttft_avg_sec:.0f}/峰{c.ttft_max_sec:.0f}s)"
+            title_s = f" {truncate_display_width(c.title, 20)}" if c.title else ""
             lines.append(
-                f"  - {tag} {c.short_id} {c.model} {format_tokens(c.context_tokens)}{delta_s} [{bar}] {c.latest_hit_rate:.1f}%{tf}{sp}"
+                f"  - {tag} {c.short_id}{title_s} {c.model} {format_tokens(c.context_tokens)}{delta_s} [{bar}] {c.latest_hit_rate:.1f}%{tf}{sp}"
             )
     if snap.target_conversation_query:
         tc = snap.target_conversation

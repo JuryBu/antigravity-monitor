@@ -23,6 +23,7 @@ from core.log_monitor import (
     format_text_summary,
     mask_email,
     short_email_label,
+    truncate_display_width,
 )
 from core.sqlite_reader import ConversationDbReader, parse_gen_metadata_row
 from core.startup_manager import install_desktop_shortcut, is_startup_enabled, set_startup_enabled
@@ -992,6 +993,115 @@ class TestShortcutsAndIcons(unittest.TestCase):
             txt = format_detail_text_report(detail)
             self.assertIn("main99", txt)
             self.assertIn("+10.0K", txt)
+
+    def test_conversation_titles_from_hub_and_vscdb_and_display_truncation(self) -> None:
+        import base64
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import os
+        import threading
+
+        self.assertEqual(truncate_display_width("ABC", 6), "ABC")
+        self.assertEqual(truncate_display_width("中文长标题测试文本超长", 10), "中文长标…")
+
+        # 1. Verify offline state.vscdb double-base64 protobuf fallback + MM-DD date in detail report
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "title001-1234-5678"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            now = time.time()
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 20))
+            (b_dir / "transcript.jsonl").write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"}) + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n",
+                encoding="utf-8",
+            )
+            sub_pb = _pb_bytes_field(1, "离线测试中文对话名".encode("utf-8"))
+            inner_pb = _pb_bytes_field(1, base64.b64encode(sub_pb))
+            entry_pb = _pb_bytes_field(1, cid.encode("utf-8")) + _pb_bytes_field(2, inner_pb)
+            top_pb = _pb_bytes_field(1, entry_pb)
+            vscdb = root / "state.vscdb"
+            vconn = sqlite3.connect(vscdb)
+            vconn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            vconn.execute(
+                "INSERT INTO ItemTable VALUES (?, ?)",
+                ("antigravityUnifiedStateSync.trajectorySummaries", base64.b64encode(top_pb).decode("ascii")),
+            )
+            vconn.commit()
+            vconn.close()
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "vscdb_path": vscdb,
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertEqual(snap.active_conversations[0].title, "离线测试中文对话名")
+            detail = engine.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(detail)
+            assert detail is not None
+            self.assertEqual(detail.title, "离线测试中文对话名")
+            rep_txt = format_detail_text_report(detail)
+            self.assertIn("离线测试中文对话名 (title0)", rep_txt)
+            self.assertIn(time.strftime("%m-%d ", time.localtime(now - 20)), rep_txt)
+
+        # 2. Verify live Hub GetAllCascadeTrajectories title override
+        class _TitleHub(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                if "GetAllCascadeTrajectories" in self.path:
+                    body = json.dumps({"trajectorySummaries": {"hubconv1-aaaa": {"summary": "在线热聊标题"}}}).encode("utf-8")
+                else:
+                    body = json.dumps({"userStatus": {"email": "demo1@example.com", "cascadeModelConfigData": {"clientModelConfigs": []}}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _fmt: str, *_args: object) -> None:
+                return
+
+        srv = HTTPServer(("127.0.0.1", 0), _TitleHub)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                daemon = root / "daemon"
+                daemon.mkdir()
+                (daemon / "hub_t.json").write_text(
+                    json.dumps({"pid": os.getpid(), "httpPort": port, "csrfToken": "tok_t"}),
+                    encoding="utf-8",
+                )
+                b_dir = root / "brain" / "hubconv1-aaaa" / ".system_generated" / "logs"
+                b_dir.mkdir(parents=True)
+                now = time.time()
+                (b_dir / "transcript.jsonl").write_text(
+                    json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"}) + "\n"
+                    + json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 5)), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n",
+                    encoding="utf-8",
+                )
+                engine = AntigravityMonitorEngine(
+                    paths={
+                        "brain_dir": root / "brain",
+                        "conversations_dir": root / "conversations",
+                        "daemon_dir": daemon,
+                        "ls_log_path": root / "language_server.log",
+                        "cockpit_quota_db": root / "missing.sqlite",
+                    },
+                    read_only=True,
+                )
+                snap = engine.poll(now_ts=now, force_account=True)
+                self.assertEqual(snap.active_conversations[0].title, "在线热聊标题")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

@@ -107,7 +107,7 @@ python -B main.py --json --readonly --conversation-id <id>
 ### 4. `counts`、`active_conversations` 与 `target_conversation`
 
 - **`counts`**：`active_main`、`active_subagent`、`active_total`。
-- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
+- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`title`（对话标题，在线来自本地 Hub `GetAllCascadeTrajectories`，离线回退 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
 - **`target_conversation`**：仅当传入 `--conversation-id` 时填充；除上述字段外，还包含 `recent_steps`（近 10 步逐拍 `total_tokens`、`context_delta`、`hit_rate`、`classification`、`reason`）。同时顶层附 `target_conversation_query` 与 `target_conversation_found`。
 
 ---

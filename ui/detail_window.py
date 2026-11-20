@@ -13,6 +13,7 @@ from core.log_monitor import (
     format_delta_tokens,
     format_detail_text_report,
     format_tokens,
+    truncate_display_width,
 )
 
 UI_FONT = "Microsoft YaHei UI"
@@ -333,8 +334,15 @@ class ConversationDetailWindow:
             self._lbl_role.configure(text="子代理", bg=t["card_alt_bg"], fg=t["text_secondary"])
         else:
             self._lbl_role.configure(text="主对话", bg=t["green_bg"], fg=t["green"])
-        self._lbl_title.configure(text=f"{rep.short_id} · {rep.model}")
-        self._lbl_sub.configure(text=f"总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+        if rep.title:
+            disp_name = truncate_display_width(rep.title, 28)
+            self._lbl_title.configure(text=disp_name)
+            self._lbl_sub.configure(text=f"{rep.short_id} · {rep.model} · 总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+            self.win.title(f"{rep.title} ({rep.short_id}) - 长线体检")
+        else:
+            self._lbl_title.configure(text=f"{rep.short_id} · {rep.model}")
+            self._lbl_sub.configure(text=f"总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+            self.win.title(f"{rep.short_id} - 长线体检")
 
         pts = rep.points[-60:] if (self._window_mode == "60" and len(rep.points) > 60) else list(rep.points)
         self._display_points = pts
@@ -413,12 +421,12 @@ class ConversationDetailWindow:
             return
         y_lbl = h - 9
         first, last = pts[0], pts[-1]
-        t0 = datetime.datetime.fromtimestamp(first.timestamp).strftime("%H:%M") if first.timestamp > 0 else ""
-        t1 = datetime.datetime.fromtimestamp(last.timestamp).strftime("%H:%M") if last.timestamp > 0 else ""
+        t0 = datetime.datetime.fromtimestamp(first.timestamp).strftime("%m-%d %H:%M") if first.timestamp > 0 else ""
+        t1 = datetime.datetime.fromtimestamp(last.timestamp).strftime("%m-%d %H:%M") if last.timestamp > 0 else ""
         cv.create_text(pad_l, y_lbl, text=f"#{first.step_index} {t0}".strip(), anchor="w", font=(MONO_FONT, 7), fill=t["text_muted"])
         if len(pts) >= 3:
             mid = pts[len(pts) // 2]
-            tm = datetime.datetime.fromtimestamp(mid.timestamp).strftime("%H:%M") if mid.timestamp > 0 else ""
+            tm = datetime.datetime.fromtimestamp(mid.timestamp).strftime("%m-%d %H:%M") if mid.timestamp > 0 else ""
             cv.create_text(pad_l + plot_w / 2.0, y_lbl, text=f"#{mid.step_index} {tm}".strip(), anchor="center", font=(MONO_FONT, 7), fill=t["text_muted"])
         cv.create_text(pad_l + plot_w, y_lbl, text=f"#{last.step_index} {t1}".strip(), anchor="e", font=(MONO_FONT, 7), fill=t["text_muted"])
 
@@ -632,7 +640,7 @@ class ConversationDetailWindow:
             "first_cacheable": "首次入窗",
             "abnormal_zero": "掉缓存!",
         }
-        hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%H:%M:%S") if pt.timestamp > 0 else "--:--:--"
+        hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f} t/s" if pt.tps is not None else "—"
         tag = reason_map.get(pt.reason, pt.reason)
