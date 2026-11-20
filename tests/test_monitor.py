@@ -738,6 +738,47 @@ class TestShortcutsAndIcons(unittest.TestCase):
             self.assertEqual(conv.recent_steps[1].context_delta, 42000 - 500000)
             self.assertEqual(conv.latest_context_delta, 8000)
 
+    def test_literal_context_summary_text_without_shrink_never_triggers_compact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain" / "lit00001-bbbb" / ".system_generated" / "logs"
+            brain.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 800))
+            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 20))
+            # User mentions literal "<CONTEXT_SUMMARY>" after 13m idle; context grew 340K -> 343K -> MUST be idle_rewarm, NOT compact_reset!
+            lines = [
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hi"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 338000, "output_tokens": 300}),
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "mention <CONTEXT_SUMMARY> and CHECKPOINT in prose"}),
+                json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": t1, "model": "gemini-4-neon-xhigh", "input_tokens": 343000, "cache_read_tokens": 0, "output_tokens": 300}),
+            ]
+            (brain / "transcript.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=now)
+            st = snap.active_conversations[0].recent_steps[-1]
+            self.assertEqual(st.reason, "idle_rewarm")
+            self.assertEqual(st.classification, "expected_cold")
+            detail = engine.read_conversation_detail("lit00001", now_ts=now)
+            self.assertIsNotNone(detail)
+            assert detail is not None
+            self.assertEqual(detail.compact_count, 0)
+
     def test_json_contract_pressure_exit_codes_and_readonly_zero_write(self) -> None:
         self.assertEqual(compute_pressure("IDLE", 0, 960, 1200), "offline_unknown")
         self.assertEqual(compute_pressure("T0", 200, 960, 1200), "normal")

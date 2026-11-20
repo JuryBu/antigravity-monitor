@@ -115,7 +115,7 @@ python -B main.py --json --readonly --conversation-id <id>
 ## 五、只读边界与已知局限
 
 1. **严格零写盘与并发安全**：`--cli`、`--json` 及 `--readonly` 均跳过 `account_ledger.json` 持久化写盘，多对话、多子代理并发调用不会触发 Windows `os.replace` `PermissionError` 竞态。
-2. **上下文压缩重热识别**：系统通过 `transcript.jsonl` 中的 `CHECKPOINT` / `<CONTEXT_SUMMARY>` 事件或上下文骤降（`< 0.75×`）识别压缩重热（`reason = "compact_reset"`, `classification = "expected_cold"`），即便压缩本身耗时超过 180s 也不会误判为异常掉缓存或扣减健康度。
+2. **上下文压缩重热识别**：系统通过 `transcript.jsonl` 中的 `CHECKPOINT` 事件结合上下文真实缩水（`< 0.85×`），或无事件时的上下文骤降（`< 0.75×`）识别压缩重热（`reason = "compact_reset"`, `classification = "expected_cold"`），既保证压缩耗时超过 180s 也不误判，也避免正文提及压缩关键词时产生假阳性。
 3. **规则文件修改触发的前缀重置**：若对话中途修改了注入到系统提示词中的规则文件，下一拍可能出现单步 `cr=0` 重热（随后立即恢复 98%+ 命中）；单步归零仅触发轻量 `WARN`（`pressure = "warn"`），需连续 `>= 2` 步或近 10 步高频异常才会判定为 `T1 / degraded`。
 4. **周额度与重置时间来源**：5h 额度及原生 `resetTime` 直接来自本机在线 Antigravity Language Server Hub（最多扫描最近 40 个 `hub_*.json` 并先校验 PID 存活）；周额度与周重置时间在安装了第三方工具 Antigravity Cockpit 且**严格同邮箱匹配**时只读补全，未安装或离线时保持 `null`，绝不跨账号混用。
 5. **全链路自动脱敏**：所有输出均对邮箱及账号标识执行首尾掩码处理，绝不读取、打印或持久化任何认证 Token。

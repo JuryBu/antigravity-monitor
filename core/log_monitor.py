@@ -519,13 +519,16 @@ def classify_steps(
                     break
 
         after_checkpoint = bool(item.get("after_checkpoint", False))
+        is_real_compact = prev_total is not None and prev_total >= min_cacheable_tokens and (
+            (after_checkpoint and total < prev_total * 0.85) or (total < prev_total * 0.75)
+        )
         if cr > 0:
             cls, reason = "hit", "cached"
         elif prev_ts is None:
             cls, reason = "expected_cold", "first_turn"
         elif crossed_switch:
             cls, reason = "expected_cold", "account_switch"
-        elif after_checkpoint or (prev_total is not None and prev_total >= min_cacheable_tokens and total < prev_total * 0.75):
+        elif is_real_compact:
             cls, reason = "expected_cold", "compact_reset"
         elif ts > 0 and prev_ts > 0 and (ts - prev_ts) > idle_rewarm_sec:
             cls, reason = "expected_cold", "idle_rewarm"
@@ -1450,10 +1453,10 @@ class AntigravityMonitorEngine:
                         '"SUBAGENT"' in line or '"SWARM"' in line or "[swarm]" in line or '"source":"AGENT"' in line
                     ):
                         has_subagent_marker = True
-                    if '"CHECKPOINT"' in line or "<CONTEXT_SUMMARY>" in line:
+                    if '"CHECKPOINT"' in line:
                         try:
                             chk_obj = json.loads(line)
-                            if chk_obj.get("type") == "CHECKPOINT" or "<CONTEXT_SUMMARY>" in str(chk_obj.get("content", "")):
+                            if chk_obj.get("type") == "CHECKPOINT":
                                 pending_checkpoint = True
                         except json.JSONDecodeError:
                             pass
