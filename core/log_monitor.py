@@ -526,6 +526,7 @@ def default_antigravity_paths() -> Dict[str, Path]:
     return {
         "brain_dir": home / ".gemini" / "antigravity" / "brain",
         "conversations_dir": home / ".gemini" / "antigravity" / "conversations",
+        "annotations_dir": home / ".gemini" / "antigravity" / "annotations",
         "daemon_dir": home / ".gemini" / "antigravity" / "daemon",
         "ls_log_path": appdata / "Antigravity" / "logs" / "language_server.log",
         "cockpit_quota_db": home / ".antigravity_cockpit" / "platform-quota-history-v1.sqlite",
@@ -533,6 +534,52 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "ledger_path": Path(__file__).resolve().parent.parent / "account_ledger.json",
         "vscdb_path": appdata / "Antigravity" / "User" / "globalStorage" / "state.vscdb",
     }
+
+
+_PBTXT_TITLE_RE = re.compile(rb'(?:^|[\s{])title\s*:\s*"((?:\\.|[^"\\])*)"')
+
+
+def parse_pbtxt_title(raw: bytes) -> str:
+    """Decode `title:"..."` from Antigravity annotations/*.pbtxt (UTF-8 & protobuf text escapes)."""
+    m = _PBTXT_TITLE_RE.search(raw)
+    if not m:
+        return ""
+    body = m.group(1)
+    out = bytearray()
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch == 0x5C and i + 1 < n:  # backslash escape
+            nxt = body[i + 1]
+            if 0x30 <= nxt <= 0x37:  # octal \ooo (1-3 digits)
+                j = i + 1
+                while j < n and j < i + 4 and 0x30 <= body[j] <= 0x37:
+                    j += 1
+                out.append(int(body[i + 1 : j], 8) & 0xFF)
+                i = j
+                continue
+            if nxt in (0x78, 0x58) and i + 3 < n:  # hex \xHH
+                try:
+                    out.append(int(body[i + 2 : i + 4], 16) & 0xFF)
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            esc_map = {
+                ord('"'): ord('"'),
+                ord("'"): ord("'"),
+                ord("\\"): ord("\\"),
+                ord("n"): ord(" "),
+                ord("r"): ord(" "),
+                ord("t"): ord(" "),
+            }
+            out.append(esc_map.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return " ".join(out.decode("utf-8", errors="ignore").split()).strip()
 
 
 def classify_steps(
@@ -829,19 +876,24 @@ class AntigravityMonitorEngine:
         cockpit_logs_dir = base_paths.get("cockpit_logs_dir")
         ledger_path = base_paths.get("ledger_path")
         vscdb_path = base_paths.get("vscdb_path")
-        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path,
-        # avoid reading the host's real Cockpit logs, VSCode state DB, or polluting the real local ledger file.
+        annotations_dir = base_paths.get("annotations_dir")
+        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path/annotations_dir,
+        # avoid reading the host's real Cockpit logs, VSCode state DB, annotations, or polluting the real local ledger file.
         if paths and "ledger_path" not in paths:
             ledger_path = None
         if paths and "cockpit_logs_dir" not in paths:
             cockpit_logs_dir = None
         if paths and "vscdb_path" not in paths:
             vscdb_path = None
+        if paths and "annotations_dir" not in paths:
+            annotations_dir = None
 
         self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
+        self.annotations_dir: Optional[Path] = Path(annotations_dir) if annotations_dir is not None else None
         self._transcript_cache: Dict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]] = {}
         self._subagent_hint_cache: Dict[str, Tuple[int, bool]] = {}
         self._conv_titles: Dict[str, str] = {}
+        self._annotation_title_cache: Dict[str, Tuple[Tuple[int, int], str]] = {}
         self._vscdb_titles_stamp: Optional[Tuple[int, int]] = None
         self._vscdb_titles_cache: Dict[str, str] = {}
         self._db_reader = ConversationDbReader(self.conversations_dir, max_cache_entries=36, tail_rows=16)
@@ -2012,12 +2064,44 @@ class AntigravityMonitorEngine:
         self._vscdb_titles_cache = titles
         return titles
 
+    def _load_annotation_title_cached(self, conv_id: str) -> str:
+        """Read-only per-conversation title from ~/.gemini/antigravity/annotations/<conv_id>.pbtxt."""
+        if self.annotations_dir is None or not conv_id:
+            return ""
+        if "/" in conv_id or "\\" in conv_id or ".." in conv_id:
+            return ""
+        pbtxt = self.annotations_dir / f"{conv_id}.pbtxt"
+        try:
+            st = pbtxt.stat()
+        except OSError:
+            self._annotation_title_cache.pop(conv_id, None)
+            return ""
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = self._annotation_title_cache.get(conv_id)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        try:
+            # Annotation files are tiny metadata files (<16 KB); bound read defensively
+            with pbtxt.open("rb") as fh:
+                raw = fh.read(65536)
+        except OSError:
+            return cached[1] if cached is not None else ""
+        title = parse_pbtxt_title(raw)
+        self._annotation_title_cache[conv_id] = (stamp, title)
+        return title
+
     def _resolve_conv_title(self, conv_id: str) -> str:
         if not conv_id:
             return ""
+        # 1. Local annotations/<conv_id>.pbtxt (persists user renames & survives Hub restart / account switch)
+        ann_title = self._load_annotation_title_cached(conv_id)
+        if ann_title:
+            return ann_title
+        # 2. Live Hub GetAllCascadeTrajectories summary (covers auto-named conversations without pbtxt title)
         title = self._conv_titles.get(conv_id, "")
         if title:
             return title
+        # 3. Offline state.vscdb double-base64 protobuf fallback
         vtitles = self._load_vscdb_titles_cached()
         return vtitles.get(conv_id, "")
 

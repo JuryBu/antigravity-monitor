@@ -1282,6 +1282,211 @@ class TestShortcutsAndIcons(unittest.TestCase):
             self.assertEqual(snap3.level, "green")
             self.assertIn("已平复", snap3.sub_headline)
 
+    def test_annotations_pbtxt_title_resolution_and_escapes(self) -> None:
+        from core.log_monitor import parse_pbtxt_title
+
+        # Direct UTF-8, quoted escapes, and Go prototext octal UTF-8 escapes
+        self.assertEqual(
+            parse_pbtxt_title('title:"SVG制作测响应" last_user_view_time:{seconds:1795197574}'.encode("utf-8")),
+            "SVG制作测响应",
+        )
+        octal_raw = b'title:"\\346\\265\\213\\350\\257\\225 \\"A\\\\B\\"" last_user_view_time:{seconds:1}'
+        self.assertEqual(parse_pbtxt_title(octal_raw), '测试 "A\\B"')
+        self.assertEqual(parse_pbtxt_title(b"last_user_view_time:{seconds:123}"), "")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "ca052932-0030-459c-aafa-ba18aa7ca3b4"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(parents=True)
+            now = time.time()
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 15))
+            (b_dir / "transcript.jsonl").write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "svg"}) + "\n"
+                + json.dumps({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": 1,
+                    "created_at": t0,
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 48000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            pbtxt = ann_dir / f"{cid}.pbtxt"
+            pbtxt.write_text('title:"SVG制作测响应" last_user_view_time:{seconds:1795197574 nanos:0}\n', encoding="utf-8")
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "annotations_dir": ann_dir,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            snap = engine.poll(now_ts=now)
+            self.assertEqual(snap.active_conversations[0].title, "SVG制作测响应")
+            detail = engine.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(detail)
+            assert detail is not None
+            self.assertEqual(detail.title, "SVG制作测响应")
+
+            # Live rename in annotations/*.pbtxt must invalidate cache and update title immediately
+            time.sleep(0.02)
+            pbtxt.write_text('title:"SVG重命名新标题" last_user_view_time:{seconds:1795197600}\n', encoding="utf-8")
+            snap2 = engine.poll(now_ts=now + 2)
+            self.assertEqual(snap2.active_conversations[0].title, "SVG重命名新标题")
+
+    def test_detail_window_locked_width_never_jitters_on_hover_or_switch(self) -> None:
+        import tkinter as tk
+        from core.log_monitor import ConversationDetailPoint, ConversationDetailReport
+        from ui.detail_window import ConversationDetailWindow
+        from ui.themes import THEMES
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        try:
+            now = time.time()
+            pt_short = ConversationDetailPoint(
+                step_index=3,
+                timestamp=now - 120,
+                total_tokens=18000,
+                input_tokens=18000,
+                cache_read_tokens=0,
+                output_tokens=120,
+                hit_rate=0.0,
+                classification="expected_cold",
+                reason="first_turn",
+                context_delta=0,
+                ttft_sec=4.2,
+                tps=91.0,
+                model="Neon XHigh",
+            )
+            pt_long = ConversationDetailPoint(
+                step_index=1309,
+                timestamp=now - 10,
+                total_tokens=482100,
+                input_tokens=482100,
+                cache_read_tokens=0,
+                output_tokens=640,
+                hit_rate=0.0,
+                classification="abnormal_miss",
+                reason="abnormal_zero",
+                context_delta=-245600,
+                ttft_sec=134.8,
+                tps=218.0,
+                model="Hydrogen XH",
+            )
+            rep_a = ConversationDetailReport(
+                conversation_id="ca052932-0030-459c-aafa-ba18aa7ca3b4",
+                short_id="ca0529",
+                is_subagent=False,
+                model="Neon XHigh",
+                model_raw="gemini-4-neon-xhigh",
+                total_steps=38,
+                today_steps=38,
+                latest_context_tokens=217300,
+                latest_context_delta=2000,
+                peak_context_tokens=217300,
+                max_context_tokens=512000,
+                compact_count=0,
+                cache_hit_steps=13,
+                abnormal_miss_steps=22,
+                expected_cold_steps=3,
+                overall_cacheable_hit_ratio=0.371,
+                avg_ttft_sec=24.7,
+                p95_ttft_sec=72.3,
+                max_ttft_sec=103.1,
+                avg_tps=177.0,
+                latest_tps=117.0,
+                latest_ttft_sec=33.4,
+                freshness_remaining_sec=None,
+                freshness_invalid_reason="",
+                freshness_window_sec=210,
+                points=[pt_short, pt_long],
+                title="SVG制作测响应",
+            )
+            rep_b = ConversationDetailReport(
+                conversation_id="long0001-0000-0000-0000-000000000001",
+                short_id="long00",
+                is_subagent=False,
+                model="Carbon High",
+                model_raw="gemini-4-carbon-high",
+                total_steps=985,
+                today_steps=120,
+                latest_context_tokens=482100,
+                latest_context_delta=-245600,
+                peak_context_tokens=512000,
+                max_context_tokens=512000,
+                compact_count=4,
+                cache_hit_steps=820,
+                abnormal_miss_steps=2,
+                expected_cold_steps=20,
+                overall_cacheable_hit_ratio=0.997,
+                avg_ttft_sec=18.2,
+                p95_ttft_sec=44.5,
+                max_ttft_sec=134.8,
+                avg_tps=205.0,
+                latest_tps=218.0,
+                latest_ttft_sec=134.8,
+                freshness_remaining_sec=120,
+                freshness_invalid_reason="",
+                freshness_window_sec=210,
+                points=[pt_short, pt_long],
+                title="这是一个非常非常长的中文标题测试用于验证不会撑宽单对话弹窗",
+            )
+            reps = {rep_a.conversation_id: rep_a, rep_b.conversation_id: rep_b}
+
+            dw = ConversationDetailWindow(
+                parent=root,
+                theme=THEMES["midnight_blue"],
+                load_report=lambda cid: reps.get(cid),
+                on_toggle_pin=lambda _cid: None,
+                is_pinned_fn=lambda _cid: False,
+            )
+            dw.show_conversation(rep_a.conversation_id, place_near_parent=True)
+            root.update()
+            base_w = dw.win.winfo_width()
+            base_h = dw.win.winfo_height()
+            self.assertGreaterEqual(base_w, 700)
+
+            # Hover short step, hover ultra-long step, toggle mode, switch to ultra-long title conversation
+            dw._update_readout_for_point(pt_short, prefix="选定步")
+            root.update()
+            self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), (base_w, base_h))
+
+            dw._update_readout_for_point(pt_long, prefix="选定步")
+            root.update()
+            self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), (base_w, base_h))
+
+            dw._set_window_mode("all")
+            root.update()
+            self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), (base_w, base_h))
+
+            dw.show_conversation(rep_b.conversation_id, place_near_parent=False)
+            root.update()
+            self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), (base_w, base_h))
+
+            # Right-hand close button must stay strictly inside locked window width
+            close_right = dw._btn_close.winfo_x() + dw._btn_close.winfo_width()
+            self.assertLessEqual(close_right, dw._hdr.winfo_width() + 2)
+            dw.close()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

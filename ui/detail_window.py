@@ -19,6 +19,10 @@ from core.log_monitor import (
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
+_READOUT_WIDTH_PROBE = (
+    "选定步 #9999 (11-21 01:50:10) │ [Hydrogen XH] │ 请求体 512.0K (+99.9K) "
+    "│ 缓存 100.0% [压缩重热] │ 首字 123.4s │ 999 t/s"
+)
 
 
 def _model_band_color(model_name: str, theme: Dict[str, str]) -> str:
@@ -83,6 +87,8 @@ class ConversationDetailWindow:
         self._chart_meta: Dict[str, Dict[str, Any]] = {}
         self._last_sync_sig: Optional[Tuple[Any, ...]] = None
         self._hovering_chart: bool = False
+        self._locked_size: Optional[Tuple[int, int]] = None
+        self._last_canvas_sizes: Dict[str, Tuple[int, int]] = {}
         self._drag_ox: int = 0
         self._drag_oy: int = 0
         self._win_ox: int = 0
@@ -93,6 +99,7 @@ class ConversationDetailWindow:
         self.win = tk.Toplevel(parent)
         self.win.title("单对话长线体检")
         self.win.overrideredirect(True)
+        self.win.resizable(False, False)
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.97)
         self.win.bind("<Escape>", lambda _e: self.close())
@@ -105,18 +112,12 @@ class ConversationDetailWindow:
 
         self._build_ui()
         self.apply_theme(theme)
+        self._lock_window_size()
 
     def _build_ui(self) -> None:
-        # Header bar (draggable)
+        # Header bar (draggable): pack right-side controls first so long titles can never push them out
         self._hdr = tk.Frame(self._surface)
         self._hdr.pack(fill="x", pady=(0, 8))
-
-        self._lbl_role = tk.Label(self._hdr, text="主对话", font=(UI_FONT, 8, "bold"), padx=6, pady=1)
-        self._lbl_role.pack(side="left", padx=(0, 6))
-        self._lbl_title = tk.Label(self._hdr, text="—", font=(UI_FONT, 10, "bold"), anchor="w")
-        self._lbl_title.pack(side="left")
-        self._lbl_sub = tk.Label(self._hdr, text="", font=(MONO_FONT, 8), anchor="w")
-        self._lbl_sub.pack(side="left", padx=(8, 0))
 
         self._btn_close = tk.Label(self._hdr, text="✕", font=(UI_FONT, 9, "bold"), padx=6, pady=1, cursor="hand2")
         self._btn_close.pack(side="right", padx=(6, 0))
@@ -132,6 +133,13 @@ class ConversationDetailWindow:
             b.pack(side="left", padx=(4, 0))
             b.bind("<Button-1>", lambda _e, m=mode: self._set_window_mode(m))
             self._range_btns[mode] = b
+
+        self._lbl_role = tk.Label(self._hdr, text="主对话", font=(UI_FONT, 8, "bold"), padx=6, pady=1)
+        self._lbl_role.pack(side="left", padx=(0, 6))
+        self._lbl_title = tk.Label(self._hdr, text="—", font=(UI_FONT, 10, "bold"), anchor="w")
+        self._lbl_title.pack(side="left")
+        self._lbl_sub = tk.Label(self._hdr, text="", font=(MONO_FONT, 8), anchor="w")
+        self._lbl_sub.pack(side="left", padx=(8, 0))
 
         for w in (self._hdr, self._lbl_role, self._lbl_title, self._lbl_sub):
             w.bind("<ButtonPress-1>", self._on_drag_start)
@@ -171,23 +179,23 @@ class ConversationDetailWindow:
             lt.pack(side="left")
             ll = tk.Label(top, text=legend, font=(UI_FONT, 8), anchor="e")
             ll.pack(side="right")
-            cv = tk.Canvas(frame, width=640, height=chart_heights[key], highlightthickness=0, bd=0, cursor="crosshair")
+            cv = tk.Canvas(frame, width=680, height=chart_heights[key], highlightthickness=0, bd=0, cursor="crosshair")
             cv.pack(fill="x")
             cv.bind("<Motion>", lambda e, k=key: self._on_chart_hover(k, e))
             cv.bind("<Leave>", lambda _e: self._clear_chart_crosshair())
             cv.bind("<Configure>", lambda _e, k=key: self._on_chart_configure(k))
             self._charts[key] = {"frame": frame, "top": top, "title": lt, "legend": ll, "canvas": cv}
 
-        # Live crosshair readout strip
+        # Live crosshair readout strip (measure with max-width probe first so locked width fits longest row)
         self._readout_box = tk.Frame(self._surface, padx=8, pady=5, highlightthickness=1)
         self._readout_box.pack(fill="x", pady=(0, 8))
         self._lbl_readout = tk.Label(
             self._readout_box,
-            text="移动鼠标到任意图表上可精准查看对应步号的上下文变化、TTFT、吞吐与缓存原因",
+            text=_READOUT_WIDTH_PROBE,
             font=(MONO_FONT, 8),
             anchor="w",
         )
-        self._lbl_readout.pack(fill="x")
+        self._lbl_readout.pack(fill="both", expand=True)
 
         # Bottom action buttons
         self._act_row = tk.Frame(self._surface)
@@ -241,12 +249,51 @@ class ConversationDetailWindow:
         if self._report is not None:
             self._render_report()
 
+    def _lock_window_size(self) -> Tuple[int, int]:
+        """Measure DPI-aware baseline dimensions once and permanently lock geometry to prevent width jitter."""
+        if self._locked_size is not None:
+            return self._locked_size
+        self.win.update_idletasks()
+        hdr_h = max(24, int(self._hdr.winfo_reqheight()))
+        readout_h = max(26, int(self._readout_box.winfo_reqheight()))
+        req_w = int(self.win.winfo_reqwidth())
+        req_h = int(self.win.winfo_reqheight())
+
+        if self._screen_bounds_fn is not None:
+            vx, vy, vr, vb = self._screen_bounds_fn(self._parent)
+            avail_w = max(640, (vr - vx) - 40)
+            avail_h = max(480, (vb - vy) - 64)
+        else:
+            avail_w = max(640, self._parent.winfo_screenwidth() - 40)
+            avail_h = max(480, self._parent.winfo_screenheight() - 64)
+
+        locked_w = min(avail_w, max(728, req_w + 16))
+        locked_h = min(avail_h, max(540, req_h))
+
+        # Freeze inner containers that carry variable-length text so label updates never resize the window
+        self._hdr.configure(height=hdr_h)
+        self._hdr.pack_propagate(False)
+        self._readout_box.configure(height=readout_h)
+        self._readout_box.pack_propagate(False)
+        self._outer.pack_propagate(False)
+
+        self._locked_size = (locked_w, locked_h)
+        self.win.minsize(locked_w, locked_h)
+        self.win.maxsize(locked_w, locked_h)
+        self.win.geometry(f"{locked_w}x{locked_h}")
+        self._lbl_readout.configure(
+            text="移动鼠标到任意图表上可精准查看对应步号的上下文变化、TTFT、吞吐与缓存原因"
+        )
+        self.win.update_idletasks()
+        return self._locked_size
+
     def show_conversation(self, conv_id: str, place_near_parent: bool = True) -> None:
         if self._closed:
             return
         self._conv_id = conv_id
         self._last_sync_sig = None
         self._hovering_chart = False
+        self._lock_window_size()
         self.win.deiconify()
         self.win.lift()
         self.win.update_idletasks()
@@ -254,6 +301,9 @@ class ConversationDetailWindow:
         self.win.update_idletasks()
         if place_near_parent:
             self._place_window()
+        else:
+            w, h = self._lock_window_size()
+            self.win.geometry(f"{w}x{h}+{self.win.winfo_x()}+{self.win.winfo_y()}")
         if self._apply_rounding_fn is not None:
             try:
                 self._apply_rounding_fn(int(self.win.winfo_id()))
@@ -275,6 +325,7 @@ class ConversationDetailWindow:
             round(conv.ttft_sec, 2) if conv.ttft_sec is not None else None,
             round(conv.tps, 1) if conv.tps is not None else None,
             conv.model_raw,
+            conv.title,
         )
         if sig != self._last_sync_sig:
             self._last_sync_sig = sig
@@ -288,6 +339,12 @@ class ConversationDetailWindow:
     def _on_chart_configure(self, chart_key: str) -> None:
         if self._closed or not self._display_points:
             return
+        cv = self._charts[chart_key]["canvas"]
+        cur_sz = (int(cv.winfo_width()), int(cv.winfo_height()))
+        if cur_sz[0] <= 20 or cur_sz[1] <= 20:
+            return
+        if self._last_canvas_sizes.get(chart_key) == cur_sz:
+            return
         if chart_key == "ctx":
             self._draw_context_chart(self._display_points)
         elif chart_key == "ttft":
@@ -296,9 +353,7 @@ class ConversationDetailWindow:
             self._draw_cache_chart(self._display_points)
 
     def _place_window(self) -> None:
-        self.win.update_idletasks()
-        w = self.win.winfo_reqwidth()
-        h = self.win.winfo_reqheight()
+        w, h = self._lock_window_size()
         if self._screen_bounds_fn is not None:
             vx, vy, vr, vb = self._screen_bounds_fn(self._parent)
         else:
@@ -314,7 +369,7 @@ class ConversationDetailWindow:
         else:
             x = max(vx + 12, min(vr - w - 12, (vx + vr - w) // 2))
         y = max(vy + 12, min(vb - h - 48, py))
-        self.win.geometry(f"+{x}+{y}")
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self._drag_ox = event.x_root
@@ -325,7 +380,8 @@ class ConversationDetailWindow:
     def _on_drag_move(self, event: tk.Event) -> None:
         nx = self._win_ox + (event.x_root - self._drag_ox)
         ny = self._win_oy + (event.y_root - self._drag_oy)
-        self.win.geometry(f"+{nx}+{ny}")
+        w, h = self._lock_window_size()
+        self.win.geometry(f"{w}x{h}+{nx}+{ny}")
 
     def _set_window_mode(self, mode: str) -> None:
         if mode not in ("60", "all"):
@@ -402,9 +458,9 @@ class ConversationDetailWindow:
         distinct_models = list(dict.fromkeys(p.model for p in rep.points if p.model))
         model_tag = f"{rep.model} (含{len(distinct_models)}模)" if len(distinct_models) >= 2 else rep.model
         if rep.title:
-            disp_name = truncate_display_width(rep.title, 26)
+            disp_name = truncate_display_width(rep.title, 20)
             self._lbl_title.configure(text=disp_name)
-            self._lbl_sub.configure(text=f"{rep.short_id} · {model_tag} · 总计 {rep.total_steps} 步 (今日 {rep.today_steps} 步)")
+            self._lbl_sub.configure(text=f"{rep.short_id} · {model_tag} · {rep.total_steps}步(今{rep.today_steps})")
             self.win.title(f"{rep.title} ({rep.short_id}) - 长线体检")
         else:
             self._lbl_title.configure(text=f"{rep.short_id} · {model_tag}")
@@ -421,13 +477,17 @@ class ConversationDetailWindow:
             round(rep.latest_ttft_sec, 2) if rep.latest_ttft_sec is not None else None,
             round(rep.latest_tps, 1) if rep.latest_tps is not None else None,
             rep.model_raw,
+            rep.title,
         )
 
         # Update dynamic model legend on TTFT chart header
         vis_models = list(dict.fromkeys(p.model for p in pts if p.model))
         if vis_models:
+            tags = [_short_model_tag(m) for m in vis_models[:3]]
+            if len(vis_models) > 3:
+                tags.append(f"+{len(vis_models) - 3}")
             self._charts["ttft"]["legend"].configure(
-                text="顶带模型: " + " / ".join(_short_model_tag(m) for m in vis_models[:4]) + " │ 绿<15s 青<45s 橙<90s 红≥90s"
+                text="顶带模型: " + " / ".join(tags) + " │ 绿<15s 青<45s 橙<90s 红≥90s"
             )
         else:
             self._charts["ttft"]["legend"].configure(text="绿<15s · 青15-45s · 橙45-90s · 红≥90s")
@@ -578,6 +638,7 @@ class ConversationDetailWindow:
         cv = self._charts["ctx"]["canvas"]
         cv.delete("all")
         w, h, pad_l, pad_r, pad_t, pad_b = self._chart_geometry(cv)
+        self._last_canvas_sizes["ctx"] = (w, h)
         pad_t = 16
         plot_w = max(20, w - pad_l - pad_r)
         plot_h = max(20, h - pad_t - pad_b)
@@ -631,6 +692,7 @@ class ConversationDetailWindow:
         cv = self._charts["ttft"]["canvas"]
         cv.delete("all")
         w, h, pad_l, pad_r, pad_t, pad_b = self._chart_geometry(cv)
+        self._last_canvas_sizes["ttft"] = (w, h)
         pad_t = 22
         plot_w = max(20, w - pad_l - pad_r)
         plot_h = max(20, h - pad_t - pad_b)
@@ -703,6 +765,7 @@ class ConversationDetailWindow:
         cv = self._charts["cache"]["canvas"]
         cv.delete("all")
         w, h, pad_l, pad_r, pad_t, pad_b = self._chart_geometry(cv)
+        self._last_canvas_sizes["cache"] = (w, h)
         plot_w = max(20, w - pad_l - pad_r)
         plot_h = max(20, h - pad_t - pad_b)
         self._chart_meta["cache"] = {"pad_l": pad_l, "plot_w": plot_w, "pad_t": pad_t, "plot_h": plot_h}
