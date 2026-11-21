@@ -161,7 +161,6 @@ class ConversationDetailWindow:
         self._display_points: List[ConversationDetailPoint] = []
         self._chart_meta: Dict[str, Dict[str, Any]] = {}
         self._last_sync_sig: Optional[Tuple[Any, ...]] = None
-        self._last_view_key: Tuple[str, str] = ("", "30m")
         self._is_historical_badge: bool = False
         self._hovering_chart: bool = False
         self._locked_size: Optional[Tuple[int, int]] = None
@@ -376,21 +375,17 @@ class ConversationDetailWindow:
             self._lbl_live_tag.configure(text="● 实时", bg=t["green_bg"], fg=t["green"])
 
     @staticmethod
-    def _build_sync_sig(conv: Any, snap: MonitorSnapshot) -> Tuple[Any, ...]:
+    def _build_sync_sig(conv: Any, _snap: MonitorSnapshot) -> Tuple[Any, ...]:
+        # Track ONLY view-independent full-conversation identity + latest TTFT/TPS so switching
+        # left-panel account/range filters never causes redundant reloads, yet delayed SQLite WAL
+        # TTFT flushes still update the open detail window.
         return (
             conv.conversation_id,
-            conv.total_step_count,
             getattr(conv, "full_step_count", conv.total_step_count),
-            round(conv.latest_timestamp, 2),
             round(getattr(conv, "full_latest_timestamp", conv.latest_timestamp), 2),
-            conv.context_tokens,
-            round(conv.latest_hit_rate, 1),
             round(conv.ttft_sec, 2) if conv.ttft_sec is not None else None,
             round(conv.tps, 1) if conv.tps is not None else None,
-            conv.model_raw,
             conv.title,
-            snap.view_account,
-            snap.history_range,
         )
 
     def show_conversation(
@@ -404,9 +399,7 @@ class ConversationDetailWindow:
         self._conv_id = conv_id
         self._last_sync_sig = None
         self._hovering_chart = False
-        if initial_snap is not None:
-            self._last_view_key = (initial_snap.view_account, initial_snap.history_range)
-            self._set_live_badge(bool(initial_snap.is_custom_account_view or initial_snap.history_range != "30m"))
+        self._set_live_badge(False)
         self._lock_window_size()
         self.win.deiconify()
         self.win.lift()
@@ -428,21 +421,32 @@ class ConversationDetailWindow:
             except Exception:
                 pass
 
+    def _tick_own_freshness_kpi(self, now_ts: float) -> None:
+        """Keep the detail window's own freshness countdown ticking even if left panel switches to another account."""
+        rep = self._report
+        if rep is None or not rep.points:
+            return
+        latest_pt = rep.points[-1]
+        latest_tps = self._current_wstats.get("latest_tps")
+        if latest_tps is None:
+            latest_tps = rep.latest_tps
+        if rep.freshness_invalid_reason:
+            self._update_freshness_kpi(None, rep.freshness_invalid_reason, latest_tps)
+            return
+        if rep.freshness_remaining_sec is not None and latest_pt.timestamp > 0:
+            rem = int(round(rep.freshness_window_sec - (now_ts - latest_pt.timestamp)))
+            self._update_freshness_kpi(max(0, rem), "", latest_tps)
+
     def sync_from_snapshot(self, snap: MonitorSnapshot) -> None:
         """Keep the open detail modal dynamically in sync with the main 2.5s poll loop."""
         if self._closed or not self._conv_id:
             return
-        is_hist_view = bool(snap.is_custom_account_view or snap.history_range != "30m")
-        self._set_live_badge(is_hist_view)
-        view_key = (snap.view_account, snap.history_range)
         conv = next((c for c in snap.active_conversations if c.conversation_id == self._conv_id), None)
         if conv is None:
-            if view_key != self._last_view_key:
-                self._last_view_key = view_key
-                self._last_sync_sig = None
-                self.refresh()
+            # Left panel may be filtered to another account; still keep this conversation's own freshness ticking!
+            self._tick_own_freshness_kpi(snap.generated_at)
+            self._sync_pin_button()
             return
-        self._last_view_key = view_key
         sig = self._build_sync_sig(conv, snap)
         if sig != self._last_sync_sig:
             self._last_sync_sig = sig
@@ -452,10 +456,10 @@ class ConversationDetailWindow:
             latest_tps = self._current_wstats.get("latest_tps")
             if latest_tps is None:
                 latest_tps = self._report.latest_tps if self._report is not None else conv.tps
-            if is_hist_view:
-                self._update_freshness_kpi(None, "", latest_tps)
-            else:
+            if not (snap.is_custom_account_view or snap.history_range != "30m"):
                 self._update_freshness_kpi(conv.freshness_remaining_sec, conv.freshness_invalid_reason, latest_tps)
+            else:
+                self._tick_own_freshness_kpi(snap.generated_at)
             self._sync_pin_button()
 
     def _on_chart_configure(self, chart_key: str) -> None:

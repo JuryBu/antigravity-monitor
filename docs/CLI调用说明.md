@@ -39,6 +39,9 @@ python -B main.py --json --readonly --conversation-id <id>
 | `--conversation-id <id>` | 定向附带指定对话（支持完整 UUID 或不区分大小写的前缀匹配）的实时上下文大小、最新请求体增量（`latest_context_delta`）、缓存命中、TTFT、保鲜倒计时及近 10 步明细，即使该对话不在最近 24 条活跃会话内也会按需定位读取 |
 | `--account <label>` | 定向查看某单独历史账号（如 `al***1`、`be***2`，或 `__all__` 查看全机合并视图）的专属评级、对话、步数与日志；省略则自动跟随当前在线账号（刚换号尚无新步时自动沿用该号最近历史活跃数据定级） |
 | `--range {30m,6h,today,7d}` | 指定观测时间范围，默认 `30m`（实时模式）；可选 `6h` / `today` / `7d` 历史范围 |
+| `--clean-subagents` | 显式触发安全清理超过保护期的已结束老旧子代理以腾出本机 500 槽位（遵守 6 重防误删校验，绝不触碰主对话或未知 `.db`；默认移入系统回收站，按配置支持 `archive` / `delete`） |
+| `--dry-run` | 配合 `--clean-subagents` 仅预览待清理条数与预计释放空间，严格零写盘 |
+| `--min-age <minutes>` | 配合 `--clean-subagents` 指定保护期（分钟；硬下限锁死 `>= 30` 分钟，`0` 或省略沿用配置默认 `120` 分钟） |
 
 ---
 
@@ -104,9 +107,11 @@ python -B main.py --json --readonly --conversation-id <id>
 
 - **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
 - **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`）。
-- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（5m 流超时）、`403`、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；切换账号时前序账号的 503/超时不会连坐新号，同号内 503 后若当前模型连续稳定恢复响应且 TTFT 正常则自动从 `T2` 降级观察直至回绿。
-- **`models_recent`**：数组，按当前账号近 30 分钟内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg` 与 `steps_after_last_t2`（最近一次 503/超时后的成功步数）。
-- **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常时至少包含当前状态诊断条目。
+- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，并按 `±6s` 反查出事对话短 ID 与标题）、`403`、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；单次流超时或单次 503 报 `WARN`，累计 `>= 2` 次（`503 + timeout >= 2`）才升红 `T2`，且仅当主对话同档/主力模型事后连续稳定响应（中位 TTFT `< 45s`，排除子代理与轻量免疫模型洗白）时才稳定降级观察防反复横跳。
+- **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
+- **`models_recent`**：数组，按当前账号观测范围内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg`、`steps_after_last_t2`（最近一次 503/超时后的成功步数）与 `ttft_after_last_t2_median`（事后中位 TTFT，防多模态单步长尾误判）。
+- **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常或 `slots.main_at_risk == true` 时保证包含对应高危告警条目。
+- **`--clean-subagents --json` 输出**：返回 `{ok, dry_run, mode, protect_age_min, candidate_count, removed_count, freed_bytes, skipped_locked_count, skipped_changed_count, remaining_db_count, archive_path, error}`（与 `--readonly` 冲突且未带 `--dry-run` 时返回 `ok: false` 与退出码 `2`）。
 
 ### 4. `counts`、`active_conversations` 与 `target_conversation`
 

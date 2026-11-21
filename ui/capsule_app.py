@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+from tkinter import messagebox
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -25,8 +26,10 @@ from core.log_monitor import (
     format_tokens,
     truncate_display_width,
 )
+from core.slot_manager import SlotCleanupResult, SlotInventorySnapshot, format_bytes_human
 from core.startup_manager import is_startup_enabled, set_startup_enabled
 from ui.detail_window import ConversationDetailWindow
+from ui.slots_window import ConversationSlotsWindow
 from ui.themes import THEMES, get_theme
 
 UI_FONT = "Microsoft YaHei UI"
@@ -141,6 +144,8 @@ class AntigravityCapsuleApp:
         self._latest_snapshot: Optional[MonitorSnapshot] = None
         self._last_steps_pct: int = 0
         self._last_steps_color: str = self.theme["green"]
+        self._last_slots_pct: int = 0
+        self._last_slots_color: str = self.theme["green"]
         self._startup_cached: bool = is_startup_enabled()
         self._startup_busy: bool = False
 
@@ -182,6 +187,7 @@ class AntigravityCapsuleApp:
         self._var_startup = tk.BooleanVar(value=self._startup_cached)
         self._var_notifications = tk.BooleanVar(value=bool(self.config["notifications_enabled"]))
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
+        self._var_auto_clean = tk.BooleanVar(value=bool(self.config.get("slot_auto_clean_enabled", True)))
 
         self._tooltip_win: Optional[tk.Toplevel] = None
         self._conv_hover_texts: List[str] = []
@@ -190,7 +196,13 @@ class AntigravityCapsuleApp:
         self._pinned_conv_id: Optional[str] = None
         self._fresh_hover_text: str = ""
         self._speed_hover_text: str = ""
+        self._slots_hover_text: str = ""
         self._detail_win: Optional[ConversationDetailWindow] = None
+        self._slots_win: Optional[ConversationSlotsWindow] = None
+        self._slots_cleaning_busy: bool = False
+        self._auto_clean_thread: Optional[threading.Thread] = None
+        self._last_main_risk_alerted: bool = False
+        self._ctx_clean_menu_idx: Optional[int] = None
         self._conv_filter: str = str(self.config.get("conv_filter", "main"))
         self._view_account: str = ""
         self._history_range: str = "30m"
@@ -252,7 +264,12 @@ class AntigravityCapsuleApp:
         self._sep4 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep4.pack(side="left")
         self._lbl_bar_steps = tk.Label(self._bar, text="0/1000", font=(MONO_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_secondary"])
-        self._lbl_bar_steps.pack(side="left", padx=(0, 8))
+        self._lbl_bar_steps.pack(side="left", padx=(0, 6))
+
+        self._sep5 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
+        self._lbl_bar_slots = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["orange"], cursor="hand2")
+        self._lbl_bar_slots.bind("<Button-1>", lambda _e: self.open_slots_window())
+        self._lbl_bar_slots.bind("<Button-3>", self._show_context_menu)
 
         self._btn_hide = tk.Label(self._bar, text="—", font=(UI_FONT, 9, "bold"), padx=5, pady=1, cursor="hand2")
         self._btn_hide.pack(side="right", padx=(2, 0))
@@ -342,6 +359,71 @@ class AntigravityCapsuleApp:
         self._steps_canvas = tk.Canvas(self._card_head, height=7, highlightthickness=0, bd=0)
         self._steps_canvas.pack(fill="x")
         self._steps_canvas.bind("<Configure>", lambda _e: self._draw_steps_progress(self._last_steps_pct, self._last_steps_color))
+
+        head_row_slots = tk.Frame(self._card_head)
+        head_row_slots.pack(fill="x", pady=(6, 3))
+        self._lbl_slots_title = tk.Label(
+            head_row_slots,
+            text="本地会话槽位 (详情 ▾)",
+            font=(UI_FONT, 8),
+            cursor="hand2",
+        )
+        self._lbl_slots_title.pack(side="left")
+        self._lbl_slots_title.bind("<Button-1>", lambda _e: self.open_slots_window())
+
+        self._btn_slots_auto = tk.Label(
+            head_row_slots,
+            text="自动:开",
+            font=(UI_FONT, 7, "bold"),
+            padx=5,
+            pady=1,
+            cursor="hand2",
+        )
+        self._btn_slots_auto.pack(side="right", padx=(4, 0))
+        self._btn_slots_auto.bind("<Button-1>", lambda _e: self.toggle_auto_clean_slots())
+
+        self._btn_slots_clean = tk.Label(
+            head_row_slots,
+            text="清理",
+            font=(UI_FONT, 7, "bold"),
+            padx=5,
+            pady=1,
+            cursor="hand2",
+        )
+        self._btn_slots_clean.pack(side="right", padx=(5, 0))
+        self._btn_slots_clean.bind("<Button-1>", lambda _e: self.trigger_manual_subagent_cleanup())
+
+        self._lbl_slots_val = tk.Label(
+            head_row_slots,
+            text="— / 500",
+            font=(MONO_FONT, 8, "bold"),
+            cursor="hand2",
+        )
+        self._lbl_slots_val.pack(side="right")
+        self._lbl_slots_val.bind("<Button-1>", lambda _e: self.open_slots_window())
+
+        self._slots_canvas = tk.Canvas(self._card_head, height=7, highlightthickness=0, bd=0, cursor="hand2")
+        self._slots_canvas.pack(fill="x")
+        self._slots_canvas.bind("<Configure>", lambda _e: self._draw_slots_progress(self._last_slots_pct, self._last_slots_color))
+        self._slots_canvas.bind("<Button-1>", lambda _e: self.open_slots_window())
+
+        for slw in (self._lbl_slots_title, self._lbl_slots_val, self._slots_canvas):
+            slw.bind("<Enter>", self._show_slots_tooltip)
+            slw.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
+
+        self._slot_risk_frame = tk.Frame(self._card_head, padx=7, pady=4, highlightthickness=1, cursor="hand2")
+        self._lbl_slot_risk = tk.Label(
+            self._slot_risk_frame,
+            text="",
+            font=(UI_FONT, 8, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=640,
+            cursor="hand2",
+        )
+        self._lbl_slot_risk.pack(fill="x")
+        self._slot_risk_frame.bind("<Button-1>", lambda _e: self.open_slots_window())
+        self._lbl_slot_risk.bind("<Button-1>", lambda _e: self.open_slots_window())
 
         # --- Module 2: 2-Column Diagnostics (Real-time Speed + Large Context Freshness) ---
         self._mid_row = tk.Frame(self._details)
@@ -501,7 +583,7 @@ class AntigravityCapsuleApp:
         self._log_cells: Dict[str, Dict[str, Any]] = {}
         cell_specs = [
             ("503", "503 限流"),
-            ("timeout", "5m 超时"),
+            ("timeout", "流超时"),
             ("403", "403 封禁"),
             ("retry", "代理重试"),
         ]
@@ -585,6 +667,11 @@ class AntigravityCapsuleApp:
         self._ctx_menu.add_checkbutton(label="开机自启动", variable=self._var_startup, command=self.toggle_startup)
         self._ctx_menu.add_checkbutton(label="启动时缩进托盘", variable=self._var_start_min, command=self.toggle_start_minimized)
         self._ctx_menu.add_checkbutton(label="启用异常通知", variable=self._var_notifications, command=self.toggle_notifications)
+        self._ctx_menu.add_checkbutton(label="自动清理老旧子代理", variable=self._var_auto_clean, command=self.toggle_auto_clean_slots)
+        self._ctx_menu.add_separator()
+        self._ctx_menu.add_command(label="查看本机 500 槽位详情", command=self.open_slots_window)
+        self._ctx_menu.add_command(label=self._format_clean_menu_label(), command=self.trigger_manual_subagent_cleanup)
+        self._ctx_clean_menu_idx = self._ctx_menu.index("end")
         self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="立即刷新采样", command=self.request_immediate_poll)
         self._ctx_menu.add_command(label="复制文字体检摘要", command=self.copy_summary_to_clipboard)
@@ -604,12 +691,13 @@ class AntigravityCapsuleApp:
         self._lbl_bar_status.configure(bg=t["panel_bg"])
         self._lbl_bar_cache_k.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._lbl_bar_cache_v.configure(bg=t["panel_bg"])
-        for sep in (self._sep1, self._sep2, self._sep3, self._sep4):
+        for sep in (self._sep1, self._sep2, self._sep3, self._sep4, self._sep5):
             sep.configure(bg=t["panel_bg"], fg=t["divider"])
         self._lbl_bar_tps.configure(bg=t["panel_bg"])
         self._lbl_bar_fresh.configure(bg=t["panel_bg"])
         self._lbl_bar_acc.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._lbl_bar_steps.configure(bg=t["panel_bg"], fg=t["text_secondary"])
+        self._lbl_bar_slots.configure(bg=t["panel_bg"])
         for b in (self._btn_expand, self._btn_hide):
             b.configure(bg=t["panel_bg"], fg=t["text_secondary"])
 
@@ -621,7 +709,7 @@ class AntigravityCapsuleApp:
         for card in (self._card_head, self._card_speed, self._card_fresh, self._card_convs, self._card_logs):
             card.configure(bg=t["card_bg"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
             for child in card.winfo_children():
-                if isinstance(child, tk.Frame) and child not in (self._banner_frame,):
+                if isinstance(child, tk.Frame) and child not in (self._banner_frame, self._slot_risk_frame):
                     child.configure(bg=t["card_bg"])
 
         self._lbl_headline.configure(bg=t["card_bg"])
@@ -642,6 +730,13 @@ class AntigravityCapsuleApp:
         self._lbl_steps_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_steps_val.configure(bg=t["card_bg"], fg=t["text_primary"])
         self._steps_canvas.configure(bg=t["card_bg"])
+        self._lbl_slots_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
+        self._lbl_slots_val.configure(bg=t["card_bg"], fg=t["text_primary"])
+        self._btn_slots_clean.configure(bg=t["btn_bg"], fg=t["btn_text"])
+        self._slots_canvas.configure(bg=t["card_bg"])
+        self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
+        self._lbl_slot_risk.configure(bg=t["red_bg"], fg=t["red"])
+        self._sync_slots_auto_button()
 
         self._lbl_speed_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_pin_badge.configure(bg=t["btn_hover"], fg=t["cyan"])
@@ -722,11 +817,30 @@ class AntigravityCapsuleApp:
         y = max(vy + 4, min(vb - h - 44, int(y)))
         self.root.geometry(f"+{x}+{y}")
 
+    def _format_clean_menu_label(self) -> str:
+        age = max(30, int(self.config.get("slot_protect_age_min", 120)))
+        age_s = f"{age // 60}h" if age % 60 == 0 else f"{age}m"
+        return f"立即清理 {age_s} 外子代理"
+
     def _clamp_window_to_screen(self) -> None:
         self.root.update_idletasks()
         vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
+        avail_h = max(240, (vb - 48) - (vy + 4))
         w = self.root.winfo_reqwidth()
         h = self.root.winfo_reqheight()
+        # If expanded panel exceeds available monitor height (e.g. high DPI + many rows + risk banner),
+        # shrink the scrollable conversation viewport so bottom action buttons & resize grip stay reachable.
+        if self._expanded and h > avail_h:
+            cur_vp_h = int(self._conv_viewport.winfo_reqheight())
+            overflow = h - avail_h
+            new_vp_h = max(48, cur_vp_h - overflow)
+            if new_vp_h < cur_vp_h:
+                self._conv_viewport.configure(height=new_vp_h)
+                self._conv_scrollbar.configure(height=new_vp_h)
+                self._sync_custom_scrollbar()
+                self.root.update_idletasks()
+                w = self.root.winfo_reqwidth()
+                h = self.root.winfo_reqheight()
         cur_x = self.root.winfo_x()
         cur_y = self.root.winfo_y()
         new_x = max(vx + 4, min(vr - w - 4, cur_x))
@@ -762,6 +876,12 @@ class AntigravityCapsuleApp:
         self._var_startup.set(self._startup_cached)
         self._var_start_min.set(bool(self.config["start_minimized"]))
         self._var_notifications.set(bool(self.config["notifications_enabled"]))
+        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
+        if self._ctx_clean_menu_idx is not None:
+            try:
+                self._ctx_menu.entryconfigure(self._ctx_clean_menu_idx, label=self._format_clean_menu_label())
+            except tk.TclError:
+                pass
         try:
             self._ctx_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -792,12 +912,19 @@ class AntigravityCapsuleApp:
             self._detail_win = None
             dw.close()
 
+    def _close_slots_window(self) -> None:
+        if self._slots_win is not None:
+            sw = self._slots_win
+            self._slots_win = None
+            sw.close()
+
     def hide_window(self) -> None:
         if self._closing:
             return
         self._visible = False
         self._hide_conv_tooltip()
         self._close_detail_window()
+        self._close_slots_window()
         self.root.withdraw()
 
     def toggle_visible(self) -> None:
@@ -814,6 +941,7 @@ class AntigravityCapsuleApp:
         else:
             self._hide_conv_tooltip()
             self._close_detail_window()
+            self._close_slots_window()
             self._details.pack_forget()
             self._btn_expand.configure(text="▾")
         self._clamp_window_to_screen()
@@ -836,6 +964,8 @@ class AntigravityCapsuleApp:
         self._apply_theme_colors()
         if self._detail_win is not None:
             self._detail_win.apply_theme(self.theme)
+        if self._slots_win is not None:
+            self._slots_win.apply_theme(self.theme)
         if self._latest_snapshot is not None:
             self.render_snapshot(self._latest_snapshot)
         if self.tray is not None:
@@ -869,6 +999,191 @@ class AntigravityCapsuleApp:
         if self.tray is not None:
             self.tray.refresh_menu()
 
+    def _sync_slots_auto_button(self) -> None:
+        t = self.theme
+        enabled = bool(self.config.get("slot_auto_clean_enabled", True))
+        self._var_auto_clean.set(enabled)
+        if enabled:
+            self._btn_slots_auto.configure(text="自动:开", bg=t["green_bg"], fg=t["green"])
+        else:
+            self._btn_slots_auto.configure(text="自动:关", bg=t["card_alt_bg"], fg=t["text_muted"])
+
+    def toggle_auto_clean_slots(self) -> None:
+        self.config["slot_auto_clean_enabled"] = not bool(self.config.get("slot_auto_clean_enabled", True))
+        self.config_store.save(self.config)
+        self.engine.update_config(self.config)
+        self._sync_slots_auto_button()
+        if self._slots_win is not None and not self._slots_win._closed:
+            self._slots_win.sync_auto_button()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+
+    def open_slots_window(self) -> None:
+        if self._closing:
+            return
+        self._hide_conv_tooltip()
+        if self._slots_win is None or self._slots_win._closed:
+            def _on_closed() -> None:
+                self._slots_win = None
+
+            self._slots_win = ConversationSlotsWindow(
+                parent=self.root,
+                theme=self.theme,
+                load_inventory=lambda: self.engine.read_slot_inventory(include_items=True, force=True),
+                on_clean_now=self._run_manual_clean_async,
+                is_auto_clean_enabled=lambda: bool(self.config.get("slot_auto_clean_enabled", True)),
+                on_toggle_auto_clean=self.toggle_auto_clean_slots,
+                get_protect_age_min=lambda: max(30, int(self.config.get("slot_protect_age_min", 120))),
+                get_clean_mode=lambda: str(self.config.get("slot_clean_mode", "recycle")),
+                on_closed=_on_closed,
+                apply_rounding_fn=_apply_win11_rounded_corners,
+                screen_bounds_fn=_get_virtual_screen_bounds,
+                async_refresh=True,
+            )
+            self._slots_win.show(place_near_parent=True)
+        else:
+            self._slots_win.show(place_near_parent=False)
+
+    def _run_manual_clean_async(self, on_done: Optional[Callable[[SlotCleanupResult], None]] = None) -> None:
+        import time as _time
+        if self._slots_cleaning_busy:
+            if on_done is not None:
+                busy_res = SlotCleanupResult(
+                    started_at=_time.time(),
+                    finished_at=_time.time(),
+                    trigger="manual",
+                    mode=str(self.config.get("slot_clean_mode", "recycle")),
+                    protect_age_min=max(30, int(self.config.get("slot_protect_age_min", 120))),
+                    dry_run=False,
+                    error="cleanup_already_running",
+                )
+                self.dispatch_to_ui(lambda: on_done(busy_res))
+            return
+        self._slots_cleaning_busy = True
+
+        def _worker() -> None:
+            res: SlotCleanupResult
+            try:
+                res = self.engine.clean_old_subagents(
+                    trigger="manual",
+                    dry_run=False,
+                    stop_event=self._stop_event,
+                )
+            except Exception as exc:
+                now_t = _time.time()
+                res = SlotCleanupResult(
+                    started_at=now_t,
+                    finished_at=now_t,
+                    trigger="manual",
+                    mode=str(self.config.get("slot_clean_mode", "recycle")),
+                    protect_age_min=max(30, int(self.config.get("slot_protect_age_min", 120))),
+                    dry_run=False,
+                    error=str(exc),
+                )
+
+            def _finish() -> None:
+                self._slots_cleaning_busy = False
+                if self._closing:
+                    return
+                self.request_immediate_poll()
+                if on_done is not None:
+                    try:
+                        on_done(res)
+                    except Exception:
+                        pass
+
+            self.dispatch_to_ui(_finish)
+
+        threading.Thread(target=_worker, name="SlotCleanupThread", daemon=True).start()
+
+    def trigger_manual_subagent_cleanup(self) -> None:
+        if self._closing or self._slots_cleaning_busy:
+            return
+        if self.engine.read_only:
+            messagebox.showwarning(
+                "只读模式禁止清理",
+                "当前监控以 --readonly 严格只读模式运行，已禁止执行任何本地文件清理操作。",
+                parent=self.root,
+            )
+            return
+        self._btn_slots_clean.configure(text="盘点中…", fg=self.theme["orange"])
+
+        def _scan_bg() -> None:
+            try:
+                inv = self.engine.read_slot_inventory(include_items=True, force=True)
+            except Exception as exc:
+                self.dispatch_to_ui(
+                    lambda: (
+                        self._btn_slots_clean.configure(text="清理", fg=self.theme["btn_text"]),
+                        messagebox.showwarning("盘点失败", str(exc), parent=self.root),
+                    )
+                    if not self._closing
+                    else None
+                )
+                return
+
+            def _prompt_and_clean() -> None:
+                if self._closing:
+                    return
+                self._btn_slots_clean.configure(text="清理", fg=self.theme["btn_text"])
+                protect_min = max(30, int(self.config.get("slot_protect_age_min", 120)))
+                if not inv.summary_db_ok:
+                    messagebox.showwarning(
+                        "无法执行安全清理",
+                        f"未能读取本地 conversation_summaries.db（{inv.summary_db_error or '文件不可读'}），为保护主对话已中止清理。",
+                        parent=self.root,
+                    )
+                    return
+                if inv.cleanable_sub_count <= 0:
+                    self.open_slots_window()
+                    if self._slots_win is not None and not self._slots_win._closed:
+                        self._slots_win.set_status_message(
+                            f"当前没有超过 {protect_min} 分钟的可清理子代理（主对话 {inv.main_count} / 保护中子代理 {inv.protected_sub_count}）",
+                            "text_secondary",
+                        )
+                    return
+                mode_map = {
+                    "recycle": "移入 Windows 系统回收站（可随时还原）",
+                    "archive": "先打 tar + SHA-256 复验再删除",
+                    "delete": "直接删除",
+                }
+                mode_desc = mode_map.get(str(self.config.get("slot_clean_mode", "recycle")), "移入 Windows 系统回收站")
+                ok = messagebox.askyesno(
+                    "确认清理历史子代理",
+                    (
+                        f"准备安全让位 {inv.cleanable_sub_count} 条已结束老旧子代理（超过 {protect_min} 分钟，约 {format_bytes_human(inv.cleanable_bytes)}）。\n\n"
+                        f"• 清理方式：{mode_desc}\n"
+                        f"• 永久保护：{inv.main_count} 条主对话、{inv.protected_sub_count} 条保护中子代理、{inv.unknown_count} 条未知文件（0 受影响）\n"
+                        f"• 遇进程句柄占用将自动跳过，绝不强杀 Antigravity\n\n"
+                        "确认立即执行吗？"
+                    ),
+                    parent=self.root,
+                )
+                if not ok:
+                    return
+                self._btn_slots_clean.configure(text="清理中…", fg=self.theme["orange"])
+
+                def _after_clean(res: SlotCleanupResult) -> None:
+                    if self._closing:
+                        return
+                    self._btn_slots_clean.configure(text="清理", fg=self.theme["btn_text"])
+                    if res.error:
+                        msg = f"子代理清理中止：{res.error}"
+                    else:
+                        skip = f"（跳过占用 {res.skipped_locked_count}）" if res.skipped_locked_count else ""
+                        msg = f"已让位 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，剩余 {res.remaining_db_count} 槽{skip}"
+                    if self._expanded:
+                        self._lbl_banner.configure(text=msg, fg=self.theme["red"] if res.error else self.theme["green"])
+                    if self._slots_win is not None and not self._slots_win._closed:
+                        self._slots_win.refresh()
+                        self._slots_win.set_status_message(msg, "red" if res.error else "green")
+
+                self._run_manual_clean_async(_after_clean)
+
+            self.dispatch_to_ui(_prompt_and_clean)
+
+        threading.Thread(target=_scan_bg, name="SlotPreCleanScanThread", daemon=True).start()
+
     def toggle_startup(self) -> None:
         """Toggle Windows Startup shortcut asynchronously so PowerShell COM never blocks UI."""
         if self._startup_busy:
@@ -887,6 +1202,8 @@ class AntigravityCapsuleApp:
 
             def _finish() -> None:
                 self._startup_busy = False
+                if self._closing:
+                    return
                 self._startup_cached = actual
                 self._var_startup.set(actual)
                 if self.tray is not None:
@@ -995,17 +1312,15 @@ class AntigravityCapsuleApp:
         if cur_view:
             auto_lbl = auto_lbl.replace("● ", "   ")
         menu.add_command(label=auto_lbl, command=lambda: self.set_view_account(""))
-        if known:
+        other_accounts = [
+            acc for acc in known
+            if not (cur_online and acc.lower() == cur_online.lower())
+        ]
+        if other_accounts:
             menu.add_separator()
-            for acc in known:
-                is_cur_online = bool(cur_online and acc.lower() == cur_online.lower())
-                if is_cur_online:
-                    # Selecting the active online account maps cleanly to auto-follow ("") to avoid ghost lock
-                    mark = "● " if (not cur_view or cur_view.lower() == acc.lower()) else "   "
-                    menu.add_command(label=f"{mark}{acc} (当前在线 · 自动跟随)", command=lambda: self.set_view_account(""))
-                else:
-                    mark = "● " if (cur_view and cur_view.lower() == acc.lower()) else "   "
-                    menu.add_command(label=f"{mark}{acc} (历史记录)", command=lambda a=acc: self.set_view_account(a))
+            for acc in other_accounts:
+                mark = "● " if (cur_view and cur_view.lower() == acc.lower()) else "   "
+                menu.add_command(label=f"{mark}{acc} (历史记录)", command=lambda a=acc: self.set_view_account(a))
         menu.add_separator()
         all_mark = "● " if cur_view == "__all__" else "   "
         menu.add_command(label=f"{all_mark}全机合并视角", command=lambda: self.set_view_account("__all__"))
@@ -1013,6 +1328,7 @@ class AntigravityCapsuleApp:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+            self.root.after(500, lambda m=menu: m.destroy() if m.winfo_exists() else None)
 
     def restart_app(self) -> None:
         cb = self._on_restart
@@ -1150,15 +1466,56 @@ class AntigravityCapsuleApp:
         step_text_color = step_bar_color if snap.today_steps >= snap.daily_steps_warn else t["text_secondary"]
         self._lbl_bar_steps.configure(text=f"{snap.today_steps}/{snap.daily_steps_alert}", fg=step_text_color)
 
+        inv = snap.slot_inventory
+        bar_slots_was_visible = bool(self._lbl_bar_slots.winfo_manager())
+        bar_slots_now_visible = False
+        if inv is not None and (inv.main_at_risk or inv.status in ("warn", "danger")):
+            bar_slots_now_visible = True
+            if inv.main_at_risk:
+                bar_slot_txt = f"槽位危 {inv.total_db}/{inv.cap}!"
+                bar_slot_col = t["red"]
+            elif inv.status == "danger":
+                bar_slot_txt = f"槽位 {inv.total_db}/{inv.cap}"
+                bar_slot_col = t["red"]
+            else:
+                bar_slot_txt = f"槽位 {inv.total_db}/{inv.cap}"
+                bar_slot_col = t["orange"]
+            self._lbl_bar_slots.configure(text=bar_slot_txt, fg=bar_slot_col)
+            if not self._sep5.winfo_manager():
+                self._sep5.pack(side="left", after=self._lbl_bar_steps)
+            if not self._lbl_bar_slots.winfo_manager():
+                self._lbl_bar_slots.pack(side="left", padx=(0, 6), after=self._sep5)
+        else:
+            if self._lbl_bar_slots.winfo_manager():
+                self._lbl_bar_slots.pack_forget()
+            if self._sep5.winfo_manager():
+                self._sep5.pack_forget()
+        if bar_slots_now_visible != bar_slots_was_visible:
+            self._clamp_window_to_screen()
+
+        # High-priority main-conversation eviction risk guard: proactively surface HUD once even if muted/minimized!
+        if inv is not None and inv.main_at_risk:
+            if not self._last_main_risk_alerted:
+                self._last_main_risk_alerted = True
+                if not self._visible:
+                    self.show_window()
+                if not self._expanded:
+                    self.set_expanded(True)
+        else:
+            self._last_main_risk_alerted = False
+
         if self.tray is not None:
             hit_s = f"{snap.primary_hit_rate:.1f}%" if snap.primary_hit_rate is not None else "—"
             tps_s = f"{snap.primary_tps:.0f}t/s" if snap.primary_tps is not None else "—"
-            tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {snap.today_steps}步"
-            self.tray.update_status(snap.level if snap.level in ("green", "orange", "red") else "green", tip)
+            slot_tip = f" | 槽位 {inv.total_db}/{inv.cap}" if inv is not None else ""
+            tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {snap.today_steps}步{slot_tip}"
+            tray_lvl = "red" if (inv is not None and inv.main_at_risk) else (snap.level if snap.level in ("green", "orange", "red") else "green")
+            self.tray.update_status(tray_lvl, tip)
 
-            if self.config["notifications_enabled"] and snap.alerts:
-                for _key, title, msg in snap.alerts:
-                    self.tray.notify(title, msg)
+            if snap.alerts:
+                for key, title, msg in snap.alerts:
+                    if self.config["notifications_enabled"] or key.startswith("slot:main_risk:"):
+                        self.tray.notify(title, msg)
 
         if not self._expanded:
             return
@@ -1224,6 +1581,53 @@ class AntigravityCapsuleApp:
         self._last_steps_pct = pct
         self._last_steps_color = step_bar_color
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
+
+        # Module 1B: Local 500-slot conversation pool guard
+        self._sync_slots_auto_button()
+        if inv is not None:
+            slot_pct = min(100, int(round((inv.total_db / max(1, inv.cap)) * 100.0)))
+            slot_bar_col = compute_steps_color(
+                inv.total_db,
+                int(self.config.get("slot_warn_threshold", 380)),
+                int(self.config.get("slot_alert_threshold", 450)),
+                t["green"],
+                t["red"],
+            )
+            if inv.main_at_risk:
+                slot_bar_col = t["red"]
+            slot_txt_col = slot_bar_col if (inv.main_at_risk or inv.status != "ok") else t["text_primary"]
+            slot_val_txt = f"{inv.total_db} / {inv.cap} ({slot_pct}%) · 主 {inv.main_count} / 可清 {inv.cleanable_sub_count}"
+            self._lbl_slots_val.configure(text=slot_val_txt, fg=slot_txt_col)
+            if not self._slots_cleaning_busy:
+                if inv.cleanable_sub_count > 0:
+                    self._btn_slots_clean.configure(text=f"清理({inv.cleanable_sub_count})", bg=t["btn_hover"], fg=t["cyan"])
+                else:
+                    self._btn_slots_clean.configure(text="清理", bg=t["btn_bg"], fg=t["text_muted"])
+            self._last_slots_pct = slot_pct
+            self._last_slots_color = slot_bar_col
+            self._draw_slots_progress(self._last_slots_pct, self._last_slots_color)
+            self._slots_hover_text = self._build_slots_tooltip_text(inv)
+
+            risk_was_visible = bool(self._slot_risk_frame.winfo_manager())
+            if inv.main_at_risk:
+                risk_msg = inv.risk_headline or f"槽位 {inv.total_db}/{inv.cap} 已撞 30 分钟下限，重启可能删主对话！点此查看"
+                self._lbl_slot_risk.configure(text=f"⚠ {risk_msg}（点此展开详情）", bg=t["red_bg"], fg=t["red"])
+                self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
+                if not risk_was_visible:
+                    self._slot_risk_frame.pack(fill="x", pady=(5, 0))
+                    self._clamp_window_to_screen()
+            else:
+                if risk_was_visible:
+                    self._slot_risk_frame.pack_forget()
+                    self._clamp_window_to_screen()
+        else:
+            self._lbl_slots_val.configure(text="— / 500", fg=t["text_muted"])
+            self._last_slots_pct = 0
+            self._last_slots_color = t["green"]
+            self._draw_slots_progress(0, t["green"])
+            self._slots_hover_text = ""
+            if self._slot_risk_frame.winfo_manager():
+                self._slot_risk_frame.pack_forget()
 
         # Module 2: Speed & Freshness (reflects pinned conversation when active)
         if snap.is_custom_account_view or snap.history_range != "30m":
@@ -1315,13 +1719,13 @@ class AntigravityCapsuleApp:
                 text=f"底层日志监控（{snap.log_scope_label} · {win_title} / 今日）"
             )
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
-            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1)
+            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=2)
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
             self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999)
         else:
             self._lbl_logs_title.configure(text="底层日志监控（客户端未运行 · 已暂停实时告警）")
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2, offline_muted=True)
-            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=1, offline_muted=True)
+            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=2, offline_muted=True)
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1, offline_muted=True)
             self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999, offline_muted=True)
 
@@ -1336,16 +1740,18 @@ class AntigravityCapsuleApp:
             ev_txt = "\n".join(e.summary for e in snap.recent_events[-2:])
             self._banner_frame.configure(bg=t["red_bg"], highlightbackground=t["red"])
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
-        elif logs_live and snap.t2_recovery_note and snap.grade == "WARN":
+        elif logs_live and snap.grade == "WARN" and (snap.t2_recovery_note or snap.recent_timeout > 0 or snap.recent_503 > 0):
             self._banner_frame.configure(bg=t["orange_bg"], highlightbackground=t["orange"])
             self._lbl_banner.configure(bg=t["orange_bg"], fg=t["orange"], text=snap.sub_headline)
         else:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["border_soft"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["text_secondary"], text=snap.sub_headline)
 
-        # Dynamically sync open single-conversation detail window on every poll tick
+        # Dynamically sync open modals on every poll tick
         if self._detail_win is not None and not self._detail_win._closed:
             self._detail_win.sync_from_snapshot(snap)
+        if self._slots_win is not None and not self._slots_win._closed:
+            self._slots_win.sync_from_summary(snap.slot_inventory)
 
     def _update_log_cell(
         self,
@@ -1380,6 +1786,42 @@ class AntigravityCapsuleApp:
         fill_w = int(round(w * max(0, min(100, pct)) / 100.0))
         if fill_w > 0:
             c.create_rectangle(0, 1, fill_w, h - 1, fill=fill_color, outline="")
+
+    def _draw_slots_progress(self, pct: int, fill_color: str) -> None:
+        c = self._slots_canvas
+        c.delete("all")
+        raw_w = c.winfo_width()
+        w = raw_w if raw_w > 20 else 380
+        h = 7
+        c.create_rectangle(0, 1, w, h - 1, fill=self.theme["bar_track"], outline="")
+        fill_w = int(round(w * max(0, min(100, pct)) / 100.0))
+        if fill_w > 0:
+            c.create_rectangle(0, 1, fill_w, h - 1, fill=fill_color, outline="")
+
+    def _build_slots_tooltip_text(self, inv: SlotInventorySnapshot) -> str:
+        auto_s = "开启（离线空闲 / 高水位自动让位）" if self.config.get("slot_auto_clean_enabled", True) else "已关闭"
+        mode_map = {"recycle": "Windows 系统回收站（可还原）", "archive": "tar+SHA256 归档后删除", "delete": "直接删除"}
+        mode_s = mode_map.get(str(self.config.get("slot_clean_mode", "recycle")), "系统回收站")
+        lines = [
+            f"Antigravity 本机 500 会话槽位池（点击展开完整明细）:",
+            f"  当前占用: {inv.total_db} / {inv.cap} ({inv.usage_pct:.0f}% · 安全余量 {inv.headroom} 槽 · 约 {format_bytes_human(inv.total_bytes)})",
+            f"  主对话: {inv.main_count} 条（永久保护，绝不自动清理）",
+            f"  可清理子代理 (>{inv.protect_age_min}m): {inv.cleanable_sub_count} 条（约 {format_bytes_human(inv.cleanable_bytes)}）",
+            f"  保护中子代理: {inv.protected_sub_count} 条（30m 硬下限不可突破；30m 外可清 {inv.cleanable_30m_count} 条）",
+        ]
+        if inv.unknown_count > 0:
+            lines.append(f"  未知 .db: {inv.unknown_count} 条（不在摘要库中，保守跳过）")
+        lines.append(f"  清理策略: {mode_s} │ 自动让位: {auto_s}")
+        if inv.last_auto_clean_summary:
+            lines.append(f"  最近清理: {inv.last_auto_clean_summary}")
+        if inv.main_at_risk and inv.risk_headline:
+            lines.append(f"  ⚠ 风险提醒: {inv.risk_headline}")
+        return "\n".join(lines)
+
+    def _show_slots_tooltip(self, event: tk.Event) -> None:
+        if self._closing or not self._slots_hover_text:
+            return
+        self._show_text_tooltip(self._slots_hover_text, event)
 
     def _ttft_color(self, sec: Optional[float]) -> str:
         t = self.theme
@@ -1581,6 +2023,7 @@ class AntigravityCapsuleApp:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+            self.root.after(500, lambda m=menu: m.destroy() if m.winfo_exists() else None)
 
     def set_pinned_conversation(self, conv_id: Optional[str]) -> None:
         self._pinned_conv_id = conv_id or None
@@ -1600,16 +2043,12 @@ class AntigravityCapsuleApp:
             def _on_closed() -> None:
                 self._detail_win = None
 
-            def _load_scoped_report(cid: str):
-                with self._view_lock:
-                    va = self._view_account
-                    hr = self._history_range
-                return self.engine.read_conversation_detail(cid, view_account=va, history_range=hr)
-
+            # Single-conversation detail modal ALWAYS displays the conversation's full own trajectory
+            # (never sliced or fragmented by the dashboard's account/history filter).
             self._detail_win = ConversationDetailWindow(
                 parent=self.root,
                 theme=self.theme,
-                load_report=_load_scoped_report,
+                load_report=self.engine.read_conversation_detail,
                 on_toggle_pin=self._toggle_pin_conversation,
                 is_pinned_fn=lambda cid: self._pinned_conv_id == cid,
                 on_closed=_on_closed,
@@ -1922,6 +2361,24 @@ class AntigravityCapsuleApp:
         self._conv_scrollbar.configure(height=vp_h)
         self._update_conv_scrollregion()
 
+    def _spawn_auto_clean_thread(self, snap: MonitorSnapshot) -> None:
+        if self._closing or self.engine.read_only:
+            return
+        if self._auto_clean_thread is not None and self._auto_clean_thread.is_alive():
+            return
+
+        def _bg_auto_clean() -> None:
+            try:
+                res = self.engine.maybe_auto_clean_slots(snap, stop_event=self._stop_event)
+                if res is not None and (res.removed_count > 0 or res.error):
+                    self.request_immediate_poll()
+            except Exception:
+                pass
+
+        th = threading.Thread(target=_bg_auto_clean, name="AutoSlotCleanupThread", daemon=True)
+        self._auto_clean_thread = th
+        th.start()
+
     # ------------------------------------------------------------------ Polling & lifecycle
     def _worker_loop(self) -> None:
         first = True
@@ -1939,6 +2396,8 @@ class AntigravityCapsuleApp:
                     history_range=hr,
                 )
                 first = False
+                if not self.engine.read_only:
+                    self._spawn_auto_clean_thread(snap)
                 try:
                     while not self._snapshot_queue.empty():
                         self._snapshot_queue.get_nowait()
@@ -1985,6 +2444,9 @@ class AntigravityCapsuleApp:
                 "toggle_startup": self.toggle_startup,
                 "toggle_start_minimized": self.toggle_start_minimized,
                 "toggle_mute": self.toggle_notifications,
+                "toggle_auto_clean": self.toggle_auto_clean_slots,
+                "open_slots": self.open_slots_window,
+                "clean_subagents": self.trigger_manual_subagent_cleanup,
                 "refresh_now": self.request_immediate_poll,
                 "copy_summary": self.copy_summary_to_clipboard,
                 "open_logs": self.open_logs_folder,
@@ -1997,6 +2459,8 @@ class AntigravityCapsuleApp:
                 "startup": lambda: self._startup_cached,
                 "start_minimized": lambda: self.config["start_minimized"],
                 "notifications": lambda: self.config["notifications_enabled"],
+                "auto_clean": lambda: self.config.get("slot_auto_clean_enabled", True),
+                "clean_label": self._format_clean_menu_label,
             },
         )
         self.tray.start()
@@ -2025,6 +2489,9 @@ class AntigravityCapsuleApp:
         if self._detail_win is not None:
             self._detail_win.close()
             self._detail_win = None
+        if self._slots_win is not None:
+            self._slots_win.close()
+            self._slots_win = None
         self._stop_event.set()
         self._force_poll_event.set()
 
@@ -2042,6 +2509,10 @@ class AntigravityCapsuleApp:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=1.5)
             self._worker_thread = None
+
+        if self._auto_clean_thread is not None and self._auto_clean_thread.is_alive():
+            self._auto_clean_thread.join(timeout=3.0)
+            self._auto_clean_thread = None
 
         try:
             self.root.quit()

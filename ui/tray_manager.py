@@ -105,6 +105,17 @@ class TrayManager:
                 self._invoke("toggle_mute"),
                 checked=lambda _item: not bool(self._getters["notifications"]()),
             ),
+            pystray.MenuItem(
+                "自动清理老旧子代理",
+                self._invoke("toggle_auto_clean"),
+                checked=lambda _item: bool(self._getters.get("auto_clean", lambda: True)()),
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("查看本机 500 槽位详情", self._invoke("open_slots")),
+            pystray.MenuItem(
+                lambda _item: str(self._getters.get("clean_label", lambda: "立即清理 2h 外子代理")()),
+                self._invoke("clean_subagents"),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即刷新采样", self._invoke("refresh_now")),
             pystray.MenuItem("复制文字体检摘要", self._invoke("copy_summary")),

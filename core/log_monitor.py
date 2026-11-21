@@ -26,12 +26,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from core.account_ledger import AccountSwitchLedger, _mask_short
 from core.config_store import DEFAULT_CONFIG, sanitize_config
+from core.slot_manager import (
+    MIN_PROTECT_AGE_MIN,
+    SlotCleanupResult,
+    SlotInventoryScanner,
+    SlotInventorySnapshot,
+    SlotSubagentCleaner,
+    format_bytes_human,
+)
 from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, parse_pb_map
 
 EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
@@ -50,9 +58,36 @@ HTTP_503_RE = re.compile(
     re.IGNORECASE,
 )
 STREAM_TIMEOUT_RE = re.compile(
-    r"(?:stream idle timeout|timed out after 5m)",
+    r"(?:stream idle timeout(?:\s*\((\d+(?:\.\d+)?(?:h|m|s|ms)(?:[0-9.]*(?:h|m|s|ms))*)\))?|timed out after\s+(\d+(?:\.\d+)?(?:h|m|s|ms)(?:[0-9.]*(?:h|m|s|ms))*))",
     re.IGNORECASE,
 )
+_DURATION_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)", re.IGNORECASE)
+
+
+def _parse_duration_to_sec(raw: str) -> Optional[float]:
+    if not raw:
+        return None
+    total = 0.0
+    matched = False
+    for num_s, unit in _DURATION_TOKEN_RE.findall(raw):
+        matched = True
+        val = float(num_s)
+        u = unit.lower()
+        if u == "h":
+            total += val * 3600.0
+        elif u == "m":
+            total += val * 60.0
+        elif u == "s":
+            total += val
+        elif u == "ms":
+            total += val / 1000.0
+    return total if matched else None
+
+
+def _is_light_immune_model(model_name: str) -> bool:
+    """Lightweight models (Hydrogen / Flash) are largely immune to flagship T1/T2 throttling and must not whitewash flagship T2."""
+    low = (model_name or "").lower()
+    return ("hydrogen" in low) or ("flash" in low)
 TOS_403_RE = re.compile(
     r"(?:tos_violation|permission_denied[^a-z0-9]{0,16}(?:code\s*[:=]?\s*)?403\b|(?:status|http|code)[^0-9]{0,12}403\b.*permission_denied)",
     re.IGNORECASE,
@@ -408,6 +443,11 @@ class ModelPerfStats:
     steps_after_last_t2: int = 0
     ttft_after_last_t2_avg: Optional[float] = None
     ttft_after_last_t2_latest: Optional[float] = None
+    ttft_after_last_t2_median: Optional[float] = None
+    main_steps_after_last_t2: int = 0
+    main_ttft_after_last_t2_median: Optional[float] = None
+    main_ttft_after_last_t2_latest: Optional[float] = None
+    main_ttft_after_last_t2_recent2_max: Optional[float] = None
 
 
 @dataclass
@@ -509,6 +549,8 @@ class MonitorSnapshot:
     is_historical_rating: bool = False
     rating_anchor_ts: float = 0.0
     range_steps: int = 0
+    slot_inventory: Optional[SlotInventorySnapshot] = None
+    is_host_idle_offline: bool = False
 
 
 HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
@@ -570,6 +612,7 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "brain_dir": home / ".gemini" / "antigravity" / "brain",
         "conversations_dir": home / ".gemini" / "antigravity" / "conversations",
         "annotations_dir": home / ".gemini" / "antigravity" / "annotations",
+        "summaries_db_path": home / ".gemini" / "antigravity" / "conversation_summaries.db",
         "daemon_dir": home / ".gemini" / "antigravity" / "daemon",
         "ls_log_path": appdata / "Antigravity" / "logs" / "language_server.log",
         "cockpit_quota_db": home / ".antigravity_cockpit" / "platform-quota-history-v1.sqlite",
@@ -813,12 +856,23 @@ class LanguageServerLogTailer:
 
         category: Optional[str] = None
         label = ""
+        m_to = STREAM_TIMEOUT_RE.search(body)
         if TOS_403_RE.search(body):
             category = "403"
             label = "403 TOS/权限拒绝"
-        elif STREAM_TIMEOUT_RE.search(body):
-            category = "timeout"
-            label = "5m 流超时"
+        elif m_to is not None:
+            is_explicit_stream = m_to.group(1) is not None or ("stream idle timeout" in body_low)
+            raw_dur = (m_to.group(1) or m_to.group(2) or "").strip().lower()
+            dur_sec = _parse_duration_to_sec(raw_dur) if raw_dur else None
+            # Generic "timed out after <dur>" below 30s (e.g. 500ms / 5s local RPC) must NOT false-alarm LLM stream timeout
+            if (not is_explicit_stream) and (dur_sec is not None and dur_sec < 30.0):
+                category = None
+            else:
+                category = "timeout"
+                norm_dur = re.sub(r"^(\d+h)?(\d+m)0s$", lambda mm: (mm.group(1) or "") + mm.group(2), raw_dur) if raw_dur else ""
+                if norm_dur.endswith("0m") and "h" in norm_dur:
+                    norm_dur = norm_dur[:-2]
+                label = f"流超时 ({norm_dur})" if norm_dur else "流超时"
         elif HTTP_503_RE.search(body):
             category = "503"
             label = "服务端 503 No capacity"
@@ -983,9 +1037,15 @@ class AntigravityMonitorEngine:
 
         self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
         self.annotations_dir: Optional[Path] = Path(annotations_dir) if annotations_dir is not None else None
+        summaries_db_path = base_paths.get("summaries_db_path")
+        if paths and "summaries_db_path" not in paths:
+            summaries_db_path = self.conversations_dir.parent / "conversation_summaries.db"
+        self.summaries_db_path: Path = Path(summaries_db_path) if summaries_db_path is not None else (self.conversations_dir.parent / "conversation_summaries.db")
         self._lock = threading.RLock()
         self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]]" = OrderedDict()
+        self._transcript_error_ts: "OrderedDict[str, List[Tuple[float, str]]]" = OrderedDict()
         self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
+        self._full_align_cache: "OrderedDict[Tuple[str, Tuple[int, int], int, int], List[Optional[Any]]]" = OrderedDict()
         self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
         self._conv_titles: Dict[str, str] = {}
         self._annotation_title_cache: "OrderedDict[str, Tuple[Tuple[int, int], str]]" = OrderedDict()
@@ -998,12 +1058,205 @@ class AntigravityMonitorEngine:
             cockpit_logs_dir=cockpit_logs_dir,
             read_only=self.read_only,
         )
+        journal_path = None if self.read_only else (Path(__file__).resolve().parent.parent / "logs" / "slot_cleanup_journal.jsonl")
+        if paths and "slot_journal_path" in paths:
+            journal_path = None if self.read_only else Path(paths["slot_journal_path"])
+        self.slot_scanner = SlotInventoryScanner(
+            conversations_dir=self.conversations_dir,
+            brain_dir=self.brain_dir,
+            summaries_db_path=self.summaries_db_path,
+            cache_ttl_sec=15.0,
+        )
+        self.slot_cleaner = SlotSubagentCleaner(self.slot_scanner, journal_path=journal_path)
+        self._offline_since_ts: float = 0.0
+        self._last_auto_clean_ts: float = 0.0
+        self._last_auto_clean_summary: str = ""
         self._account_cache: AccountQuotaInfo = AccountQuotaInfo()
         self._active_hub_pid: int = 0
         self._last_account_poll: float = 0.0
         self._last_quota_family: str = "gemini"
         self._baseline_ready: bool = False
         self._emitted_alert_keys: Deque[str] = deque(maxlen=256)
+
+    def read_slot_inventory(self, include_items: bool = True, force: bool = True, now_ts: Optional[float] = None) -> SlotInventorySnapshot:
+        with self._lock:
+            cfg = dict(self.config)
+            summary_txt = self._last_auto_clean_summary
+        inv = self.slot_scanner.scan(
+            now_ts=now_ts,
+            protect_age_min=int(cfg.get("slot_protect_age_min", 120)),
+            slot_cap=int(cfg.get("slot_cap", 500)),
+            warn_threshold=int(cfg.get("slot_warn_threshold", 380)),
+            alert_threshold=int(cfg.get("slot_alert_threshold", 450)),
+            include_items=include_items,
+            force=force,
+        )
+        # Never mutate cached SlotInventorySnapshot in place across threads!
+        return replace(inv, last_auto_clean_summary=summary_txt)
+
+    def clean_old_subagents(
+        self,
+        protect_age_min: Optional[int] = None,
+        mode: Optional[str] = None,
+        archive_dir: Optional[str] = None,
+        trigger: str = "manual",
+        dry_run: bool = False,
+        now_ts: Optional[float] = None,
+        stop_event: Optional[threading.Event] = None,
+        update_summary: bool = True,
+    ) -> SlotCleanupResult:
+        with self._lock:
+            cfg = dict(self.config)
+        eff_age = max(
+            MIN_PROTECT_AGE_MIN,
+            int(cfg.get("slot_protect_age_min", 120)) if protect_age_min is None else int(protect_age_min),
+        )
+        eff_mode = str(cfg.get("slot_clean_mode", "recycle")) if mode is None else str(mode)
+        eff_arch = str(cfg.get("slot_archive_dir", "")) if archive_dir is None else str(archive_dir)
+        started = float(now_ts if now_ts is not None else time.time())
+        if self.read_only and not dry_run:
+            return SlotCleanupResult(
+                started_at=started,
+                finished_at=time.time(),
+                trigger=trigger,
+                mode=eff_mode,
+                protect_age_min=eff_age,
+                dry_run=False,
+                error="read_only_mode_forbids_cleanup",
+            )
+        res = self.slot_cleaner.execute_cleanup(
+            protect_age_min=eff_age,
+            mode=eff_mode,
+            archive_dir=eff_arch,
+            trigger=trigger,
+            dry_run=dry_run,
+            now_ts=now_ts,
+            slot_cap=int(cfg.get("slot_cap", 500)),
+            stop_event=stop_event,
+        )
+        if not dry_run:
+            with self._lock:
+                for cid in res.removed_cids:
+                    self._transcript_cache.pop(cid, None)
+                    self._transcript_error_ts.pop(cid, None)
+                if update_summary:
+                    hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
+                    tag = "手动清理" if trigger == "manual" else "自动让位"
+                    if res.error:
+                        self._last_auto_clean_summary = f"{hm} {tag}失败: {res.error}"
+                    elif res.removed_count > 0:
+                        self._last_auto_clean_summary = f"{hm} {tag} {res.removed_count} 条子代理 ({format_bytes_human(res.freed_bytes)})"
+        return res
+
+    def maybe_auto_clean_slots(
+        self,
+        snap: MonitorSnapshot,
+        now_ts: Optional[float] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Optional[SlotCleanupResult]:
+        """Run safe automatic old-subagent cleanup when Antigravity is offline/closed or slots hit high water."""
+        with self._lock:
+            cfg = dict(self.config)
+            if self.read_only or not bool(cfg.get("slot_auto_clean_enabled", True)):
+                return None
+            inv = snap.slot_inventory
+            if inv is None or not inv.summary_db_ok:
+                return None
+            now = float(now_ts if now_ts is not None else time.time())
+            # Decouple offline detection from UI history view filters (6h/today/7d/custom account)!
+            is_offline_idle = bool(snap.is_host_idle_offline or ((not snap.account.online) and (snap.grade == "IDLE")))
+            if is_offline_idle:
+                if self._offline_since_ts <= 0.0:
+                    self._offline_since_ts = now
+            else:
+                self._offline_since_ts = 0.0
+
+            # Respect 10-minute cooldown between automatic cleanup passes
+            if self._last_auto_clean_ts > 0.0 and (now - self._last_auto_clean_ts) < 600.0:
+                return None
+
+            base_protect = max(MIN_PROTECT_AGE_MIN, int(cfg.get("slot_protect_age_min", 120)))
+            trigger_th = int(cfg.get("slot_auto_trigger_threshold", 420))
+            alert_th = int(cfg.get("slot_alert_threshold", 450))
+
+            chosen_trigger = ""
+            chosen_age = base_protect
+            if is_offline_idle and (now - self._offline_since_ts) >= 15.0:
+                # Ideal window: Antigravity is closed/idle (zero LS handle locks) before next startup prune!
+                if inv.cleanable_sub_count > 0:
+                    chosen_trigger = "auto_offline"
+                    chosen_age = base_protect
+                elif inv.total_db >= trigger_th and inv.cleanable_30m_count > 0:
+                    chosen_trigger = "auto_offline"
+                    chosen_age = MIN_PROTECT_AGE_MIN
+            elif snap.account.online and inv.total_db >= trigger_th:
+                if inv.cleanable_sub_count > 0:
+                    chosen_trigger = "auto_high_water"
+                    chosen_age = base_protect
+                elif inv.total_db >= alert_th and inv.cleanable_30m_count > 0:
+                    chosen_trigger = "auto_high_water"
+                    chosen_age = MIN_PROTECT_AGE_MIN
+
+            if not chosen_trigger:
+                return None
+            self._last_auto_clean_ts = now
+
+        res = self.clean_old_subagents(
+            protect_age_min=chosen_age,
+            trigger=chosen_trigger,
+            dry_run=False,
+            now_ts=now,
+            stop_event=stop_event,
+            update_summary=False,
+        )
+        # Stepped pass down to the 30m hard floor if pool is still high after 2h pass:
+        # - Offline: remaining >= trigger_th
+        # - Online high-water: remaining >= alert_th (prevents 1 locked >2h subagent from starving 30m..120m cleanups!)
+        need_step2 = (
+            chosen_age > MIN_PROTECT_AGE_MIN
+            and not res.error
+            and (stop_event is None or not stop_event.is_set())
+            and (
+                (chosen_trigger == "auto_offline" and res.remaining_db_count >= trigger_th)
+                or (chosen_trigger == "auto_high_water" and res.remaining_db_count >= alert_th)
+            )
+        )
+        if need_step2:
+            res2 = self.clean_old_subagents(
+                protect_age_min=MIN_PROTECT_AGE_MIN,
+                trigger=chosen_trigger,
+                dry_run=False,
+                now_ts=now,
+                stop_event=stop_event,
+                update_summary=False,
+            )
+            if not res2.error and res2.removed_count > 0:
+                res.removed_count += res2.removed_count
+                res.freed_bytes += res2.freed_bytes
+                res.skipped_locked_count += res2.skipped_locked_count
+                res.skipped_changed_count += res2.skipped_changed_count
+                res.remaining_db_count = res2.remaining_db_count
+                res.removed_cids.extend(res2.removed_cids)
+            elif res2.error and not res.error and res.removed_count == 0:
+                res.error = res2.error
+
+        hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
+        with self._lock:
+            if res.error:
+                self._last_auto_clean_summary = f"{hm} 自动让位失败: {res.error}"
+            elif res.removed_count > 0:
+                self._last_auto_clean_summary = f"{hm} 自动让位 {res.removed_count} 条子代理 ({format_bytes_human(res.freed_bytes)})"
+        if res.error:
+            self.slot_cleaner._append_journal(
+                {
+                    "at": datetime.datetime.fromtimestamp(res.finished_at).astimezone().isoformat(timespec="seconds"),
+                    "trigger": chosen_trigger,
+                    "mode": res.mode,
+                    "protect_age_min": res.protect_age_min,
+                    "error": res.error,
+                }
+            )
+        return res
 
     def update_config(self, config: Dict[str, Any]) -> None:
         with self._lock:
@@ -1205,11 +1458,24 @@ class AntigravityMonitorEngine:
             and scoped_indices
             and scoped_indices[-1] < len(all_steps) - 1
         )
-        need_full = is_tail_truncated or (need_full_window_gens and len(c._scoped_steps_all) > len(tail_gens))
+        # Detect ANY non-contiguous gap inside scoped recent steps (even short cross-account gaps <= 16 rows!),
+        # so intervening steps from another account can NEVER be mismatched onto this account's TTFT bars!
+        recent_n = min(len(scoped_indices), len(c.recent_steps)) if scoped_indices else 0
+        has_internal_gap = bool(
+            all_steps is not None
+            and scoped_indices
+            and recent_n >= 2
+            and ((scoped_indices[-1] - scoped_indices[-recent_n] + 1) > recent_n)
+        )
+        need_full = (
+            is_tail_truncated
+            or has_internal_gap
+            or (need_full_window_gens and len(c._scoped_steps_all) > len(c.recent_steps))
+        )
 
         aligned_recent: List[Optional[Any]] = []
         if not need_full and c.recent_steps and tail_gens:
-            # Fast zero-full-scan path for live un-truncated conversations: align directly against cached tail 16 rows
+            # Fast zero-full-scan path for contiguous live un-truncated conversations
             aligned_recent = _align_steps_with_gen_history(c.recent_steps, tail_gens)
             if any(g is not None for g in aligned_recent):
                 c._scoped_gens_all = list(aligned_recent)
@@ -1217,10 +1483,21 @@ class AntigravityMonitorEngine:
                 need_full = True
 
         if need_full and all_steps and scoped_indices:
-            # Global alignment on full all_steps -> project cleanly back to scoped_indices (immune to cross-account/compaction greedy mismatch)
+            # Global alignment on full all_steps with LRU cache keyed by (cid, transcript_stamp, len(all_steps), len(full_gens))
             full_gens = self._db_reader.read_full_history(c.conversation_id)
             if full_gens:
-                full_aligned = _align_steps_with_gen_history(all_steps, full_gens)
+                t_entry = self._transcript_cache.get(c.conversation_id)
+                t_stamp = t_entry[0] if t_entry is not None else (0, len(all_steps))
+                a_key = (c.conversation_id, t_stamp, len(all_steps), len(full_gens))
+                full_aligned = self._full_align_cache.get(a_key)
+                if full_aligned is not None:
+                    self._full_align_cache.move_to_end(a_key)
+                else:
+                    full_aligned = _align_steps_with_gen_history(all_steps, full_gens)
+                    self._full_align_cache[a_key] = full_aligned
+                    self._full_align_cache.move_to_end(a_key)
+                    while len(self._full_align_cache) > 48:
+                        self._full_align_cache.popitem(last=False)
                 scoped_gens = [full_aligned[i] for i in scoped_indices]
                 c._scoped_gens_all = scoped_gens
                 aligned_recent = scoped_gens[-len(c.recent_steps):] if c.recent_steps else []
@@ -1377,6 +1654,7 @@ class AntigravityMonitorEngine:
         target_bundle: Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]] = None
         collected_main_count = 0
         has_any_live_transcript = False
+        latest_host_transcript_ts = 0.0
 
         total_today_steps = 0
         total_main_today_steps = 0
@@ -1396,6 +1674,8 @@ class AntigravityMonitorEngine:
                 continue
 
             last_raw_ts = float(raw_steps[-1].get("timestamp", 0.0) or 0.0)
+            if last_raw_ts > latest_host_transcript_ts:
+                latest_host_transcript_ts = last_raw_ts
             if (now - last_raw_ts) <= 120.0:
                 has_any_live_transcript = True
 
@@ -1658,7 +1938,7 @@ class AntigravityMonitorEngine:
                             p_consec = max(p_consec, cm)
                         if p_log["403"] > 0:
                             prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），首步冷启尚未验真"
-                        elif p_log["timeout"] > 0 or p_log["503"] >= 2:
+                        elif (p_log["timeout"] + p_log["503"]) >= 2:
                             prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
                         elif p_consec >= 2:
                             prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
@@ -1760,6 +2040,12 @@ class AntigravityMonitorEngine:
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
+        notable_events = self._annotate_log_events_with_conversations(notable_events, top_convs)
+        latest_timeout_ev = next((ev for ev in reversed(notable_events) if ev.category == "timeout"), None)
+        latest_timeout_summary = latest_timeout_ev.summary if latest_timeout_ev is not None else ""
+
+        slot_inv = self.read_slot_inventory(now_ts=now, include_items=False, force=False)
+
         model_stats = self._compute_recent_model_stats(
             recent_active=recent_active,
             cutoff_ts=eval_cutoff_ts,
@@ -1790,6 +2076,7 @@ class AntigravityMonitorEngine:
             historical_tag=historical_tag,
             history_range_label=hr_label,
             prior_hist_warning=prior_hist_warning,
+            latest_timeout_summary=latest_timeout_summary,
         )
 
         # Offline + custom/history lookup yielding no records -> offline_unknown (exit 2) rather than normal (exit 0)
@@ -1803,19 +2090,18 @@ class AntigravityMonitorEngine:
                 daily_steps_alert=self.config["daily_steps_alert"],
             )
 
-        if is_custom_account_view or hr_key != "30m" or is_historical_rating:
-            alerts: List[Tuple[str, str, str]] = []
-        else:
-            alerts = self._collect_new_alerts(
-                grade=grade,
-                notable_events=notable_events,
-                recent_active=recent_active,
-                max_consec_miss=max_consec_miss,
-                today_steps=today_steps,
-                steps_scope_label=steps_scope_label,
-                is_online=self._account_cache.online,
-                severe_frequent_miss_conv=severe_frequent_miss_conv,
-            )
+        alerts = self._collect_new_alerts(
+            grade=grade,
+            notable_events=notable_events,
+            recent_active=recent_active,
+            max_consec_miss=max_consec_miss,
+            today_steps=today_steps,
+            steps_scope_label=steps_scope_label,
+            is_online=self._account_cache.online,
+            severe_frequent_miss_conv=severe_frequent_miss_conv,
+            slot_inventory=slot_inv,
+            slots_only=bool(is_custom_account_view or hr_key != "30m" or is_historical_rating),
+        )
 
         primary_ttft_avg = eval_primary.ttft_avg_sec if eval_primary else None
         primary_ttft_max = eval_primary.ttft_max_sec if eval_primary else None
@@ -1893,7 +2179,76 @@ class AntigravityMonitorEngine:
             is_historical_rating=is_historical_rating,
             rating_anchor_ts=rating_anchor_ts,
             range_steps=range_steps,
+            slot_inventory=slot_inv,
+            is_host_idle_offline=bool((not self._account_cache.online) and ((now - latest_host_transcript_ts) >= 15.0)),
         )
+
+    def _is_cached_subagent(self, cid: str, conv_map: Dict[str, ConversationSummary]) -> bool:
+        conv_obj = conv_map.get(cid)
+        if conv_obj is not None:
+            return bool(conv_obj.is_subagent)
+        cached = self._transcript_cache.get(cid)
+        if cached is not None:
+            _, _, has_ue, has_sm = cached
+            if has_ue:
+                return False
+            if has_sm:
+                return True
+        return self._check_subagent_hint_cached(cid)
+
+    def _annotate_log_events_with_conversations(
+        self,
+        events: List[LogEvent],
+        known_convs: List[ConversationSummary],
+    ) -> List[LogEvent]:
+        """Match language_server.log error timestamps against per-conversation ERROR_MESSAGE timestamps (±6s)."""
+        if not events or not self._transcript_error_ts:
+            return events
+        conv_map = {c.conversation_id: c for c in known_convs}
+        out: List[LogEvent] = []
+        for ev in events:
+            if ev.category not in ("timeout", "503", "403"):
+                out.append(ev)
+                continue
+            best_cid = ""
+            best_key: Optional[Tuple[int, int, float]] = None
+            for cid, err_entries in self._transcript_error_ts.items():
+                if not err_entries:
+                    continue
+                is_sub = 1 if self._is_cached_subagent(cid, conv_map) else 0
+                for ets, etxt in err_entries:
+                    diff = abs(ets - ev.timestamp)
+                    if diff > 6.0:
+                        continue
+                    # Prefer content-relevant ERROR_MESSAGE matches over unrelated tool errors in the same second
+                    if ev.category == "timeout":
+                        rel_rank = 0 if ("timeout" in etxt or "deadline" in etxt or "timed out" in etxt) else 1
+                    elif ev.category == "503":
+                        rel_rank = 0 if ("503" in etxt or "capacity" in etxt or "unavailable" in etxt or "exhausted" in etxt) else 1
+                    else:
+                        rel_rank = 0 if ("403" in etxt or "permission" in etxt or "tos" in etxt) else 1
+                    cand_key = (rel_rank, is_sub, diff)
+                    if best_key is None or cand_key < best_key:
+                        best_key = cand_key
+                        best_cid = cid
+            if best_cid:
+                conv_obj = conv_map.get(best_cid)
+                title = conv_obj.title if conv_obj is not None else self._resolve_conv_title(best_cid)
+                title_part = f" {truncate_display_width(title, 22)}" if title else ""
+                tag = f"{best_cid[:6]}{title_part}"
+                new_summary = ev.summary if tag in ev.summary else f"{ev.summary} · {tag}"
+                out.append(
+                    LogEvent(
+                        timestamp=ev.timestamp,
+                        category=ev.category,
+                        summary=new_summary,
+                        event_key=ev.event_key,
+                        model=ev.model,
+                    )
+                )
+            else:
+                out.append(ev)
+        return out
 
     @staticmethod
     def _compute_recent_model_stats(
@@ -1934,6 +2289,8 @@ class AntigravityMonitorEngine:
                         "post_ttfts": [],
                         "post_latest_ts": 0.0,
                         "post_latest_ttft": None,
+                        "main_post_steps": 0,
+                        "main_post_pairs": [],  # (timestamp, ttft_sec)
                     },
                 )
                 b["steps"] += 1
@@ -1960,12 +2317,32 @@ class AntigravityMonitorEngine:
                         if st.timestamp >= b["post_latest_ts"]:
                             b["post_latest_ts"] = st.timestamp
                             b["post_latest_ttft"] = float(t_val)
+                    if not c.is_subagent:
+                        b["main_post_steps"] += 1
+                        if t_val is not None:
+                            b["main_post_pairs"].append((st.timestamp, float(t_val)))
 
         out: List[ModelPerfStats] = []
         for mname, b in buckets.items():
             tl = b["ttfts"]
             pl = b["tpss"]
             ptl = b["post_ttfts"]
+            ptl_median: Optional[float] = None
+            if ptl:
+                sp = sorted(ptl)
+                mid = len(sp) // 2
+                ptl_median = sp[mid] if (len(sp) % 2 == 1) else ((sp[mid - 1] + sp[mid]) / 2.0)
+
+            mpairs = sorted(b["main_post_pairs"], key=lambda x: x[0])
+            mvals = [v for _, v in mpairs]
+            m_median: Optional[float] = None
+            if mvals:
+                sm = sorted(mvals)
+                mm = len(sm) // 2
+                m_median = sm[mm] if (len(sm) % 2 == 1) else ((sm[mm - 1] + sm[mm]) / 2.0)
+            m_latest = mvals[-1] if mvals else None
+            m_rec2_max = max(mvals[-2:]) if len(mvals) >= 2 else m_latest
+
             out.append(
                 ModelPerfStats(
                     model=mname,
@@ -1980,6 +2357,11 @@ class AntigravityMonitorEngine:
                     steps_after_last_t2=int(b["post_steps"]),
                     ttft_after_last_t2_avg=(sum(ptl) / len(ptl)) if ptl else None,
                     ttft_after_last_t2_latest=b["post_latest_ttft"],
+                    ttft_after_last_t2_median=ptl_median,
+                    main_steps_after_last_t2=int(b["main_post_steps"]),
+                    main_ttft_after_last_t2_median=m_median,
+                    main_ttft_after_last_t2_latest=m_latest,
+                    main_ttft_after_last_t2_recent2_max=m_rec2_max,
                 )
             )
         out.sort(key=lambda m: m.latest_timestamp, reverse=True)
@@ -2023,6 +2405,7 @@ class AntigravityMonitorEngine:
         historical_tag: str = "",
         history_range_label: str = "近 30 分钟",
         prior_hist_warning: str = "",
+        latest_timeout_summary: str = "",
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
@@ -2048,36 +2431,106 @@ class AntigravityMonitorEngine:
                 "",
             )
 
-        # Dynamic T2 evaluation: inspect post-error successful steps & per-model TTFT instead of permanently
-        # locking the account in T2 for 30m after transient/single-model 503 bursts.
+        # Dynamic T2 evaluation:
+        # - Single isolated stream timeout (or single 503) warns in orange (WARN) instead of hard-alarming T2.
+        # - (eff_503 + eff_timeout) >= 2 enters T2 evaluation using MAIN-conversation post-error median TTFT:
+        #   1. Subagents & lightweight immune models (Hydrogen/Flash) NEVER whitewash flagship (Neon/Carbon) T2!
+        #   2. If the active primary model itself shows post-error degradation, no other model can override it.
+        #   3. When primary has >=4 main post-steps and median < 30s, tolerate a single multimodal TTFT spike (<150s)
+        #      unless the latest two steps are both >=60s (prevents WARN <-> T2 flapping).
+        #   4. Full green T0 recovery requires actual measured TTFT samples on the active model (never via another model).
         t2_active = False
         t2_recovering_warn = ""
         t2_recovered_info = ""
-        if eff_timeout > 0 or eff_503 >= 2:
+        if (eff_timeout + eff_503) >= 2:
             stats_list = model_stats or []
-            primary_ms = next((m for m in stats_list if m.model == active_model), None)
-            if primary_ms is None and stats_list:
-                primary_ms = max(stats_list, key=lambda m: (m.steps_after_last_t2, m.latest_timestamp))
-            post_steps = primary_ms.steps_after_last_t2 if primary_ms is not None else 0
-            post_ttft_avg = primary_ms.ttft_after_last_t2_avg if primary_ms is not None else None
-            post_ttft_latest = primary_ms.ttft_after_last_t2_latest if primary_ms is not None else None
-            post_model_name = primary_ms.model if primary_ms is not None else active_model
-            elapsed_since_err = (now_ts - last_t2_error_ts) if (now_ts > 0 and last_t2_error_ts > 0) else 0.0
-            ttft_severe = (
-                (post_ttft_latest is not None and post_ttft_latest >= 60.0)
-                or (post_ttft_avg is not None and post_ttft_avg >= 60.0)
-            )
-            ttft_ok = (
-                (post_ttft_latest is None or post_ttft_latest < 45.0)
-                and (post_ttft_avg is None or post_ttft_avg < 45.0)
-            )
-            err_desc = f"{eff_503} 次 503" + (f" / {eff_timeout} 次超时" if eff_timeout > 0 else "")
-            ttft_desc = f"，TTFT 均 {post_ttft_avg:.1f}s" if post_ttft_avg is not None else ""
+            active_is_light = _is_light_immune_model(active_model)
 
-            if post_steps >= 6 and elapsed_since_err >= 600.0 and ttft_ok:
-                t2_recovered_info = f"前序 {err_desc} 已平复（{post_model_name} 事后连跑 {post_steps} 步正常{ttft_desc}）"
-            elif post_steps >= 2 and not ttft_severe and ttft_ok:
-                t2_recovering_warn = f"前序 {err_desc}，{post_model_name} 事后已连跑 {post_steps} 步正常{ttft_desc}"
+            def _eff_steps(ms: ModelPerfStats) -> int:
+                return ms.main_steps_after_last_t2 if ms.main_steps_after_last_t2 > 0 else (ms.steps_after_last_t2 if ms.main_ttft_after_last_t2_median is None and not any(m.main_steps_after_last_t2 > 0 for m in stats_list) else 0)
+
+            def _eff_rep_ttft(ms: ModelPerfStats) -> Optional[float]:
+                if ms.main_steps_after_last_t2 > 0:
+                    return ms.main_ttft_after_last_t2_median
+                return ms.ttft_after_last_t2_median if ms.ttft_after_last_t2_median is not None else ms.ttft_after_last_t2_avg
+
+            def _eff_latest_ttft(ms: ModelPerfStats) -> Optional[float]:
+                return ms.main_ttft_after_last_t2_latest if ms.main_steps_after_last_t2 > 0 else ms.ttft_after_last_t2_latest
+
+            def _is_degraded(ms: ModelPerfStats) -> bool:
+                steps_n = ms.main_steps_after_last_t2
+                if steps_n <= 0:
+                    return False
+                rep = ms.main_ttft_after_last_t2_median
+                lat = ms.main_ttft_after_last_t2_latest
+                rec2 = ms.main_ttft_after_last_t2_recent2_max
+                if rep is not None and rep >= 45.0:
+                    return True
+                if steps_n >= 4 and rep is not None and rep < 30.0:
+                    # Tolerate single multimodal spike; only degraded if extreme (>=150s) or consecutive slow
+                    if lat is not None and lat >= 150.0:
+                        return True
+                    return False
+                return bool(lat is not None and lat >= 60.0 and (rec2 is None or rec2 >= 60.0))
+
+            def _is_healthy_main_recovery(ms: ModelPerfStats, allow_no_ttft: bool = False) -> bool:
+                steps_n = ms.main_steps_after_last_t2
+                if steps_n < 2:
+                    return False
+                rep = ms.main_ttft_after_last_t2_median
+                lat = ms.main_ttft_after_last_t2_latest
+                if rep is None and not allow_no_ttft:
+                    return False
+                if rep is not None and rep >= 45.0:
+                    return False
+                if steps_n >= 4 and rep is not None and rep < 30.0:
+                    # Single multimodal spike tolerance: allow up to 150s if previous step was fast
+                    if lat is not None and lat >= 150.0:
+                        return False
+                    return True
+                if lat is not None and lat >= 60.0:
+                    return False
+                return True
+
+            primary_ms = next((m for m in stats_list if m.model == active_model), None)
+            primary_degraded = primary_ms is not None and _is_degraded(primary_ms)
+            elapsed_since_err = (now_ts - last_t2_error_ts) if (now_ts > 0 and last_t2_error_ts > 0) else 0.0
+            err_parts = []
+            if eff_503 > 0:
+                err_parts.append(f"{eff_503} 次 503")
+            if eff_timeout > 0:
+                err_parts.append(f"{eff_timeout} 次流超时")
+            err_desc = " / ".join(err_parts) if err_parts else "限流事件"
+
+            if primary_ms is not None and _is_healthy_main_recovery(primary_ms, allow_no_ttft=False):
+                rep = _eff_rep_ttft(primary_ms)
+                ttft_desc = f"，TTFT 中位 {rep:.1f}s" if rep is not None else ""
+                p_steps = primary_ms.main_steps_after_last_t2
+                if p_steps >= 6 and elapsed_since_err >= 600.0:
+                    t2_recovered_info = f"前序 {err_desc} 已平复（{primary_ms.model} 事后连跑 {p_steps} 步正常{ttft_desc}）"
+                else:
+                    t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步正常{ttft_desc}"
+            elif primary_ms is not None and _is_healthy_main_recovery(primary_ms, allow_no_ttft=True):
+                # Main steps succeeded without SQLite TTFT yet -> allow downgrade to WARN, never green T0
+                p_steps = primary_ms.main_steps_after_last_t2
+                t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步（待 TTFT 采样验真）"
+            elif not primary_degraded:
+                # Only allow a non-lightweight main-conversation peer model to soften T2 -> WARN (never to green T0!)
+                peer_candidates = [
+                    m for m in stats_list
+                    if m.model != active_model
+                    and (active_is_light or not _is_light_immune_model(m.model))
+                    and _is_healthy_main_recovery(m, allow_no_ttft=False)
+                ]
+                if peer_candidates:
+                    best_peer = max(peer_candidates, key=lambda m: (m.main_steps_after_last_t2, m.latest_timestamp))
+                    rep = _eff_rep_ttft(best_peer)
+                    ttft_desc = f"，TTFT 中位 {rep:.1f}s" if rep is not None else ""
+                    t2_recovering_warn = (
+                        f"前序 {err_desc}，另一主模型 {best_peer.model} 已连跑 {best_peer.main_steps_after_last_t2} 步可用{ttft_desc}"
+                    )
+                else:
+                    t2_active = True
             else:
                 t2_active = True
 
@@ -2089,7 +2542,7 @@ class AntigravityMonitorEngine:
                 "red",
                 "T2",
                 f"T2 限流黑洞{hist_head_tag} · {active_model}",
-                f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {eff_timeout} 次 5m 超时，事后未恢复稳定响应{extra}",
+                f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {eff_timeout} 次流超时，事后未恢复稳定响应{extra}",
                 "",
             )
         if max_consec_miss >= 2:
@@ -2123,6 +2576,7 @@ class AntigravityMonitorEngine:
             or any_single_miss
             or unstable_recovery_conv is not None
             or eff_503 == 1
+            or eff_timeout == 1
             or any_slow
             or today_steps >= self.config["daily_steps_warn"]
         ):
@@ -2139,6 +2593,8 @@ class AntigravityMonitorEngine:
                 reasons.append("疑似暗限速")
             if eff_503 == 1 and not t2_recovering_warn:
                 reasons.append("偶发 1 次 503")
+            if eff_timeout == 1 and not t2_recovering_warn:
+                reasons.append(f"偶发流超时: {latest_timeout_summary}" if latest_timeout_summary else "偶发 1 次流超时")
             if today_steps >= self.config["daily_steps_warn"]:
                 reasons.append(f"今日步数 {today_steps}")
             return ("orange", "WARN", f"留意预警{hist_head_tag} · {active_model}", f"{hist_prefix}" + " / ".join(reasons), t2_recovering_warn)
@@ -2182,49 +2638,72 @@ class AntigravityMonitorEngine:
         steps_scope_label: str = "全机",
         is_online: bool = True,
         severe_frequent_miss_conv: Optional[ConversationSummary] = None,
+        slot_inventory: Optional[SlotInventorySnapshot] = None,
+        slots_only: bool = False,
     ) -> List[Tuple[str, str, str]]:
-        if grade == "IDLE" or (not is_online and not recent_active):
-            self._baseline_ready = True
-            return []
         candidates: List[Tuple[str, str, str]] = []
-        if grade == "T3":
-            for ev in notable_events:
-                if ev.category == "403":
-                    candidates.append((ev.event_key, "Antigravity 封禁告警 (T3)", ev.summary))
-        elif grade == "T2":
-            for ev in notable_events:
-                if ev.category in ("503", "timeout"):
-                    candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
-        elif grade == "T1":
-            # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
-            offending = next((c for c in recent_active if c.consec_miss >= 2), None)
-            if offending is not None:
-                key = f"t1:{offending.conversation_id}:{offending.consec_miss_start_step}"
+        if slot_inventory is not None and slot_inventory.summary_db_ok:
+            if slot_inventory.main_at_risk:
                 candidates.append(
-                    (key, "Antigravity 疑似 T1 掉缓存", f"{offending.short_id} ({offending.model}) 已连续 {max_consec_miss} 步 cr=0")
+                    (
+                        f"slot:main_risk:{slot_inventory.total_db // 5}:{slot_inventory.main_count}",
+                        "Antigravity 500 槽位告急（主对话风险）",
+                        slot_inventory.risk_headline
+                        or f"本地会话已达 {slot_inventory.total_db}/{slot_inventory.cap}，已撞 30 分钟保护下限，请先备份主对话再重启！",
+                    )
                 )
-            elif severe_frequent_miss_conv is not None:
-                c = severe_frequent_miss_conv
-                pct = int(round((c.recent10_hit_ratio or 0.0) * 100))
-                key = f"t1freq:{c.conversation_id}:{c.first_abnormal_step_in_recent10}"
+            elif slot_inventory.status == "danger":
                 candidates.append(
-                    (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
+                    (
+                        f"slot:danger:{slot_inventory.total_db // 10}",
+                        "Antigravity 本机槽位逼近 500 上限",
+                        f"当前 {slot_inventory.total_db}/{slot_inventory.cap}（主 {slot_inventory.main_count} / 可清子代理 {slot_inventory.cleanable_sub_count}），建议及时清理让位",
+                    )
                 )
-        elif today_steps >= self.config["daily_steps_alert"]:
-            day = datetime.date.today().isoformat()
-            candidates.append(
-                (
-                    f"steps:{day}:{steps_scope_label}:{self.config['daily_steps_alert']}",
-                    f"Antigravity 今日步数红线 ({steps_scope_label})",
-                    f"{steps_scope_label} 今日已达 {today_steps} 步，注意控频护号",
+
+        if not slots_only and grade != "IDLE" and (is_online or recent_active):
+            if grade == "T3":
+                for ev in notable_events:
+                    if ev.category == "403":
+                        candidates.append((ev.event_key, "Antigravity 封禁告警 (T3)", ev.summary))
+            elif grade == "T2":
+                for ev in notable_events:
+                    if ev.category in ("503", "timeout"):
+                        candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
+            elif grade == "T1":
+                # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
+                offending = next((c for c in recent_active if c.consec_miss >= 2), None)
+                if offending is not None:
+                    key = f"t1:{offending.conversation_id}:{offending.consec_miss_start_step}"
+                    candidates.append(
+                        (key, "Antigravity 疑似 T1 掉缓存", f"{offending.short_id} ({offending.model}) 已连续 {max_consec_miss} 步 cr=0")
+                    )
+                elif severe_frequent_miss_conv is not None:
+                    c = severe_frequent_miss_conv
+                    pct = int(round((c.recent10_hit_ratio or 0.0) * 100))
+                    key = f"t1freq:{c.conversation_id}:{c.first_abnormal_step_in_recent10}"
+                    candidates.append(
+                        (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
+                    )
+            elif today_steps >= self.config["daily_steps_alert"]:
+                day = datetime.date.today().isoformat()
+                candidates.append(
+                    (
+                        f"steps:{day}:{steps_scope_label}:{self.config['daily_steps_alert']}",
+                        f"Antigravity 今日步数红线 ({steps_scope_label})",
+                        f"{steps_scope_label} 今日已达 {today_steps} 步，注意控频护号",
+                    )
                 )
-            )
 
         if not self._baseline_ready:
-            for key, _, _ in candidates:
-                self._emitted_alert_keys.append(key)
+            immediate_critical: List[Tuple[str, str, str]] = []
+            for item in candidates:
+                self._emitted_alert_keys.append(item[0])
+                # Never silence a main-conversation eviction risk alert on first poll!
+                if item[0].startswith("slot:main_risk:"):
+                    immediate_critical.append(item)
             self._baseline_ready = True
-            return []
+            return immediate_critical
 
         fresh: List[Tuple[str, str, str]] = []
         for item in candidates:
@@ -2274,15 +2753,19 @@ class AntigravityMonitorEngine:
             st = tp.stat()
         except OSError:
             self._transcript_cache.pop(conv_id, None)
+            self._transcript_error_ts.pop(conv_id, None)
             return [], False, False
 
         stamp = (st.st_mtime_ns, st.st_size)
         cached = self._transcript_cache.get(conv_id)
         if cached is not None and cached[0] == stamp:
             self._transcript_cache.move_to_end(conv_id)
+            if conv_id in self._transcript_error_ts:
+                self._transcript_error_ts.move_to_end(conv_id)
             return cached[1], cached[2], cached[3]
 
         parsed: List[Dict[str, Any]] = []
+        error_ts_list: List[Tuple[float, str]] = []
         has_user_explicit = False
         has_subagent_marker = False
         pending_checkpoint = False
@@ -2298,6 +2781,17 @@ class AntigravityMonitorEngine:
                         '"SUBAGENT"' in line or '"SWARM"' in line or "[swarm]" in line or '"source":"AGENT"' in line
                     ):
                         has_subagent_marker = True
+                    if '"ERROR_MESSAGE"' in line:
+                        try:
+                            err_obj = json.loads(line)
+                            if err_obj.get("type") == "ERROR_MESSAGE":
+                                ets = parse_iso_timestamp(str(err_obj.get("created_at", "") or ""))
+                                if ets is not None:
+                                    ec = str(err_obj.get("content", "") or "")[:160].lower()
+                                    error_ts_list.append((ets, ec))
+                                continue
+                        except json.JSONDecodeError:
+                            pass
                     if '"CHECKPOINT"' in line:
                         try:
                             chk_obj = json.loads(line)
@@ -2378,7 +2872,15 @@ class AntigravityMonitorEngine:
         self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
         self._transcript_cache.move_to_end(conv_id)
         while len(self._transcript_cache) > 384:
-            self._transcript_cache.popitem(last=False)
+            evicted_cid, _ = self._transcript_cache.popitem(last=False)
+            self._transcript_error_ts.pop(evicted_cid, None)
+        if error_ts_list:
+            self._transcript_error_ts[conv_id] = error_ts_list[-16:]
+            self._transcript_error_ts.move_to_end(conv_id)
+            while len(self._transcript_error_ts) > 384:
+                self._transcript_error_ts.popitem(last=False)
+        else:
+            self._transcript_error_ts.pop(conv_id, None)
         return parsed, has_user_explicit, has_subagent_marker
 
     def _resolve_conversation_transcript(self, query: str) -> Optional[Tuple[str, Path]]:
@@ -3039,6 +3541,15 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
         {"key": k, "title": t, "message": m}
         for k, t, m in snap.alerts
     ]
+    if snap.slot_inventory is not None and snap.slot_inventory.main_at_risk:
+        if not any(a["key"].startswith("slot:main_risk:") for a in alerts_out):
+            alerts_out.append(
+                {
+                    "key": f"slot:main_risk:{snap.slot_inventory.total_db // 5}:{snap.slot_inventory.main_count}",
+                    "title": "Antigravity 500 槽位告急（主对话风险）",
+                    "message": snap.slot_inventory.risk_message,
+                }
+            )
     if not alerts_out and snap.pressure in ("warn", "red", "degraded"):
         alerts_out.append({"key": f"status:{snap.grade}", "title": snap.headline, "message": snap.sub_headline})
 
@@ -3148,9 +3659,36 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
                 "latest_ttft_sec": round(m.latest_ttft_sec, 2) if m.latest_ttft_sec is not None else None,
                 "tps_avg": round(m.tps_avg, 2) if m.tps_avg is not None else None,
                 "steps_after_last_t2": m.steps_after_last_t2,
+                "ttft_after_last_t2_median": round(m.ttft_after_last_t2_median, 2) if m.ttft_after_last_t2_median is not None else None,
             }
             for m in snap.model_stats
         ],
+        "slots": (
+            {
+                "total_db": snap.slot_inventory.total_db,
+                "cap": snap.slot_inventory.cap,
+                "remaining_slots": snap.slot_inventory.remaining_slots,
+                "headroom": snap.slot_inventory.remaining_slots,
+                "usage_pct": snap.slot_inventory.usage_pct,
+                "main_count": snap.slot_inventory.main_count,
+                "cleanable_sub_count": snap.slot_inventory.cleanable_sub_count,
+                "cleanable_30m_count": snap.slot_inventory.cleanable_30m_count,
+                "protected_sub_count": snap.slot_inventory.protected_sub_count,
+                "unknown_count": snap.slot_inventory.unknown_count,
+                "pinned_floor_count": snap.slot_inventory.pinned_floor_count,
+                "total_bytes": snap.slot_inventory.total_bytes,
+                "cleanable_bytes": snap.slot_inventory.cleanable_bytes,
+                "protect_age_min": snap.slot_inventory.protect_age_min,
+                "status": snap.slot_inventory.status,
+                "main_at_risk": snap.slot_inventory.main_at_risk,
+                "risk_message": snap.slot_inventory.risk_message,
+                "risk_headline": snap.slot_inventory.risk_message,
+                "summary_db_ok": snap.slot_inventory.summary_db_ok,
+                "last_auto_clean_summary": snap.slot_inventory.last_auto_clean_summary,
+            }
+            if snap.slot_inventory is not None
+            else None
+        ),
         "alerts": alerts_out,
         "counts": {
             "active_main": len(main_convs),
@@ -3265,9 +3803,20 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         [
             f"实时性能: 缓存 {hit_str} | 吞吐 {tps_str} | TTFT {ttft_str}",
             f"步数统计: {steps_str}",
-            f"底层日志 ({snap.log_scope_label} · {snap.history_range_label} / 今日): 503={snap.recent_503}/{snap.today_503} | 5m超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
+            f"底层日志 ({snap.log_scope_label} · {snap.history_range_label} / 今日): 503={snap.recent_503}/{snap.today_503} | 流超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
         ]
     )
+    if snap.slot_inventory is not None:
+        si = snap.slot_inventory
+        slot_line = (
+            f"本地槽位: {si.total_db}/{si.cap} ({si.usage_pct:.0f}% · 余 {si.headroom}) | "
+            f"主对话 {si.main_count} / 可清子代理 {si.cleanable_sub_count} ({format_bytes_human(si.cleanable_bytes)}) / 保护中 {si.protected_sub_count}"
+        )
+        if si.unknown_count > 0:
+            slot_line += f" / 未知 {si.unknown_count}"
+        lines.append(slot_line)
+        if si.main_at_risk and si.risk_headline:
+            lines.append(f"槽位警报: {si.risk_headline}")
     if len(snap.model_stats) >= 2:
         ms_parts = []
         for ms in snap.model_stats[:4]:

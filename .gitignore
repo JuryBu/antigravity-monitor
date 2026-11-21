@@ -1,6 +1,7 @@
 # Local runtime config, secrets & private state
 config.json
 account_ledger.json
+logs/
 .env
 *.local.*
 *.log

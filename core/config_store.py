@@ -27,10 +27,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "window_y": None,
     "conv_filter": "main",
     "conv_list_rows": 5,
+    "slot_cap": 500,
+    "slot_warn_threshold": 380,
+    "slot_alert_threshold": 450,
+    "slot_auto_clean_enabled": True,
+    "slot_protect_age_min": 120,
+    "slot_auto_trigger_threshold": 420,
+    "slot_clean_mode": "recycle",
+    "slot_archive_dir": "",
 }
 
 VALID_THEMES = ("midnight_blue", "obsidian_dark")
 VALID_CONV_FILTERS = ("main", "subagent", "all")
+VALID_SLOT_CLEAN_MODES = ("recycle", "archive", "delete")
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -76,6 +85,21 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
     if conv_filter in VALID_CONV_FILTERS:
         cfg["conv_filter"] = conv_filter
     cfg["conv_list_rows"] = _clamp_int(raw.get("conv_list_rows"), 5, 3, 12)
+
+    cfg["slot_cap"] = _clamp_int(raw.get("slot_cap"), 500, 100, 5000)
+    cfg["slot_warn_threshold"] = _clamp_int(raw.get("slot_warn_threshold"), 380, 50, cfg["slot_cap"] - 20)
+    cfg["slot_alert_threshold"] = _clamp_int(raw.get("slot_alert_threshold"), 450, cfg["slot_warn_threshold"] + 1, cfg["slot_cap"])
+    cfg["slot_auto_clean_enabled"] = bool(raw.get("slot_auto_clean_enabled", True))
+    # Hard floor: NEVER allow automatic or manual cleanup age protection below 30 minutes
+    cfg["slot_protect_age_min"] = _clamp_int(raw.get("slot_protect_age_min"), 120, 30, 10080)
+    trig_high = max(50, cfg["slot_cap"] - 10)
+    trig_low = min(trig_high, max(50, int(cfg["slot_cap"] * 0.5)))
+    cfg["slot_auto_trigger_threshold"] = _clamp_int(raw.get("slot_auto_trigger_threshold"), min(420, trig_high), trig_low, trig_high)
+    clean_mode = raw.get("slot_clean_mode")
+    if clean_mode in VALID_SLOT_CLEAN_MODES:
+        cfg["slot_clean_mode"] = clean_mode
+    arch_dir = raw.get("slot_archive_dir")
+    cfg["slot_archive_dir"] = str(arch_dir).strip() if isinstance(arch_dir, str) else ""
 
     for coord in ("window_x", "window_y"):
         val = raw.get(coord)

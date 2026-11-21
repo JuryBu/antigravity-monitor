@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import List
 
 from core.account_ledger import AccountSwitchLedger
 from core.config_store import ConfigStore
@@ -638,7 +642,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
             convs.mkdir()
             ls_log = root / "language_server.log"
             ls_log.write_text("", encoding="utf-8")
-            now = time.time()
+            # Pin to fixed 12:30 local so 400s offsets never straddle a top-of-hour boundary!
+            now = datetime.datetime.now().replace(hour=12, minute=30, second=0, microsecond=0).timestamp()
 
             # Main conversation (warm 200K, 30s ago -> remaining ~180s)
             b_main = root / "brain" / "main0001-1111" / ".system_generated" / "logs"
@@ -924,7 +929,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
             convs.mkdir()
             ls_log = root / "language_server.log"
             ls_log.write_text("", encoding="utf-8")
-            now = time.time()
+            # Pin to fixed 12:30 local so 400s offsets never straddle a top-of-hour boundary!
+            now = datetime.datetime.now().replace(hour=12, minute=30, second=0, microsecond=0).timestamp()
 
             # 1 older main conversation with T1 consecutive misses (rank 29 by mtime!)
             main_id = "main9999-aaaa-bbbb"
@@ -1288,8 +1294,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
 
         # Direct UTF-8, quoted escapes, and Go prototext octal UTF-8 escapes
         self.assertEqual(
-            parse_pbtxt_title('title:"SVG制作测响应" last_user_view_time:{seconds:1795197574}'.encode("utf-8")),
-            "SVG制作测响应",
+            parse_pbtxt_title('title:"矢量图渲染测试示例" last_user_view_time:{seconds:1795197574}'.encode("utf-8")),
+            "矢量图渲染测试示例",
         )
         octal_raw = b'title:"\\346\\265\\213\\350\\257\\225 \\"A\\\\B\\"" last_user_view_time:{seconds:1}'
         self.assertEqual(parse_pbtxt_title(octal_raw), '测试 "A\\B"')
@@ -1297,7 +1303,7 @@ class TestShortcutsAndIcons(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            cid = "ca052932-0030-459c-aafa-ba18aa7ca3b4"
+            cid = "demo0529-0030-459c-aafa-000000000001"
             b_dir = root / "brain" / cid / ".system_generated" / "logs"
             b_dir.mkdir(parents=True)
             ann_dir = root / "annotations"
@@ -1318,7 +1324,7 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 encoding="utf-8",
             )
             pbtxt = ann_dir / f"{cid}.pbtxt"
-            pbtxt.write_text('title:"SVG制作测响应" last_user_view_time:{seconds:1795197574 nanos:0}\n', encoding="utf-8")
+            pbtxt.write_text('title:"矢量图渲染测试示例" last_user_view_time:{seconds:1795197574 nanos:0}\n', encoding="utf-8")
 
             engine = AntigravityMonitorEngine(
                 paths={
@@ -1332,17 +1338,17 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 read_only=True,
             )
             snap = engine.poll(now_ts=now)
-            self.assertEqual(snap.active_conversations[0].title, "SVG制作测响应")
+            self.assertEqual(snap.active_conversations[0].title, "矢量图渲染测试示例")
             detail = engine.read_conversation_detail(cid, now_ts=now)
             self.assertIsNotNone(detail)
             assert detail is not None
-            self.assertEqual(detail.title, "SVG制作测响应")
+            self.assertEqual(detail.title, "矢量图渲染测试示例")
 
             # Live rename in annotations/*.pbtxt must invalidate cache and update title immediately
             time.sleep(0.02)
-            pbtxt.write_text('title:"SVG重命名新标题" last_user_view_time:{seconds:1795197600}\n', encoding="utf-8")
+            pbtxt.write_text('title:"矢量图重命名新标题" last_user_view_time:{seconds:1795197600}\n', encoding="utf-8")
             snap2 = engine.poll(now_ts=now + 2)
-            self.assertEqual(snap2.active_conversations[0].title, "SVG重命名新标题")
+            self.assertEqual(snap2.active_conversations[0].title, "矢量图重命名新标题")
 
     def test_detail_window_locked_width_never_jitters_on_hover_or_switch(self) -> None:
         import tkinter as tk
@@ -1389,8 +1395,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 model="Hydrogen XH",
             )
             rep_a = ConversationDetailReport(
-                conversation_id="ca052932-0030-459c-aafa-ba18aa7ca3b4",
-                short_id="ca0529",
+                conversation_id="demo0529-0030-459c-aafa-000000000001",
+                short_id="demo05",
                 is_subagent=False,
                 model="Neon XHigh",
                 model_raw="gemini-4-neon-xhigh",
@@ -1415,7 +1421,7 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 freshness_invalid_reason="",
                 freshness_window_sec=210,
                 points=[pt_short, pt_long],
-                title="SVG制作测响应",
+                title="矢量图渲染测试示例",
             )
             rep_b = ConversationDetailReport(
                 conversation_id="long0001-0000-0000-0000-000000000001",
@@ -2128,13 +2134,701 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 dw.sync_from_snapshot(snap_filtered)
             # Zero redundant refreshes even though conv.total_step_count (12) != rep.total_steps (50)!
             self.assertEqual(calls["n"], 1)
-            self.assertIn("历史回看", dw._lbl_live_tag.cget("text"))
+            # v7 policy: single-conversation detail window always represents full live conversation, never fragmented by left account filter
+            self.assertIn("实时", dw._lbl_live_tag.cget("text"))
             dw.close()
         finally:
             try:
                 root.destroy()
             except tk.TclError:
                 pass
+
+    def test_v7_single_stream_timeout_warns_with_dynamic_duration_and_culprit_and_escalates_on_second(self) -> None:
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "demo7a12-1111-2222-3333-444455556666"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ann_dir = root / "annotations"
+            ann_dir.mkdir()
+            (ann_dir / f"{cid}.pbtxt").write_text('title: "多模态构图排版示例"\n', encoding="utf-8")
+            ls_log = root / "language_server.log"
+
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            err_ts = now - 60.0
+            glog_t1 = time.strftime("%m%d %H:%M:%S", time.localtime(err_ts))
+            # Include a 500ms local RPC timeout line to prove short non-LLM timeouts are ignored!
+            ls_log.write_text(
+                f"ERROR: logging before google.Init: I{glog_t1}.050000 1234 rpc.go:99] local probe timed out after 500ms\n"
+                f"ERROR: logging before google.Init: I{glog_t1}.100000 1234 run.go:315] "
+                f"Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s\n",
+                encoding="utf-8",
+            )
+            tr_lines = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts - 30)), "content": "hi"},
+                # PLANNER_RESPONSE mentioning literal "ERROR_MESSAGE" in content MUST NOT be swallowed!
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts - 15)), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300, "content": 'checking "ERROR_MESSAGE" handler'},
+                {"type": "ERROR_MESSAGE", "step_index": 3, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts + 1.0)), "content": "stream idle timeout"},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts + 10)), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 120000, "output_tokens": 350},
+            ]
+            tp = b_dir / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in tr_lines) + "\n", encoding="utf-8")
+            os.utime(tp, (err_ts + 10, err_ts + 10))
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "summaries_db_path": root / "summaries.db",
+                    "annotations_dir": ann_dir,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            engine._account_cache = AccountQuotaInfo(email_masked="al***1@example.com", short_label="al***1", online=True, observed_at=now)
+            engine._last_account_poll = now
+
+            snap1 = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap1.grade, "WARN")
+            self.assertEqual(snap1.level, "orange")
+            self.assertEqual(snap1.recent_timeout, 1)
+            # Step 2 with literal "ERROR_MESSAGE" in content MUST be preserved (total 2 planner steps!)
+            self.assertEqual(snap1.active_conversations[0].total_step_count, 2)
+            self.assertTrue(any("流超时 (10m)" in ev.summary and "demo7a" in ev.summary and "多模态构图排版示例" in ev.summary for ev in snap1.recent_events))
+            self.assertIn("demo7a", snap1.sub_headline)
+            txt1 = format_text_summary(snap1)
+            self.assertIn("流超时=1/1", txt1)
+            self.assertNotIn("5m超时=", txt1)
+
+            # Second timeout (or 503) in window escalates to red T2
+            glog_t2 = time.strftime("%m%d %H:%M:%S", time.localtime(now - 20.0))
+            with ls_log.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"ERROR: logging before google.Init: I{glog_t2}.200000 1234 run.go:315] "
+                    f"Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available)\n"
+                )
+            snap2 = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap2.grade, "T2")
+            self.assertEqual(snap2.level, "red")
+
+    def test_v7_t2_e2e_no_light_subagent_whitewash_and_multimodal_spike_anti_flap(self) -> None:
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            now = datetime.datetime.now().replace(hour=12, minute=30, second=0, microsecond=0).timestamp()
+            err_ts = now - 300.0
+            g1 = time.strftime("%m%d %H:%M:%S", time.localtime(err_ts - 5))
+            g2 = time.strftime("%m%d %H:%M:%S", time.localtime(err_ts))
+            ls_log.write_text(
+                f"ERROR: logging before google.Init: I{g1}.100000 1234 run.go:315] Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available)\n"
+                f"ERROR: logging before google.Init: I{g2}.200000 1234 run.go:315] Run: attempt 2 failed (UNAVAILABLE (code 503): No capacity available)\n",
+                encoding="utf-8",
+            )
+
+            # Case 1 (Negative test): Main Carbon High conversation is STILL degraded (TTFT 115s, 130s),
+            # while a Hydrogen XHigh subagent ran 6 fast 4s steps after T2 -> MUST STAY RED T2 (NO whitewash!)
+            main_cid = "mainc001-0000-0000-0000-000000000001"
+            sub_cid = "subh0001-0000-0000-0000-000000000002"
+            (root / "brain" / main_cid / ".system_generated" / "logs").mkdir(parents=True)
+            (root / "brain" / sub_cid / ".system_generated" / "logs").mkdir(parents=True)
+
+            main_rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts - 60)), "content": "main"}]
+            mconn = sqlite3.connect(convs / f"{main_cid}.db")
+            mconn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            for i, ttft in enumerate((115, 130), start=1):
+                in_t = 90000 if i == 1 else 2000
+                cr_t = 0 if i == 1 else 90000
+                main_rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": i + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts + 30 * i)),
+                    "model": "gemini-4-carbon-high", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 300 + i,
+                })
+                mconn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (i, _build_fake_gen_blob(in_t, cr_t, 300 + i, ttft_s=ttft, strm_s=2)))
+            mconn.commit()
+            mconn.close()
+            tp_m = root / "brain" / main_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tp_m.write_text("\n".join(json.dumps(r) for r in main_rows) + "\n", encoding="utf-8")
+            os.utime(tp_m, (now - 10, now - 10))
+
+            sub_rows = []
+            sconn = sqlite3.connect(convs / f"{sub_cid}.db")
+            sconn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            for i in range(1, 7):
+                in_t = 40000 if i == 1 else 1500
+                cr_t = 0 if i == 1 else 40000 + i * 1000
+                sub_rows.append({
+                    "source": "SWARM", "type": "PLANNER_RESPONSE", "step_index": i,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts + 20 * i)),
+                    "model": "gemini-4-hydrogen-xhigh", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 200 + i,
+                })
+                sconn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (i, _build_fake_gen_blob(in_t, cr_t, 200 + i, ttft_s=4, strm_s=1)))
+            sconn.commit()
+            sconn.close()
+            tp_s = root / "brain" / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tp_s.write_text("\n".join(json.dumps(r) for r in sub_rows) + "\n", encoding="utf-8")
+            os.utime(tp_s, (now - 5, now - 5))
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "summaries_db_path": root / "summaries.db",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            eng._account_cache = AccountQuotaInfo(email_masked="al***1@example.com", short_label="al***1", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap_still_t2 = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_still_t2.grade, "T2")
+            self.assertEqual(snap_still_t2.level, "red")
+
+            # Case 2 (Positive anti-flap): Main Neon XHigh runs 4 fast steps (12s, 14s, 16s, 18s) + 1 slow 95s multimodal step
+            # (mean=31s, median=16s < 30s, latest=95s < 150s) -> stays stable orange WARN without flapping back to T2!
+            neon_cid = "mainn002-0000-0000-0000-000000000003"
+            (root / "brain" / neon_cid / ".system_generated" / "logs").mkdir(parents=True)
+            n_rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts - 60)), "content": "neon"}]
+            nconn = sqlite3.connect(convs / f"{neon_cid}.db")
+            nconn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            for i, ttft in enumerate((12, 14, 16, 18, 95), start=1):
+                in_t = 80000 if i == 1 else 2500
+                cr_t = 0 if i == 1 else 80000 + i * 2000
+                n_rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": i + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(err_ts + 25 * i)),
+                    "model": "gemini-4-neon-xhigh", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 350 + i,
+                })
+                nconn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (i, _build_fake_gen_blob(in_t, cr_t, 350 + i, ttft_s=ttft, strm_s=2)))
+            nconn.commit()
+            nconn.close()
+            tp_n = root / "brain" / neon_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tp_n.write_text("\n".join(json.dumps(r) for r in n_rows) + "\n", encoding="utf-8")
+            os.utime(tp_n, (now - 1, now - 1))
+
+            snap_warn = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_warn.grade, "WARN")
+            self.assertEqual(snap_warn.level, "orange")
+            self.assertIn("TTFT 中位 16.", snap_warn.t2_recovery_note or snap_warn.sub_headline)
+
+    def test_v7_cross_account_internal_gap_recovers_earlier_ttft_bars(self) -> None:
+        import datetime
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "gap12345-0000-1111-2222-333344445555"
+            b_dir = root / "brain" / cid / ".system_generated" / "logs"
+            b_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ck_logs = root / "cockpit_logs"
+            ck_logs.mkdir()
+
+            now = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+            t_a1 = now - 3600.0
+            t_b = now - 1800.0
+            t_a2 = now - 120.0
+
+            (ck_logs / "app.log.2026-11-21").write_text(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_a1 - 60))}  INFO [Antigravity 2.0] 写入系统凭据: alpha1@example.com\n"
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_b - 60))}  INFO [Antigravity 2.0] 写入系统凭据: beta22@example.com\n"
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(t_a2 - 60))}  INFO [Antigravity 2.0] 写入系统凭据: alpha1@example.com\n",
+                encoding="utf-8",
+            )
+
+            tr_rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_a1 - 10)), "content": "start"}]
+            dbp = convs / f"{cid}.db"
+            conn = sqlite3.connect(dbp)
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            gen_idx = 0
+            # 4 early steps by alpha1
+            for i in range(4):
+                gen_idx += 1
+                in_t = 50000 if i == 0 else 2000
+                cr_t = 0 if i == 0 else 50000 + i * 2000
+                tr_rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": gen_idx + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_a1 + i * 15)),
+                    "model": "gemini-4-neon-xhigh", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 300 + i,
+                })
+                conn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (gen_idx, _build_fake_gen_blob(in_t, cr_t, 300 + i, ttft_s=11 + i, strm_s=2)))
+            # 22 intervening steps by beta22 (> 16 tail window!)
+            for j in range(22):
+                gen_idx += 1
+                in_t = 2500
+                cr_t = 70000 + j * 1500
+                tr_rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": gen_idx + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_b + j * 15)),
+                    "model": "gemini-4-neon-xhigh", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 400 + j,
+                })
+                conn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (gen_idx, _build_fake_gen_blob(in_t, cr_t, 400 + j, ttft_s=30, strm_s=2)))
+            # 2 latest steps back on alpha1
+            for k in range(2):
+                gen_idx += 1
+                in_t = 3000
+                cr_t = 120000 + k * 3000
+                tr_rows.append({
+                    "type": "PLANNER_RESPONSE", "step_index": gen_idx + 1,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(t_a2 + k * 20)),
+                    "model": "gemini-4-neon-xhigh", "input_tokens": in_t, "cache_read_tokens": cr_t, "output_tokens": 500 + k,
+                })
+                conn.execute("INSERT INTO gen_metadata VALUES (?, ?)", (gen_idx, _build_fake_gen_blob(in_t, cr_t, 500 + k, ttft_s=9 + k, strm_s=2)))
+            conn.commit()
+            conn.close()
+
+            tp = b_dir / "transcript.jsonl"
+            tp.write_text("\n".join(json.dumps(r) for r in tr_rows) + "\n", encoding="utf-8")
+            os.utime(tp, (t_a2 + 20, t_a2 + 20))
+
+            engine = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "summaries_db_path": root / "summaries.db",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "cockpit_logs_dir": ck_logs,
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            engine._account_cache = AccountQuotaInfo(email_masked="al***1@example.com", short_label="al***1", online=True, observed_at=now)
+            engine._last_account_poll = now
+            snap = engine.poll(now_ts=now, force_account=False)
+            self.assertEqual(len(snap.active_conversations), 1)
+            conv = snap.active_conversations[0]
+            # All 6 alpha1 steps across the 22-step beta22 gap MUST have recovered non-None TTFT bars!
+            self.assertEqual(len(conv.recent_ttfts), 6)
+            self.assertTrue(all(v is not None for v in conv.recent_ttfts), f"Expected all non-None TTFTs, got {conv.recent_ttfts}")
+            self.assertAlmostEqual(conv.recent_ttfts[0] or 0.0, 11.0, delta=0.5)
+            self.assertAlmostEqual(conv.recent_ttfts[-1] or 0.0, 10.0, delta=0.5)
+
+    def _create_slot_env(self, root: Path, now: float):
+        convs = root / "conversations"
+        brain = root / "brain"
+        convs.mkdir(parents=True, exist_ok=True)
+        brain.mkdir(parents=True, exist_ok=True)
+        sum_db = root / "conversation_summaries.db"
+        conn = sqlite3.connect(sum_db)
+        conn.execute(
+            "CREATE TABLE conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, "
+            "last_modified_time TEXT, status TEXT, agent_name TEXT, "
+            "parent_conversation_id TEXT, nesting_depth INTEGER, not_fully_idle INTEGER)"
+        )
+        conn.commit()
+        return convs, brain, sum_db, conn
+
+    def _add_slot_conv(
+        self,
+        convs: Path,
+        brain: Path,
+        conn: sqlite3.Connection,
+        cid: str,
+        age_sec: float,
+        now: float,
+        *,
+        in_summary: bool = True,
+        title: str = "",
+        agent_name: str = "",
+        parent_id: str = "",
+        nesting_depth: int = 0,
+        status: str = "CASCADE_RUN_STATUS_IDLE",
+        not_fully_idle: int = 0,
+        touch_shm_fresh: bool = False,
+        db_bytes: int = 4096,
+    ) -> None:
+        ts = now - age_sec
+        dbp = convs / f"{cid}.db"
+        dbp.write_bytes(b"x" * db_bytes)
+        os.utime(dbp, (ts, ts))
+        wal = convs / f"{cid}.db-wal"
+        wal.write_bytes(b"")
+        os.utime(wal, (ts, ts))
+        shm = convs / f"{cid}.db-shm"
+        shm.write_bytes(b"s" * 64)
+        os.utime(shm, (now, now) if touch_shm_fresh else (ts, ts))
+        bdir = brain / cid / ".system_generated" / "logs"
+        bdir.mkdir(parents=True, exist_ok=True)
+        tp = bdir / "transcript.jsonl"
+        tp.write_text('{"type":"GENERIC"}\n', encoding="utf-8")
+        os.utime(tp, (ts, ts))
+        if in_summary:
+            iso_utc = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?,?,?,?)",
+                (cid, title, 10, iso_utc, status, agent_name, parent_id, nesting_depth, not_fully_idle),
+            )
+            conn.commit()
+
+    def test_v7_slot_scanner_ignores_db_shm_mtime_and_detects_main_at_risk_floor(self) -> None:
+        from core.slot_manager import SlotInventoryScanner
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            convs, brain, sum_db, conn = self._create_slot_env(root, now)
+            try:
+                # 1 main conversation (old, must NEVER be cleanable)
+                self._add_slot_conv(convs, brain, conn, "main0001-0000", 86400, now, title="重要主对话")
+                # 1 old completed subagent whose .db-shm was touched 0s ago (must IGNORE .db-shm mtime!)
+                self._add_slot_conv(
+                    convs, brain, conn, "subold01-0000", 3 * 3600, now,
+                    agent_name="research", parent_id="main0001-0000", nesting_depth=1, touch_shm_fresh=True,
+                )
+                # 1 completed subagent at 45m (protected at 120m, cleanable at 30m floor)
+                self._add_slot_conv(
+                    convs, brain, conn, "submid01-0000", 45 * 60, now,
+                    agent_name="worker", parent_id="main0001-0000", nesting_depth=1,
+                )
+                # 1 recent subagent at 10m (strictly inside 30m hard floor)
+                self._add_slot_conv(
+                    convs, brain, conn, "subnew01-0000", 10 * 60, now,
+                    agent_name="worker", parent_id="main0001-0000", nesting_depth=1,
+                )
+                # 1 running subagent + 1 titled subagent + 1 not_fully_idle=1 + 1 unknown unregistered .db
+                self._add_slot_conv(
+                    convs, brain, conn, "subrun01-0000", 5 * 3600, now,
+                    agent_name="worker", status="CASCADE_RUN_STATUS_RUNNING",
+                )
+                self._add_slot_conv(
+                    convs, brain, conn, "subtit01-0000", 5 * 3600, now,
+                    agent_name="worker", title="有标题子会话",
+                )
+                self._add_slot_conv(
+                    convs, brain, conn, "subnfi01-0000", 5 * 3600, now,
+                    agent_name="worker", not_fully_idle=1,
+                )
+                self._add_slot_conv(convs, brain, conn, "unknow01-0000", 5 * 3600, now, in_summary=False)
+            finally:
+                conn.close()
+
+            scanner = SlotInventoryScanner(convs, brain, sum_db)
+            inv = scanner.scan(now_ts=now, protect_age_min=120, include_items=True, force=True)
+            self.assertEqual(inv.total_db, 8)
+            self.assertEqual(inv.main_count, 1)
+            self.assertEqual(inv.cleanable_sub_count, 1)
+            self.assertEqual(inv.cleanable_30m_count, 2)
+            self.assertEqual(inv.protected_sub_count, 5)
+            self.assertEqual(inv.unknown_count, 1)
+            self.assertFalse(inv.main_at_risk)
+            cleanable_ids = [it.conversation_id for it in inv.items if it.category == "cleanable_sub"]
+            self.assertEqual(cleanable_ids, ["subold01-0000"])
+
+            # Simulate hitting 30m hard floor at cap=50 (add 42 extra protected main convs -> total=50, clean30=2, pinned_floor=48 >= cap-30!)
+            conn_extra = sqlite3.connect(sum_db)
+            try:
+                for idx_m in range(42):
+                    self._add_slot_conv(convs, brain, conn_extra, f"mainex{idx_m:02d}-0000", 86400, now, title=f"主对话{idx_m}")
+            finally:
+                conn_extra.close()
+            inv_risk = scanner.scan(now_ts=now, slot_cap=50, warn_threshold=38, alert_threshold=45, protect_age_min=120, force=True)
+            self.assertTrue(inv_risk.main_at_risk)
+            self.assertEqual(inv_risk.status, "main_at_risk")
+            self.assertIn("30m", inv_risk.risk_message)
+
+    def test_v7_slot_cleaner_enforces_6_guards_30m_floor_locked_skip_and_archive_sha256(self) -> None:
+        from core.slot_manager import MIN_PROTECT_AGE_MIN, SlotInventoryScanner, SlotSubagentCleaner
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            convs, brain, sum_db, conn = self._create_slot_env(root, now)
+            try:
+                self._add_slot_conv(convs, brain, conn, "main-keep-01", 86400, now, title="主对话")
+                self._add_slot_conv(convs, brain, conn, "sub-clean-01", 3 * 3600, now, agent_name="w1", nesting_depth=1)
+                self._add_slot_conv(convs, brain, conn, "sub-lock-02", 3 * 3600, now, agent_name="w2", nesting_depth=1)
+                self._add_slot_conv(convs, brain, conn, "sub-fresh-03", 15 * 60, now, agent_name="w3", nesting_depth=1)
+                self._add_slot_conv(convs, brain, conn, "sub-arch-04", 4 * 3600, now, agent_name="w4", nesting_depth=1)
+            finally:
+                conn.close()
+
+            scanner = SlotInventoryScanner(convs, brain, sum_db)
+            recycled_paths: List[str] = []
+
+            def fake_recycle(p: Path):
+                if p.name == "sub-lock-02.db":
+                    return False, "sharing_violation"
+                recycled_paths.append(str(p))
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+                return True, ""
+
+            journal = root / "logs" / "slot_cleanup_journal.jsonl"
+            cleaner = SlotSubagentCleaner(scanner, journal_path=journal, recycle_fn=fake_recycle)
+
+            # Requesting protect_age_min=5 MUST clamp to 30m hard floor (sub-fresh-03 at 15m MUST survive!)
+            res_rec = cleaner.execute_cleanup(protect_age_min=5, mode="recycle", trigger="manual", dry_run=False, now_ts=now)
+            self.assertEqual(res_rec.protect_age_min, MIN_PROTECT_AGE_MIN)
+            self.assertEqual(res_rec.removed_count, 2)  # sub-clean-01 + sub-arch-04
+            self.assertEqual(res_rec.skipped_locked_count, 1)  # sub-lock-02
+            # Locked subagent MUST keep its .db, .db-wal, and brain dir untouched!
+            self.assertTrue((convs / "sub-lock-02.db").exists())
+            self.assertTrue((convs / "sub-lock-02.db-wal").exists())
+            self.assertTrue((brain / "sub-lock-02").is_dir())
+            # Main conversation and 15m subagent MUST remain untouched!
+            self.assertTrue((convs / "main-keep-01.db").exists())
+            self.assertTrue((convs / "sub-fresh-03.db").exists())
+            self.assertTrue(journal.is_file())
+
+            # Archive mode: missing target drive aborts safely with 0 deletions (dynamically pick an unmounted drive letter)
+            conn2 = sqlite3.connect(sum_db)
+            self._add_slot_conv(convs, brain, conn2, "sub-tar-05", 4 * 3600, now, agent_name="w5", nesting_depth=1)
+            conn2.close()
+            missing_drive = next((f"{ch}:" for ch in "QWVYXUPONMLKJIHGF" if not Path(f"{ch}:\\").exists()), "Q:")
+            res_bad_arch = cleaner.execute_cleanup(
+                protect_age_min=120, mode="archive", archive_dir=f"{missing_drive}/nonexistent_drive_xyz/arch", trigger="manual", dry_run=False, now_ts=now
+            )
+            self.assertTrue(bool(res_bad_arch.error))
+            self.assertIn("archive_drive_missing", res_bad_arch.error)
+            self.assertTrue((convs / "sub-tar-05.db").exists())
+
+            # Archive mode with valid local dir: writes PAX tar + SHA-256 verification before removing source
+            # (both sub-tar-05 and previously-locked sub-lock-02 are now cleanly archived & removed!)
+            arch_dir = root / "archives"
+            res_arch = cleaner.execute_cleanup(
+                protect_age_min=120, mode="archive", archive_dir=str(arch_dir), trigger="manual", dry_run=False, now_ts=now
+            )
+            self.assertEqual(res_arch.error, "")
+            self.assertEqual(res_arch.removed_count, 2)
+            self.assertEqual(set(res_arch.removed_cids), {"sub-lock-02", "sub-tar-05"})
+            self.assertFalse((convs / "sub-tar-05.db").exists())
+            self.assertTrue(Path(res_arch.archive_path).is_file())
+
+    def test_v7_auto_clean_offline_idle_and_high_water_respects_readonly_and_toggle(self) -> None:
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            convs, brain, sum_db, conn = self._create_slot_env(root, now)
+            try:
+                self._add_slot_conv(convs, brain, conn, "main-01", 86400, now, title="主对话")
+                self._add_slot_conv(convs, brain, conn, "sub-old-01", 3 * 3600, now, agent_name="w1", nesting_depth=1)
+            finally:
+                conn.close()
+
+            def fake_recycle(p: Path):
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+                return True, ""
+
+            base_paths = {
+                "brain_dir": brain,
+                "conversations_dir": convs,
+                "summaries_db_path": sum_db,
+                "daemon_dir": root / "daemon",
+                "ls_log_path": root / "language_server.log",
+                "cockpit_quota_db": root / "missing.sqlite",
+                "ledger_path": root / "account_ledger.json",
+                "slot_journal_path": root / "slot_journal.jsonl",
+            }
+            # 1. read_only=True MUST never delete anything
+            ro_eng = AntigravityMonitorEngine(paths=base_paths, read_only=True)
+            ro_eng.slot_cleaner._recycle_fn = fake_recycle
+            ro_eng._account_cache = AccountQuotaInfo(short_label="离线", online=False, observed_at=now)
+            ro_eng._last_account_poll = now
+            snap_ro = ro_eng.poll(now_ts=now, force_account=False)
+            self.assertIsNone(ro_eng.maybe_auto_clean_slots(snap_ro, now_ts=now))
+            self.assertIsNone(ro_eng.maybe_auto_clean_slots(snap_ro, now_ts=now + 30.0))
+            self.assertTrue((convs / "sub-old-01.db").exists())
+
+            # 2. Writable engine with auto_clean disabled MUST not delete
+            eng = AntigravityMonitorEngine(paths=base_paths, config={"slot_auto_clean_enabled": False}, read_only=False)
+            eng.slot_cleaner._recycle_fn = fake_recycle
+            eng._account_cache = AccountQuotaInfo(short_label="离线", online=False, observed_at=now)
+            eng._last_account_poll = now
+            snap_off = eng.poll(now_ts=now, force_account=False)
+            self.assertIsNone(eng.maybe_auto_clean_slots(snap_off, now_ts=now + 30.0))
+            self.assertTrue((convs / "sub-old-01.db").exists())
+
+            # 3. Enable auto_clean -> first offline poll arms timer (<15s no-op), >=15s offline triggers auto_offline!
+            eng.update_config({"slot_auto_clean_enabled": True})
+            self.assertIsNone(eng.maybe_auto_clean_slots(snap_off, now_ts=now))
+            self.assertTrue((convs / "sub-old-01.db").exists())
+            res = eng.maybe_auto_clean_slots(snap_off, now_ts=now + 20.0)
+            self.assertIsNotNone(res)
+            assert res is not None
+            self.assertEqual(res.trigger, "auto_offline")
+            self.assertEqual(res.removed_count, 1)
+            self.assertFalse((convs / "sub-old-01.db").exists())
+            self.assertTrue((convs / "main-01.db").exists())
+
+    def test_v7_cli_clean_subagents_json_and_slots_window_smoke(self) -> None:
+        import tkinter as tk
+        from core.slot_manager import SlotConversationItem, SlotInventorySnapshot
+        from main import _parse_args
+        from ui.slots_window import ConversationSlotsWindow
+        from ui.themes import THEMES
+
+        ns = _parse_args(["--clean-subagents", "--dry-run", "--min-age", "15", "--json"])
+        self.assertTrue(ns.clean_subagents)
+        self.assertTrue(ns.dry_run)
+        self.assertEqual(ns.min_age, 15)
+        self.assertTrue(ns.json)
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        try:
+            now = time.time()
+            fake_inv = SlotInventorySnapshot(
+                observed_at=now,
+                cap=500,
+                total_db=488,
+                remaining_slots=12,
+                main_count=320,
+                protected_sub_count=152,
+                cleanable_sub_count=16,
+                cleanable_bytes=25 * 1024 * 1024,
+                cleanable_30m_count=18,
+                cleanable_30m_bytes=28 * 1024 * 1024,
+                unknown_count=0,
+                pinned_floor_count=470,
+                protect_age_min=120,
+                status="main_at_risk",
+                main_at_risk=True,
+                risk_message="已撞 30m 保护下限！请先备份主对话再重启",
+                summary_db_ok=True,
+                total_bytes=420 * 1024 * 1024,
+                items=[
+                    SlotConversationItem(
+                        conversation_id="sub11111-aaaa", short_id="sub111", category="cleanable_sub",
+                        title="", agent_name="research", parent_conversation_id="main1111-aaaa",
+                        step_count=12, status="CASCADE_RUN_STATUS_IDLE", not_fully_idle=0,
+                        disk_bytes=1500000, last_active_ts=now - 7500, age_min=125.0,
+                        cleanable_at_30m=True, protect_reason="已结束闲置 · 125分钟前",
+                    ),
+                    SlotConversationItem(
+                        conversation_id="main1111-aaaa", short_id="main11", category="main",
+                        title="主力工作对话", agent_name="", parent_conversation_id="",
+                        step_count=88, status="CASCADE_RUN_STATUS_IDLE", not_fully_idle=0,
+                        disk_bytes=8500000, last_active_ts=now - 600, age_min=10.0,
+                        cleanable_at_30m=False, protect_reason="主对话（永久保护）",
+                    ),
+                ],
+            )
+            sw = ConversationSlotsWindow(
+                parent=root,
+                theme=THEMES["midnight_blue"],
+                load_inventory=lambda: fake_inv,
+                on_clean_now=lambda _cb: None,
+                is_auto_clean_enabled=lambda: True,
+                on_toggle_auto_clean=lambda: None,
+                get_protect_age_min=lambda: 120,
+                get_clean_mode=lambda: "recycle",
+            )
+            sw.show(place_near_parent=True)
+            root.update()
+            self.assertTrue(bool(sw._risk_frame.winfo_manager()))
+            self.assertIn("30m", sw._lbl_risk.cget("text"))
+            sw._set_tab("main")
+            sw.apply_theme(THEMES["obsidian_dark"])
+            root.update()
+            sw.close()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+    def test_v7_dual_review_hardening_regressions(self) -> None:
+        from core.log_monitor import AccountQuotaInfo
+        from core.slot_manager import _parse_summary_timestamp_conservative
+
+        # 1. RFC3339Nano 7/8/9 fractional digits + half-hour tz + date-only & bool rejection
+        now_utc = datetime.datetime(2026, 11, 21, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+        ts_8frac = _parse_summary_timestamp_conservative("2026-11-20T19:00:00.12345678-05:00", now_utc)
+        self.assertIsNotNone(ts_8frac)
+        self.assertAlmostEqual(ts_8frac or 0.0, now_utc, delta=1.0)
+        ts_half_tz = _parse_summary_timestamp_conservative("2026-11-21T05:30:00.123456789+05:30", now_utc)
+        self.assertIsNotNone(ts_half_tz)
+        self.assertAlmostEqual(ts_half_tz or 0.0, now_utc, delta=1.0)
+        self.assertIsNone(_parse_summary_timestamp_conservative("2026-11-21", now_utc))
+        self.assertIsNone(_parse_summary_timestamp_conservative(True, now_utc))
+
+        # 2. read_only=True MUST reject clean_old_subagents(dry_run=False)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            convs, brain, sum_db, conn = self._create_slot_env(root, now)
+            try:
+                self._add_slot_conv(convs, brain, conn, "sub-ro-01", 4 * 3600, now, agent_name="w1", nesting_depth=1)
+                self._add_slot_conv(convs, brain, conn, "sub-hw-lock", 4 * 3600, now, agent_name="w2", nesting_depth=1)
+                self._add_slot_conv(convs, brain, conn, "sub-hw-45m", 45 * 60, now, agent_name="w3", nesting_depth=1)
+                # Fill up to cap=50 so auto_high_water hits alert_th=45
+                for i in range(47):
+                    self._add_slot_conv(convs, brain, conn, f"main-hw-{i:02d}", 86400, now, title=f"主对话{i}")
+            finally:
+                conn.close()
+
+            paths = {
+                "brain_dir": brain, "conversations_dir": convs, "summaries_db_path": sum_db,
+                "daemon_dir": root / "daemon", "ls_log_path": root / "language_server.log",
+                "cockpit_quota_db": root / "missing.sqlite", "ledger_path": root / "account_ledger.json",
+                "slot_journal_path": root / "slot_journal.jsonl",
+            }
+            ro_eng = AntigravityMonitorEngine(paths=paths, read_only=True)
+            res_ro = ro_eng.clean_old_subagents(dry_run=False, now_ts=now)
+            self.assertEqual(res_ro.error, "read_only_mode_forbids_cleanup")
+            self.assertTrue((convs / "sub-ro-01.db").exists())
+
+            # 3. Online auto_high_water with 1 locked >2h subagent MUST still step down to 30m and clean unlocked 45m subagent!
+            def partial_lock_recycle(p: Path):
+                if p.name == "sub-hw-lock.db":
+                    return False, "locked_by_ls"
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+                return True, ""
+
+            cfg = {"slot_cap": 100, "slot_warn_threshold": 40, "slot_alert_threshold": 46, "slot_auto_trigger_threshold": 45, "slot_auto_clean_enabled": True}
+            # Direct config values on engine with cap=50 test override
+            eng = AntigravityMonitorEngine(paths=paths, config=cfg, read_only=False)
+            eng.config["slot_cap"] = 50
+            eng.config["slot_warn_threshold"] = 38
+            eng.config["slot_auto_trigger_threshold"] = 42
+            eng.config["slot_alert_threshold"] = 45
+            eng.slot_cleaner._recycle_fn = partial_lock_recycle
+            eng._account_cache = AccountQuotaInfo(short_label="al***1", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap_hw = eng.poll(now_ts=now, force_account=False)
+            # First-poll main_at_risk / JSON slots contract check
+            js = json.loads(format_json_snapshot(snap_hw))
+            self.assertIn("remaining_slots", js["slots"])
+            self.assertIn("risk_message", js["slots"])
+            res_hw = eng.maybe_auto_clean_slots(snap_hw, now_ts=now)
+            self.assertIsNotNone(res_hw)
+            assert res_hw is not None
+            self.assertEqual(res_hw.trigger, "auto_high_water")
+            # Both sub-ro-01 (>2h) AND sub-hw-45m (45m, stepped pass!) removed while locked sub-hw-lock safely skipped!
+            self.assertFalse((convs / "sub-ro-01.db").exists())
+            self.assertFalse((convs / "sub-hw-45m.db").exists())
+            self.assertTrue((convs / "sub-hw-lock.db").exists())
 
 
 if __name__ == "__main__":

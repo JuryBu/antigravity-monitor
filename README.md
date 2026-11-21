@@ -12,8 +12,10 @@
   - **红（异常掉缓存）**：同模型短间隔内异常 `cr = 0`，防单步偶中「洗白」且支持按切号账本隔离历史账号红条。
 - **主对话 / 子代理分类与多主对话并行**：自动识别主对话与子代理（`主对话 / 子代理 / 全部` 切换，内置主对话保护槽位防止大批子代理挤爆列表）；支持 24 条活跃对话滚动与底边自由拉高（`3～12` 行）；支持右键或详情页 **📌 聚焦指定主对话**到主面板，大上下文保鲜卡悬停可一览全部活跃大上下文主对话倒计时。
 - **单对话长线体检弹窗（实时动态更新 + 模型切换色带）**：左键点击任意对话行即可打开无边框长线详情窗口，随主面板 2.5s 轮询**实时动态刷新**新步与保鲜倒计时（随主窗收起或隐藏自动同步关闭）；支持 `近 60 步 / 全部步数` 切换、三图联动鼠标十字准星、**顶部彩色模型时间色带与切换虚线**（每步精准标注模型）、请求体增长与紫色压缩曲线、TTFT 45s/90s 参考线（含异常长尾柔封顶）及四色缓存长线，跨天自动显示 `MM-DD` 日期。
-- **按账号隔离的 30 分钟日志滑动窗与分模型 TTFT 恢复判定**：按字节偏移增量读取 `language_server.log`（剥离 glog 微秒前缀，防误匹配 `503`），严格按切号账本隔离当前账号的 `503 / 5m超时 / 403`（切号瞬间清零，绝不连坐新号）；聚合当前账号近 30 分钟不同模型的独立 TTFT/吞吐（速度卡悬停可对比），503 爆发后若切换模型或后续连续稳定响应且 TTFT 正常则自动从 `T2` 降级恢复，避免单次瞬时波动锁死 30 分钟红灯。
-- **面向自动化的无阻塞 CLI & `--json` 契约**：提供无 `pause` 包装入口 `agy-watch.cmd`，支持 `--json`、`--cli`、`--readonly`、`--conversation-id <id>`、语义化退出码（`0/1/2`）与分池配额/重置时间透传，详见 [CLI 调用说明](docs/CLI调用说明.md)。
+- **按账号隔离的 30 分钟日志滑动窗、流超时反查与抗横跳恢复判定**：按字节偏移增量读取 `language_server.log`（剥离 glog 微秒前缀，防误匹配 `503`），严格按切号账本隔离当前账号的 `503 / 流超时 / 403`（切号瞬间清零，绝不连坐新号）；动态提取流超时真实时长（如 `10m` / `5m`）并按 `±6s` 反查出事对话短 ID 与标题；单次偶发流超时或单次 503 报橙色 `WARN`，累计 `>= 2` 次才升级红色 `T2`；事后按主对话模型中位 TTFT 评估恢复（排除子代理与轻量免疫模型误洗白，容忍单步多模态长尾防 `WARN <-> T2` 横跳）。
+- **本机 500 会话槽位水位监控与安全子代理让位清理**：实时只读盘点本机 `conversations/*.db`（忽略 `.db-shm` 误触 mtime），点击主面板槽位条可展开「本机 500 槽位分布」详情窗查看主对话、可清子代理、保护中子代理与未知文件分布；支持一键手动清理 2 小时外已结束子代理，并默认开启自动让位清理（在 Antigravity 关闭空闲或高水位时自动执行，随时可关，默认移入 Windows 系统回收站可还原，6 重防误删护栏 + 30 分钟硬下限绝不突破；撞下限危及主对话时主动弹出红警提醒）。
+- **跨账号 TTFT 连续衔接与完整单对话详情窗**：当同一对话先后跨越多个账号时，主面板通过缓存化的全局对齐投影自动找回该账号更早在此对话的真实 TTFT 柱子；右侧单对话长线详情窗永远展示该对话自身完整轨迹，不被左侧账号筛选切碎。
+- **面向自动化的无阻塞 CLI & `--json` 契约**：提供无 `pause` 包装入口 `agy-watch.cmd`，支持 `--json`、`--cli`、`--readonly`、`--conversation-id <id>`、`--account`、`--range` 及显式 `--clean-subagents [--dry-run] [--min-age]`，详见 [CLI 调用说明](docs/CLI调用说明.md)。
 
 ## 健康评级与压力说明
 
@@ -21,19 +23,20 @@
 |---|---|---|---|---|
 | **IDLE 离线** | 青/灰 | `offline_unknown` | `2` | 客户端未运行且无近 2 分钟实时轨迹，暂停实时异常告警 |
 | **T0 健康** | 绿灯 | `normal` | `0` | 近 30 分钟缓存与底层日志均正常，且今日步数 `< 960` |
-| **留意预警** | 橙灯 | `warn` | `1` | 单步异常归零、偶发 1 次 503、疑似暗限速，或今日步数达到黄线（默认 `960`） |
+| **留意预警** | 橙灯 | `warn` | `1` | 单步异常归零、偶发 1 次 503 或 1 次流超时、疑似暗限速，或今日步数达到黄线（默认 `960`） |
 | **步数红线** | 红灯 | `red` | `1` | 当前账号今日累计步数达到保护红线（默认 `1200`） |
 | **T1 掉缓存** | 红灯 | `degraded` | `1` | 活跃会话连续 `>= 2` 步异常 `cr = 0`，或近 10 步异常 `>= 4` 次且命中率 `< 50%` |
-| **T2 限流黑洞** | 红灯 | `degraded` | `1` | 近 30 分钟出现 5 分钟流超时或 `>= 2` 次 `503 No capacity` |
+| **T2 限流黑洞** | 红灯 | `degraded` | `1` | 近 30 分钟累计 `503 + 流超时 >= 2` 次且主对话模型事后未稳定恢复 |
 | **T3 封禁告警** | 红灯 | `degraded` | `1` | 近 30 分钟检测到 `403 TOS_VIOLATION / PERMISSION_DENIED` |
 
 ## 数据源说明（全部本地只读）
 
 | 数据源 | 本地路径 | 用途 |
 |---|---|---|
-| 对话轨迹日志 | `%USERPROFILE%\.gemini\antigravity\brain\<id>\.system_generated\logs\transcript.jsonl` | 逐轮 `input_tokens`、`cache_read_tokens`、请求体增量 `±ΔK`、`CHECKPOINT` 压缩事件、主/子步数统计 |
+| 对话轨迹日志 | `%USERPROFILE%\.gemini\antigravity\brain\<id>\.system_generated\logs\transcript.jsonl` | 逐轮 `input_tokens`、`cache_read_tokens`、请求体增量 `±ΔK`、`CHECKPOINT` 压缩与 `Undo` 回溯事件、`ERROR_MESSAGE` 报错反查 |
 | 对话元数据库 | `%USERPROFILE%\.gemini\antigravity\conversations\<id>.db`（`mode=ro`） | `TTFT`、`streaming`、`tok/s`、`maxContextTokens` 与单对话全量长线速度曲线 |
-| 语言服务日志 | `%APPDATA%\Antigravity\logs\language_server.log` | 增量捕获 `503 No capacity`、`5m 流超时`、`403 封禁` 与代理断连重试 |
+| 会话摘要索引库 | `%USERPROFILE%\.gemini\antigravity\conversation_summaries.db`（`mode=ro`） | 500 槽位主对话 / 子代理分类识别与 6 重防误删校验 |
+| 语言服务日志 | `%APPDATA%\Antigravity\logs\language_server.log` | 增量捕获 `503 No capacity`、动态时长流超时、`403 封禁` 与代理断连重试 |
 | 本地在线 Hub | `%USERPROFILE%\.gemini\antigravity\daemon\hub_*.json`（`127.0.0.1`） | 只读 `GetUserStatus` 获取脱敏账号、套餐档位及 `gemini` / `3p` 分池 5h 额度与原生 `resetTime` |
 | Cockpit 历史库（可选） | `%USERPROFILE%\.antigravity_cockpit\platform-quota-history-v1.sqlite` | 严格同邮箱只读补全分池周额度与 `reset_at`；未安装或离线时自动跳过 |
 
