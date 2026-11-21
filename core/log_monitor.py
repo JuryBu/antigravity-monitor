@@ -2737,14 +2737,14 @@ class AntigravityMonitorEngine:
                 f"{hist_prefix}近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
                 t2_recovering_warn or t2_recovered_info,
             )
+        # Daily step thresholds are independent volume reminders and MUST NOT override
+        # the real health grade (T0/WARN/T1/T2/T3) derived from actual cache, TTFT & logs.
+        step_note = ""
         if today_steps >= self.config["daily_steps_alert"]:
-            return (
-                "red",
-                "WARN",
-                f"步数超红线{hist_head_tag} · {active_model}",
-                f"{hist_prefix}今日累计 {today_steps} 步已达 {self.config['daily_steps_alert']} 步保护红线，建议减速防降权",
-                t2_recovering_warn or t2_recovered_info,
-            )
+            step_note = f" · 提醒：今日步数 {today_steps}/{self.config['daily_steps_alert']} 已超保护红线"
+        elif today_steps >= self.config["daily_steps_warn"]:
+            step_note = f" · 提醒：今日步数 {today_steps}/{self.config['daily_steps_alert']} 接近保护线"
+
         if (
             prior_hist_warning
             or t2_recovering_warn
@@ -2753,7 +2753,6 @@ class AntigravityMonitorEngine:
             or eff_503 == 1
             or eff_timeout == 1
             or any_slow
-            or today_steps >= self.config["daily_steps_warn"]
         ):
             reasons = []
             if prior_hist_warning:
@@ -2770,9 +2769,7 @@ class AntigravityMonitorEngine:
                 reasons.append("偶发 1 次 503")
             if eff_timeout == 1 and not t2_recovering_warn:
                 reasons.append(f"偶发流超时: {latest_timeout_summary}" if latest_timeout_summary else "偶发 1 次流超时")
-            if today_steps >= self.config["daily_steps_warn"]:
-                reasons.append(f"今日步数 {today_steps}")
-            return ("orange", "WARN", f"留意预警{hist_head_tag} · {active_model}", f"{hist_prefix}" + " / ".join(reasons), t2_recovering_warn)
+            return ("orange", "WARN", f"留意预警{hist_head_tag} · {active_model}", f"{hist_prefix}" + " / ".join(reasons) + step_note, t2_recovering_warn)
 
         if primary is None:
             if custom_empty_acct:
@@ -2780,7 +2777,7 @@ class AntigravityMonitorEngine:
                     "cyan",
                     "WAIT",
                     f"历史视角 · {custom_empty_acct} 暂无记录",
-                    f"{hist_prefix}{scope_win_txt}该账号无可用对话或日志记录",
+                    f"{hist_prefix}{scope_win_txt}该账号无可用对话或日志记录{step_note}",
                     "",
                 )
             if switched_acct_label:
@@ -2788,19 +2785,19 @@ class AntigravityMonitorEngine:
                     "cyan",
                     "WAIT",
                     f"待采样 · 已切入 {switched_acct_label}",
-                    f"{hist_prefix}该账号暂无历史与实时采样，前序账号异常已隔离，发出首步后自动定级",
+                    f"{hist_prefix}该账号暂无历史与实时采样，前序账号异常已隔离，发出首步后自动定级{step_note}",
                     "",
                 )
-            return ("cyan", "WAIT", f"待采样{hist_head_tag} · 暂无会话记录", f"{hist_prefix}{scope_win_txt}暂无可用采样记录", "")
+            return ("cyan", "WAIT", f"待采样{hist_head_tag} · 暂无会话记录", f"{hist_prefix}{scope_win_txt}暂无可用采样记录{step_note}", "")
 
         if t2_recovered_info:
-            return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", f"{hist_prefix}{t2_recovered_info}", t2_recovered_info)
+            return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", f"{hist_prefix}{t2_recovered_info}{step_note}", t2_recovered_info)
 
         hist_503 = today_log["503"]
         if hist_503 > 0 and eff_503 == 0:
-            sub = f"{hist_prefix}{scope_win_txt}无新异常（该号今日历史 {hist_503} 条 503 已衰减）"
+            sub = f"{hist_prefix}{scope_win_txt}无新异常（该号今日历史 {hist_503} 条 503 已衰减）{step_note}"
         else:
-            sub = f"{hist_prefix}{scope_win_txt}缓存与底层日志均健康"
+            sub = f"{hist_prefix}{scope_win_txt}缓存与底层日志均健康{step_note}"
         return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", sub, "")
 
     def _collect_new_alerts(

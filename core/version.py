@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.1.1"
 DEFAULT_UPDATE_REPO = "JuryBu/antigravity-monitor"
 DEFAULT_UPDATE_BRANCH = "main"
 

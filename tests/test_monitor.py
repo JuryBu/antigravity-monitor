@@ -3242,6 +3242,68 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 self.assertFalse(r_lag.ok)
                 self.assertTrue(r_lag.dirty_blocked)
 
+    def test_v711_daily_steps_alert_reminds_without_overriding_t0_grade(self) -> None:
+        """v7.1.1: exceeding daily step warn/alert thresholds must remind independently without overwriting real T0/T1/T2 grade."""
+        from core.log_monitor import ConversationSummary, compute_pressure
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "account_ledger.json",
+                },
+                read_only=True,
+            )
+            now = time.time()
+            healthy_conv = ConversationSummary(
+                conversation_id="step-ok-01",
+                short_id="step-o",
+                model="Neon XHigh",
+                model_raw="gemini-4-neon-xhigh",
+                context_tokens=150000,
+                max_context_tokens=512000,
+                latest_hit_rate=0.99,
+                latest_cached_in=148500,
+                latest_uncached_in=1500,
+                latest_timestamp=now - 10,
+                recent_steps=[],
+                consec_miss=0,
+                consec_miss_start_step=0,
+                single_miss=False,
+                wasted_cold_tokens=0,
+                freshness_remaining_sec=180,
+                ttft_sec=12.0,
+                tps=140.0,
+                speed_status="ok",
+                title="正常对话",
+                is_subagent=False,
+            )
+            zero_log = {"503": 0, "timeout": 0, "403": 0, "retry": 0}
+            level, grade, headline, sub, _ = eng._evaluate_health(
+                active_model="Neon XHigh",
+                recent_log=zero_log,
+                today_log=zero_log,
+                max_consec_miss=0,
+                any_single_miss=False,
+                any_slow=False,
+                today_steps=1280,
+                primary=healthy_conv,
+                is_online=True,
+                now_ts=now,
+            )
+            self.assertEqual(grade, "T0")
+            self.assertEqual(level, "green")
+            self.assertIn("T0 健康", headline)
+            self.assertIn("1280/1200", sub)
+            # CLI pressure still flags "red" for automation throttling
+            from core.log_monitor import compute_pressure
+            self.assertEqual(compute_pressure(grade, 1280, 960, 1200), "red")
+
 
 if __name__ == "__main__":
     unittest.main()
