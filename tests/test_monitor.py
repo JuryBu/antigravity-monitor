@@ -3304,6 +3304,721 @@ class TestShortcutsAndIcons(unittest.TestCase):
             from core.log_monitor import compute_pressure
             self.assertEqual(compute_pressure(grade, 1280, 960, 1200), "red")
 
+    def test_v72_poll_go_403_filtered_and_real_tos_and_stream_403_preserved(self) -> None:
+        """v7.2.0: poll.go background cloud sync 403 must count 0, while real TOS / stream 403 stay preserved."""
+        from core.log_monitor import TOS_403_RE
+
+        # Non-403 substring with "stream" + "403" ms must never match TOS_403_RE
+        self.assertIsNone(TOS_403_RE.search("stream completed in 403ms without error"))
+        self.assertIsNotNone(TOS_403_RE.search("streamGenerateContent failed: HTTP status 403 Forbidden"))
+        self.assertIsNotNone(TOS_403_RE.search("PERMISSION_DENIED (code 403): account suspended"))
+
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "language_server.log"
+            now_dt = datetime.datetime.now()
+            mmdd = now_dt.strftime("%m%d")
+            hms1 = (now_dt - datetime.timedelta(seconds=30)).strftime("%H:%M:%S")
+            hms2 = (now_dt - datetime.timedelta(seconds=20)).strftime("%H:%M:%S")
+            hms3 = (now_dt - datetime.timedelta(seconds=10)).strftime("%H:%M:%S")
+            lines = [
+                # 1. Background poll.go cloud projects/summaries insufficient scopes + same-gid errorreport -> strictly 0
+                f"ERROR: logging before google.Init: W{mmdd} {hms1}.100000  81001 poll.go:184] cloud projects poll failed: HTTP 403 insufficient authentication scopes",
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.105000  81001 errorreport.go:307] PERMISSION_DENIED (code 403): insufficient authentication scopes",
+                f"ERROR: logging before google.Init: W{mmdd} {hms1}.500000  81002 poll.go:220] cloud summaries poll failed: PERMISSION_DENIED (code 403)",
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.505000  81002 errorreport.go:307] PERMISSION_DENIED (code 403)",
+                # 2. Same goroutine as poll.go BUT explicit TOS_VIOLATION -> MUST NOT be muted (count=1)
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.600000  81002 errorreport.go:307] PERMISSION_DENIED (code 403): TOS_VIOLATION",
+                # 3. poll.go carrying TOS_VIOLATION directly -> MUST NOT be filtered (count=2)
+                f"ERROR: logging before google.Init: E{mmdd} {hms2}.100000  81003 poll.go:184] cloud projects poll failed: 403 TOS_VIOLATION",
+                # 4. Real inference streamGenerateContent 403 -> preserved (count=3)
+                f"ERROR: logging before google.Init: E{mmdd} {hms3}.100000  81004 http_helpers.go:876] streamGenerateContent failed: HTTP status 403 Forbidden",
+            ]
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tailer = LanguageServerLogTailer(log_path)
+            tailer.poll(now_ts=now_dt.timestamp())
+            recent, _today, _evs = tailer.get_counts(now_ts=now_dt.timestamp(), window_min=30)
+            self.assertEqual(recent["403"], 3)
+            self.assertGreaterEqual(len(tailer._ignored_non_inference_403_gids), 1)
+            # Log rotation / truncation must clear ignored 403 gid table
+            log_path.write_text("", encoding="utf-8")
+            tailer.poll(now_ts=now_dt.timestamp() + 2)
+            self.assertEqual(len(tailer._ignored_non_inference_403_gids), 0)
+
+    def test_v72_account_ledger_cockpit_sort_dedup_and_hint_switch_ts_guard(self) -> None:
+        """v7.2.0: multi-file cockpit switches merge sorted+deduped, prune stale cache, and guard hint_switch_ts."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cdir = root / "cockpit"
+            cdir.mkdir()
+            f_a = cdir / "app.log.2026-11-21"
+            f_b = cdir / "app.log.2026-11-20"
+            f_a.write_text(
+                "2026-11-21T23:10:00.000Z INFO [AntigravityTools] 写入系统凭据: beta99@example.com\n"
+                "2026-11-21T23:05:00.000Z INFO [AntigravityTools] 写入系统凭据: alpha1@example.com\n",
+                encoding="utf-8",
+            )
+            f_b.write_text(
+                "2026-11-21T23:05:00.000Z INFO [AntigravityTools] 写入系统凭据: alpha1@example.com\n"
+                "2026-11-21T23:07:30.000Z INFO [AntigravityTools] 写入系统凭据: gamma3@example.com\n",
+                encoding="utf-8",
+            )
+            ledger = AccountSwitchLedger(
+                ledger_path=root / "ledger.json",
+                cockpit_logs_dir=cdir,
+            )
+            merged = ledger._read_cockpit_switches(since_ts=0.0)
+            self.assertEqual(len(merged), 3)
+            self.assertEqual([lbl for _, lbl in merged], ["al***1", "ga***3", "be***9"])
+            self.assertTrue(all(merged[i][0] <= merged[i + 1][0] for i in range(len(merged) - 1)))
+            # Removing a file must prune its stale key from _cockpit_cache
+            f_b.unlink()
+            merged2 = ledger._read_cockpit_switches(since_ts=0.0)
+            self.assertEqual(len(merged2), 2)
+            self.assertNotIn(str(f_b), ledger._cockpit_cache)
+
+            # hint_switch_ts guard: accept valid hint between prev switch and now; reject out-of-range hint
+            t0 = 1_795_200_000.0
+            ledger2 = AccountSwitchLedger(ledger_path=root / "ledger2.json", cockpit_logs_dir=None)
+            ledger2.observe_online("ol***1", t0)
+            # Valid hint 4 seconds before observation (after prev switch t0)
+            ledger2.observe_online("ne***2", t0 + 10.0, hint_switch_ts=t0 + 6.0)
+            self.assertAlmostEqual(ledger2.get_switch_timestamps(since_ts=0.0)[-1], t0 + 6.0, places=3)
+            # Invalid hint earlier than previous switch -> falls back to now
+            ledger2.observe_online("ne***3", t0 + 20.0, hint_switch_ts=t0 + 1.0)
+            self.assertAlmostEqual(ledger2.get_switch_timestamps(since_ts=0.0)[-1], t0 + 20.0, places=3)
+
+    def test_v72_carryover_conversations_strict_isolation_and_account_switch_flag(self) -> None:
+        """v7.2.0: carryover_conversations surfaces recently active window without polluting WAIT/active_conversations."""
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "carry001-1111-2222-3333-444444444444"
+            log_dir = root / "brain" / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            # Two warm steps on old account (ol***1) 90s & 60s ago
+            t_s1 = datetime.datetime.fromtimestamp(now - 90, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            t_s2 = datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            tfile = log_dir / "transcript.jsonl"
+            tfile.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": t_s1}),
+                        json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": t_s1, "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 400}),
+                        json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": t_s2, "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 400}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng._ledger.observe_online("ol***1", now - 120)
+            eng._ledger.observe_online("ne***2", now - 20)
+            eng._account_cache = AccountQuotaInfo(short_label="ne***2", email_masked="ne***2@example.com", online=True, observed_at=now)
+            eng._last_account_poll = now
+
+            # Before new account sends any step: WAIT, active_conversations empty, carryover has 1 preview!
+            snap_wait = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_wait.grade, "WAIT")
+            self.assertIsNone(snap_wait.primary_hit_rate)
+            self.assertEqual(len(snap_wait.active_conversations), 0)
+            self.assertEqual(snap_wait.today_steps, 0)
+            self.assertEqual(len(snap_wait.carryover_conversations), 1)
+            self.assertTrue(snap_wait.carryover_conversations[0].is_carryover_preview)
+            self.assertEqual(snap_wait.carryover_conversations[0].conversation_id, cid)
+
+            # JSON output preserves schema 1.0 and exposes carryover_conversations & primary_hit_reason
+            jdata = json.loads(format_json_snapshot(snap_wait))
+            self.assertEqual(jdata["schema_version"], "1.0")
+            self.assertEqual(len(jdata["carryover_conversations"]), 1)
+            self.assertIn("primary_hit_reason", jdata["cache"])
+
+            # Now new account sends step 4 in the same window -> moves out of carryover into active_conversations with account_switch
+            t_s3 = datetime.datetime.fromtimestamp(now - 5, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            with tfile.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": t_s3, "model": "gemini-4-neon-xhigh", "input_tokens": 55000, "cache_read_tokens": 0, "output_tokens": 400})
+                    + "\n"
+                )
+            os.utime(tfile, (now + 1, now + 1))
+            eng._last_account_poll = now + 2
+            snap_live = eng.poll(now_ts=now + 2, force_account=False)
+            self.assertEqual(len(snap_live.active_conversations), 1)
+            self.assertEqual(len(snap_live.carryover_conversations), 0)
+            c0 = snap_live.active_conversations[0]
+            self.assertEqual(c0.latest_cache_reason, "account_switch")
+            self.assertTrue(c0.recent_steps[-1].is_account_switch)
+            self.assertEqual(snap_live.primary_hit_reason, "account_switch")
+
+    def test_v72_sqlite_reader_short_burst_tps_none_and_model_label_priority_and_backfill(self) -> None:
+        """v7.2.0: <0.15s burst sets tps=None; m1[21]/m1[20]/m1[19] extraction + offline M427/M530/M402 backfill kill 未知模型."""
+        from core.log_monitor import AccountQuotaInfo, format_model_name
+
+        # 1. streaming_sec = 0.05 (< 0.15) -> tps MUST be None
+        usage = _pb_varint_field(2, 1000) + _pb_varint_field(3, 180) + _pb_varint_field(5, 50000)
+        ttft_pb = _pb_varint_field(1, 3) + _pb_varint_field(2, 0)
+        strm_fast = _pb_varint_field(1, 0) + _pb_varint_field(2, 50_000_000)  # 0.05s
+        m1_burst = (
+            _pb_bytes_field(4, usage)
+            + _pb_bytes_field(11, ttft_pb)
+            + _pb_bytes_field(12, strm_fast)
+            + _pb_bytes_field(21, b"MODEL_PLACEHOLDER_M530")
+        )
+        gm_burst = parse_gen_metadata_row(1, _pb_bytes_field(1, m1_burst))
+        self.assertIsNotNone(gm_burst)
+        self.assertIsNone(gm_burst.tps)
+        self.assertEqual(gm_burst.model_label, "MODEL_PLACEHOLDER_M530")
+        self.assertEqual(format_model_name(gm_burst.model_label), "Hydrogen H")
+
+        # 2. m1[20] protobuf map<string, string> entry {"model_enum": "MODEL_PLACEHOLDER_M402"} fallback when m1[21] absent
+        strm_ok = _pb_varint_field(1, 2) + _pb_varint_field(2, 0)
+        map_entry = _pb_bytes_field(1, b"model_enum") + _pb_bytes_field(2, b"MODEL_PLACEHOLDER_M402")
+        m1_map = (
+            _pb_bytes_field(4, usage)
+            + _pb_bytes_field(11, ttft_pb)
+            + _pb_bytes_field(12, strm_ok)
+            + _pb_bytes_field(20, map_entry)
+        )
+        gm_map = parse_gen_metadata_row(2, _pb_bytes_field(1, m1_map))
+        self.assertIsNotNone(gm_map)
+        self.assertEqual(gm_map.model_label, "MODEL_PLACEHOLDER_M402")
+        self.assertEqual(format_model_name(gm_map.model_label), "Opus 5.5")
+        self.assertAlmostEqual(gm_map.tps or 0.0, 90.0, places=1)
+
+        # 2b. m1[19] slug fallback when m1[21] and m1[20] absent
+        m1_slug = (
+            _pb_bytes_field(4, usage)
+            + _pb_bytes_field(11, ttft_pb)
+            + _pb_bytes_field(12, strm_ok)
+            + _pb_bytes_field(19, b"gemini-4-neon-xhigh")
+        )
+        gm_slug = parse_gen_metadata_row(3, _pb_bytes_field(1, m1_slug))
+        self.assertIsNotNone(gm_slug)
+        self.assertEqual(format_model_name(gm_slug.model_label), "Neon XHigh")
+
+        # 3. End-to-end backfill: transcript has empty model="" -> DB m1[21]=MODEL_PLACEHOLDER_M427 backfills conv, recent_steps, model_stats & detail report
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "oldacc01-1111-2222-3333-444444444444"
+            log_dir = root / "brain" / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            convs = root / "conversations"
+            convs.mkdir()
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+
+            now = time.time()
+            t1 = datetime.datetime.fromtimestamp(now - 30, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            t2 = datetime.datetime.fromtimestamp(now - 10, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            (log_dir / "transcript.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": t1}),
+                        json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": t1, "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 300}),
+                        json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": t2, "input_tokens": 1200, "cache_read_tokens": 50000, "output_tokens": 400}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            db_path = convs / f"{cid}.db"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+                m1_c = (
+                    _pb_bytes_field(4, usage)
+                    + _pb_bytes_field(11, ttft_pb)
+                    + _pb_bytes_field(12, strm_ok)
+                    + _pb_bytes_field(21, b"MODEL_PLACEHOLDER_M427")
+                )
+                blob_c = _pb_bytes_field(1, m1_c)
+                conn.execute("INSERT INTO gen_metadata VALUES (0, ?)", (blob_c,))
+                conn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (blob_c,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": convs,
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="ol***8", email_masked="ol***8@example.com", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.active_conversations[0].model, "Carbon High")
+            self.assertTrue(all(format_model_name(s.model) == "Carbon High" for s in snap.active_conversations[0].recent_steps))
+            self.assertIn("Carbon High", [m.model for m in snap.model_stats])
+            self.assertNotIn("未知模型", [m.model for m in snap.model_stats])
+
+            rep = eng.read_conversation_detail(cid)
+            self.assertIsNotNone(rep)
+            self.assertEqual(rep.model, "Carbon High")
+            self.assertTrue(all(pt.model == "Carbon High" for pt in rep.points))
+
+    def test_v72_multimodal_media_tracking_unc_block_checkpoint_revert_and_4tuple_compat(self) -> None:
+        """v7.2.0: track active multimodal media across steps, block UNC stat, clear on CHECKPOINT, prune on revert, keep 4-tuple."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "media001-1111-2222-3333-444444444444"
+            log_dir = root / "brain" / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            img1 = root / "shot1.png"
+            aud1 = root / "clip.mp3"
+            img1.write_bytes(b"x" * 2048)
+            aud1.write_bytes(b"y" * 4096)
+            img1_uri = img1.as_uri()
+            aud1_uri = aud1.as_uri()
+
+            now = time.time()
+            def _ts(offset: int) -> str:
+                return datetime.datetime.fromtimestamp(now + offset, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+            lines = [
+                # Step 1 user uploads 1 image + 1 UNC path (UNC must be blocked from os.stat, size=0, still counted)
+                json.dumps({
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": _ts(-100),
+                    "media": [
+                        {"mime_type": "image/png", "uri": img1_uri},
+                        {"mime_type": "image/png", "uri": r"\\192.0.2.1\share\evil.png"},
+                    ],
+                }),
+                json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _ts(-95), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 300}),
+                # Step 3 adds audio -> total 3 items, 6144 bytes
+                json.dumps({
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "created_at": _ts(-80),
+                    "media": [{"mime_type": "audio/mpeg", "uri": aud1_uri}],
+                }),
+                json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _ts(-75), "model": "gemini-4-neon-xhigh", "input_tokens": 1200, "cache_read_tokens": 50000, "output_tokens": 300}),
+                # Revert back to step_index=3 (prunes old step 3 audio, keeps step 1 media)
+                json.dumps({"step_index": 3, "type": "USER_INPUT", "created_at": _ts(-60), "media": []}),
+                json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _ts(-55), "model": "gemini-4-neon-xhigh", "input_tokens": 1200, "cache_read_tokens": 50000, "output_tokens": 300}),
+                # CHECKPOINT clears active media to 0
+                json.dumps({"step_index": 5, "type": "CHECKPOINT", "created_at": _ts(-40)}),
+                json.dumps({"step_index": 6, "type": "PLANNER_RESPONSE", "created_at": _ts(-35), "model": "gemini-4-neon-xhigh", "input_tokens": 42000, "cache_read_tokens": 0, "output_tokens": 300}),
+            ]
+            tfile = log_dir / "transcript.jsonl"
+            tfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            # UNC helper must strictly return 0 without touching network
+            self.assertEqual(eng._get_local_media_size_cached(r"\\192.0.2.1\share\evil.png"), 0)
+            self.assertEqual(eng._get_local_media_size_cached("file://evilhost/share/evil.png"), 0)
+            self.assertEqual(eng._get_local_media_size_cached(img1_uri), 2048)
+
+            cached_tuple = eng._read_transcript_cached(cid, tfile)
+            self.assertEqual(len(cached_tuple), 3)
+            self.assertEqual(len(eng._transcript_cache[cid]), 4)
+            raw_steps, _is_sub, _ckpts = cached_tuple
+            self.assertEqual(len(raw_steps), 4)
+            # Step 2: 2 items (img1 + UNC), 2048 bytes
+            self.assertEqual(raw_steps[0]["active_media_count"], 2)
+            self.assertEqual(raw_steps[0]["active_media_bytes"], 2048)
+            # Step 4 (pre-revert): 3 items, 6144 bytes
+            self.assertEqual(raw_steps[1]["active_media_count"], 3)
+            self.assertEqual(raw_steps[1]["active_media_bytes"], 6144)
+            # Step 4 (post-revert to step 3): pruned audio -> 2 items, 2048 bytes
+            self.assertEqual(raw_steps[2]["active_media_count"], 2)
+            self.assertEqual(raw_steps[2]["active_media_bytes"], 2048)
+            # Step 6 (post-CHECKPOINT): cleared -> 0 items, 0 bytes
+            self.assertEqual(raw_steps[3]["active_media_count"], 0)
+            self.assertEqual(raw_steps[3]["active_media_bytes"], 0)
+
+            rep = eng.read_conversation_detail(cid)
+            self.assertIsNotNone(rep)
+            txt = format_detail_text_report(rep)
+            self.assertIn("图3(6K)", txt)
+
+    def test_v72_speed_classification_short_burst_high_tps_and_multimodal_upload_exemption(self) -> None:
+        """v7.2.0: short burst / high-TPS / heavy multimodal upload avoid false slow throttle while true slow stays slow."""
+        eng = AntigravityMonitorEngine(read_only=True)
+        # 1. Short output (<500 tokens) with low apparent TPS -> NOT slow
+        self.assertEqual(eng._classify_speed(tps=14.0, ttft_sec=8.0, output_tokens=180, context_tokens=80000, streaming_sec=12.0), "ok")
+        # 2. Short streaming (<1.5s) even with >=500 tokens -> NOT slow
+        self.assertEqual(eng._classify_speed(tps=20.0, ttft_sec=8.0, output_tokens=600, context_tokens=80000, streaming_sec=0.9), "ok")
+        # 3. Genuine slow generation (>=500 tokens, >=1.5s streaming, low TPS) -> slow
+        self.assertEqual(eng._classify_speed(tps=25.0, ttft_sec=12.0, output_tokens=600, context_tokens=80000, streaming_sec=24.0), "slow")
+        # 4. High TPS cross-exemption (tps=145 >= max(80, 70), ttft=72s < 120s) -> NOT slow
+        self.assertEqual(eng._classify_speed(tps=145.0, ttft_sec=72.0, output_tokens=900, context_tokens=120000, streaming_sec=6.2), "ok")
+        # 5. Multimodal upload grace (5 images, 8MB -> grace = min(120, 15 + 80) = 95s; base 45s -> 140s):
+        #    ttft=110s with low/missing TPS exempted + flagged media_ttft_exempted=True, while plain text ttft=110s is slow
+        st_media, ex_media = eng._classify_speed_ex(
+            tps=45.0, ttft_sec=110.0, output_tokens=400, context_tokens=100000, streaming_sec=8.8,
+            active_media_count=5, active_media_bytes=8 * 1024 * 1024,
+        )
+        self.assertEqual(st_media, "ok")
+        self.assertTrue(ex_media)
+        st_text, ex_text = eng._classify_speed_ex(
+            tps=45.0, ttft_sec=110.0, output_tokens=400, context_tokens=100000, streaming_sec=8.8,
+            active_media_count=0, active_media_bytes=0,
+        )
+        self.assertEqual(st_text, "slow")
+        self.assertFalse(ex_text)
+
+    def test_v72_ui_cold_short_badges_carryover_row_and_detail_window_media_width_lock(self) -> None:
+        """v7.2.0: UI renders compact cold badges & carryover row cleanly, and detail window holds locked width with 图99(99.9M)."""
+        import tkinter as tk
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            ConversationDetailPoint,
+            ConversationDetailReport,
+            ConversationSummary,
+            MonitorSnapshot,
+            StepRecord,
+        )
+        from ui.capsule_app import AntigravityCapsuleApp
+        from ui.detail_window import ConversationDetailWindow, summarize_detail_points
+        from ui.themes import THEMES
+
+        # Token-weighted avg_tps test
+        now = time.time()
+        p_fast_short = ConversationDetailPoint(
+            step_index=1, timestamp=now - 40, model="Neon XHigh", total_tokens=50000, context_delta=50000,
+            input_tokens=50000, cache_read_tokens=0, output_tokens=100, hit_rate=0.0,
+            classification="expected_cold", reason="first_cacheable", ttft_sec=8.0, tps=200.0, streaming_sec=0.5,
+        )
+        p_long = ConversationDetailPoint(
+            step_index=2, timestamp=now - 20, model="Neon XHigh", total_tokens=80000, context_delta=30000,
+            input_tokens=2000, cache_read_tokens=78000, output_tokens=1000, hit_rate=97.5,
+            classification="hit", reason="cached", ttft_sec=12.0, tps=100.0, streaming_sec=10.0,
+            is_account_switch=True, active_media_count=99, active_media_bytes=int(99.9 * 1024 * 1024),
+        )
+        kpi = summarize_detail_points([p_fast_short, p_long])
+        self.assertAlmostEqual(kpi["avg_tps"] or 0.0, 1100.0 / 10.5, places=2)
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                # 1. Detail window width lock with worst-case media readout + account switch line
+                rep = ConversationDetailReport(
+                    conversation_id="v72ui001-0000-0000-0000-000000000001",
+                    short_id="v72ui0", is_subagent=False, model="Hydrogen XH", model_raw="gemini-4-hydrogen-xhigh",
+                    total_steps=2, today_steps=2, peak_context_tokens=512000, latest_context_tokens=512000,
+                    latest_context_delta=99900, max_context_tokens=512000, compact_count=0,
+                    cache_hit_steps=1, abnormal_miss_steps=0, expected_cold_steps=1, overall_cacheable_hit_ratio=1.0,
+                    avg_ttft_sec=10.0, p95_ttft_sec=12.0, max_ttft_sec=12.0, avg_tps=104.8, latest_tps=100.0,
+                    latest_ttft_sec=12.0, freshness_remaining_sec=180, freshness_invalid_reason="",
+                    freshness_window_sec=210, points=[p_fast_short, p_long], title="极长多图宽度锁测试",
+                )
+                dw = ConversationDetailWindow(
+                    parent=root, theme=THEMES["midnight_blue"], load_report=lambda _cid: rep,
+                    on_toggle_pin=lambda _cid: None, is_pinned_fn=lambda _cid: False,
+                )
+                dw.show_conversation(rep.conversation_id, place_near_parent=True)
+                root.update()
+                base_w, base_h = dw.win.winfo_width(), dw.win.winfo_height()
+                pt_max = ConversationDetailPoint(
+                    step_index=9999, timestamp=now, model="Hydrogen XH", total_tokens=512000, context_delta=99900,
+                    input_tokens=0, cache_read_tokens=512000, output_tokens=999, hit_rate=100.0,
+                    classification="hit", reason="cached", ttft_sec=123.4, tps=999.0, streaming_sec=1.0,
+                    is_revert=True, is_account_switch=True, active_media_count=99, active_media_bytes=int(99.9 * 1024 * 1024),
+                )
+                dw._update_readout_for_point(pt_max, prefix="选定步")
+                root.update()
+                self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), (base_w, base_h))
+                self.assertIn("图99(99.9M)", dw._lbl_readout.cget("text"))
+                self.assertLessEqual(dw._lbl_readout.winfo_reqwidth(), dw._readout_box.winfo_width())
+                dw.close()
+            finally:
+                try:
+                    root.destroy()
+                except tk.TclError:
+                    pass
+
+            # 2. Capsule app cold-start short badge & carryover preview rendering
+            cfg_store = ConfigStore(Path(td) / "cfg.json")
+            eng = AntigravityMonitorEngine(read_only=True)
+            app = AntigravityCapsuleApp(
+                app_root=Path(__file__).resolve().parent.parent,
+                config_store=cfg_store,
+                engine=eng,
+                enable_tray=False,
+                start_minimized_override=False,
+            )
+            try:
+                app.root.withdraw()
+                cold_step = StepRecord(1, now - 5, "gemini-4-neon-xhigh", 22000, 0, 300, 22000, 0.0, "expected_cold", "small_ctx")
+                c_cold = ConversationSummary(
+                    conversation_id="cold0001-0000-0000-0000-000000000001", short_id="cold01",
+                    model="Neon XHigh", model_raw="gemini-4-neon-xhigh", context_tokens=22000, max_context_tokens=512000,
+                    latest_hit_rate=0.0, latest_cached_in=0, latest_uncached_in=22000, latest_timestamp=now - 5,
+                    recent_steps=[cold_step], consec_miss=0, consec_miss_start_step=1, single_miss=False,
+                    wasted_cold_tokens=0, freshness_remaining_sec=None, ttft_sec=6.0, tps=150.0, speed_status="ok",
+                    latest_cache_reason="small_ctx", active_media_count=2, active_media_bytes=2 * 1024 * 1024,
+                    media_ttft_exempted=True, title="小上下文冷启测试",
+                )
+                c_carry = ConversationSummary(
+                    conversation_id="carry002-0000-0000-0000-000000000002", short_id="carry2",
+                    model="Carbon High", model_raw="gemini-4-carbon-high", context_tokens=160000, max_context_tokens=512000,
+                    latest_hit_rate=0.0, latest_cached_in=0, latest_uncached_in=160000, latest_timestamp=now - 40,
+                    recent_steps=[], consec_miss=0, consec_miss_start_step=0, single_miss=False,
+                    wasted_cold_tokens=0, freshness_remaining_sec=None, latest_cache_reason="account_switch",
+                    is_carryover_preview=True, title="同窗换号过渡测试",
+                )
+                snap = MonitorSnapshot(
+                    generated_at=now, level="green", grade="T0", headline="T0 健康 · Neon XHigh",
+                    sub_headline="ok", active_model="Neon XHigh", primary_hit_rate=0.0,
+                    primary_hit_classification="expected_cold", primary_hit_reason="small_ctx",
+                    primary_tps=150.0, primary_ttft=6.0, primary_speed_status="ok",
+                    min_freshness_sec=None, min_freshness_conv="", min_freshness_ctx=0,
+                    min_freshness_invalid_reason="", today_steps=1, daily_steps_warn=960, daily_steps_alert=1200,
+                    active_conversations=[c_cold], large_freshness_list=[],
+                    recent_503=0, today_503=0, recent_timeout=0, today_timeout=0,
+                    recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+                    recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+                    account=AccountQuotaInfo(short_label="ne***2", online=True, observed_at=now),
+                    sliding_window_min=30, freshness_window_sec=210,
+                    carryover_conversations=[c_carry],
+                )
+                app.set_expanded(True)
+                app.render_snapshot(snap)
+                app.root.update()
+                self.assertEqual(app._lbl_bar_cache_v.cget("text"), "<32K")
+                # Row 0 is carryover preview, Row 1 is cold active conversation
+                self.assertEqual(app._conv_rows[0]["id"].cget("text"), "↪carry2")
+                self.assertEqual(app._conv_rows[0]["hit"].cget("text"), "待首步")
+                self.assertEqual(app._conv_rows[1]["hit"].cget("text"), "<32K")
+                self.assertIn("多模态载荷: 2 项 (2.0M)", app._conv_hover_texts[1])
+                self.assertIn("已豁免暗限速误判", app._conv_hover_texts[1])
+                self.assertIn("同窗口换号过渡入口", app._conv_hover_texts[0])
+            finally:
+                app.shutdown()
+
+    def test_v72_dual_review_hardening_regressions(self) -> None:
+        """v7.2.0 final dual-review regressions: UNC/null/device block, symmetric 403 guard, ledger anti-loop, cold-hint refresh, old-account carryover UI precedence, JSON/text parity."""
+        from core.log_monitor import AccountQuotaInfo, ConversationSummary, MonitorSnapshot, StepRecord
+        from ui.capsule_app import AntigravityCapsuleApp
+
+        # 1. P0 UNC bypass, null byte, device path, and LRU 1024 cap
+        eng = AntigravityMonitorEngine(read_only=True)
+        for bad_uri in (
+            "file:///%5c192.0.2.1/share/evil.png",
+            "file://localhost/%5c192.0.2.1/share/evil.png",
+            r"file:///\\192.0.2.1\share\evil.png",
+            "file:///C:/foo%00bar.png",
+            "C:\\foo\x00bar.png",
+            "C:\\nul",
+        ):
+            self.assertEqual(eng._get_local_media_size_cached(bad_uri), 0)
+        for i in range(1100):
+            eng._get_local_media_size_cached(f"file:///Z:/nonexistent_dir_v72/img_{i}.png")
+        self.assertLessEqual(len(eng._media_size_cache), 1024)
+
+        # 2. P1 poll.go INFO must NOT mute real 403 on same gid; account_suspended/disabled/banned & streamGenerateContent MUST NOT be muted
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "language_server.log"
+            now_dt = datetime.datetime.now()
+            mmdd = now_dt.strftime("%m%d")
+            hms = (now_dt - datetime.timedelta(seconds=15)).strftime("%H:%M:%S")
+            lines = [
+                # Normal INFO poll.go line followed by real streamGenerateContent 403 on same gid 91001 -> MUST count 1
+                f"ERROR: logging before google.Init: I{mmdd} {hms}.100000  91001 poll.go:184] cloud projects poll ok",
+                f"ERROR: logging before google.Init: E{mmdd} {hms}.200000  91001 errorreport.go:307] streamGenerateContent failed: HTTP status 403 Forbidden",
+                # poll.go cloud projects poll 403 followed by hard account_disabled & account_banned on same gid 91002 -> MUST count 2
+                f"ERROR: logging before google.Init: W{mmdd} {hms}.300000  91002 poll.go:184] cloud projects poll failed: HTTP 403 insufficient authentication scopes",
+                f"ERROR: logging before google.Init: E{mmdd} {hms}.310000  91002 errorreport.go:307] PERMISSION_DENIED (code 403): account_disabled",
+                f"ERROR: logging before google.Init: E{mmdd} {hms}.320000  91002 errorreport.go:307] PERMISSION_DENIED (code 403): account banned",
+            ]
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tailer = LanguageServerLogTailer(log_path)
+            tailer.poll(now_ts=now_dt.timestamp())
+            recent, _today, _evs = tailer.get_counts(now_ts=now_dt.timestamp(), window_min=30)
+            self.assertEqual(recent["403"], 3)
+
+        # 3. P1 AccountSwitchLedger 180s manual switch-back must NOT insert backwards or loop-append
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cdir = root / "cockpit"
+            cdir.mkdir()
+            t0 = 1_795_250_000.0
+            t0_iso = datetime.datetime.fromtimestamp(t0, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            (cdir / "app.log.2026-11-22").write_text(
+                f"{t0_iso} INFO [AntigravityTools] 写入系统凭据: alpha1@example.com\n",
+                encoding="utf-8",
+            )
+            lgr = AccountSwitchLedger(ledger_path=root / "ledger.json", cockpit_logs_dir=cdir)
+            lgr.observe_online("al***1", t0 + 1.0)
+            lgr.observe_online("be***2", t0 + 20.0)
+            # Manual switch back to al***1 at t0+40 (still within 180s of t0 cockpit event!)
+            lgr.observe_online("al***1", t0 + 40.0)
+            tl = lgr.get_timeline(t0 - 10.0)
+            self.assertEqual(lgr.attribute_timestamp(t0 + 42.0, tl), "al***1")
+            ev_count = len(lgr._own_events)
+            # Polling again must NOT append duplicate events
+            lgr.observe_online("al***1", t0 + 45.0)
+            self.assertEqual(len(lgr._own_events), ev_count)
+            # Hint timestamp earlier than latest cockpit event must NOT insert before cockpit event
+            t_ck2_iso = datetime.datetime.fromtimestamp(t0 + 70.0, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            with (cdir / "app.log.2026-11-22").open("a", encoding="utf-8") as fh:
+                fh.write(f"{t_ck2_iso} INFO [AntigravityTools] 写入系统凭据: beta22@example.com\n")
+            lgr.observe_online("ga***3", t0 + 100.0, hint_switch_ts=t0 + 55.0)
+            tl2 = lgr.get_timeline(t0 - 10.0)
+            self.assertEqual(lgr.attribute_timestamp(t0 + 102.0, tl2), "ga***3")
+
+        # 4. P1 _find_recent_cold_switch_hint refreshes hot transcript on disk & handles 2-step burst in 5s
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "hint0001-1111-2222-3333-444444444444"
+            log_dir = root / "brain" / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            now = time.time()
+            def _iso(dt_s: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_s, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            # Warm old-account step (-20s), then new-account cold step (-3.5s) + warm step (-1.0s), NOT pre-cached!
+            (log_dir / "transcript.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-25)}),
+                        json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-20), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 300}),
+                        json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso(-3.5), "model": "gemini-4-neon-xhigh", "input_tokens": 55000, "cache_read_tokens": 0, "output_tokens": 300}),
+                        json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso(-1.0), "model": "gemini-4-neon-xhigh", "input_tokens": 1800, "cache_read_tokens": 55000, "output_tokens": 300}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            eng_h = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            hint = eng_h._find_recent_cold_switch_hint(now - 5.0, now)
+            self.assertIsNotNone(hint)
+            self.assertAlmostEqual(hint, now - 4.0, delta=0.2)
+
+        # 5. P0/P1 Old-account switch-back carryover UI precedence + JSON recent_steps 3 fields + text summary/detail parity
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "dup00001-1111-2222-3333-444444444444"
+            log_dir = root / "brain" / cid / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            img = root / "pic.png"
+            img.write_bytes(b"a" * 2048)
+            now = time.time()
+            def _iso2(dt_s: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_s, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            # Old account (ol***1) used this window 2h ago; other account (ne***2) used it 2m ago; now switched back to ol***1
+            (log_dir / "transcript.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso2(-7200), "media": [{"uri": img.as_uri()}]}),
+                        json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso2(-7190), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 300}),
+                        # Out-of-order stale GENERIC media entry must be ignored
+                        json.dumps({"step_index": 1, "type": "GENERIC", "created_at": _iso2(-7300), "media": [{"uri": img.as_uri()}]}),
+                        json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso2(-120), "model": "gemini-4-neon-xhigh", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 300}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            eng_d = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng_d._ledger.observe_online("ol***1", now - 7300)
+            eng_d._ledger.observe_online("ne***2", now - 300)
+            eng_d._ledger.observe_online("ol***1", now - 20)
+            eng_d._account_cache = AccountQuotaInfo(short_label="ol***1", email_masked="ol***1@example.com", online=True, observed_at=now)
+            eng_d._last_account_poll = now
+
+            snap = eng_d.poll(now_ts=now, force_account=False, target_conversation_id=cid)
+            # Both active_conversations (historical slice) & carryover_conversations (fresh preview) contain cid
+            self.assertEqual(len(snap.carryover_conversations), 1)
+            self.assertEqual(snap.carryover_conversations[0].conversation_id, cid)
+            # JSON target_conversation.recent_steps MUST include the 3 documented v7.2 fields
+            jobj = json.loads(format_json_snapshot(snap))
+            step0 = jobj["target_conversation"]["recent_steps"][0]
+            self.assertIn("is_account_switch", step0)
+            self.assertIn("active_media_count", step0)
+            self.assertIn("active_media_bytes", step0)
+            self.assertEqual(step0["active_media_count"], 1)
+            # Text summary & detail report parity
+            summary_txt = format_text_summary(snap)
+            self.assertIn("换号过渡:", summary_txt)
+            self.assertIn("↪dup000", summary_txt)
+            rep = eng_d.read_conversation_detail(cid)
+            self.assertIsNotNone(rep)
+            detail_txt = format_detail_text_report(rep)
+            self.assertIn("多模态载荷:", detail_txt)
+            self.assertIn("已自动豁免暗限速误判", detail_txt)
+
+            # UI MUST prioritize carryover preview over stale historical slice of the same conversation_id!
+            cfg_store = ConfigStore(root / "cfg.json")
+            app = AntigravityCapsuleApp(
+                app_root=Path(__file__).resolve().parent.parent,
+                config_store=cfg_store,
+                engine=eng_d,
+                enable_tray=False,
+                start_minimized_override=False,
+            )
+            try:
+                app.root.withdraw()
+                app.set_expanded(True)
+                app.render_snapshot(snap)
+                app.root.update()
+                self.assertEqual(app._conv_rows[0]["id"].cget("text"), "↪dup000")
+                self.assertEqual(app._conv_rows[0]["hit"].cget("text"), "待首步")
+                self.assertTrue(app._conv_row_carryover[0])
+                # Must not render duplicate row for same cid
+                rendered_ids = [rid for rid in app._conv_row_ids if rid]
+                self.assertEqual(rendered_ids.count(cid), 1)
+            finally:
+                app.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

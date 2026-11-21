@@ -19,12 +19,16 @@ from core.config_store import ConfigStore
 from core.log_monitor import (
     AccountQuotaInfo,
     AntigravityMonitorEngine,
+    ConversationDetailPoint,
+    ConversationDetailReport,
     ConversationSummary,
     MonitorSnapshot,
     StepRecord,
 )
 from ui.capsule_app import AntigravityCapsuleApp
+from ui.detail_window import ConversationDetailWindow
 from ui.icon_builder import build_tray_icon
+from ui.themes import THEMES
 
 
 def _enable_dpi() -> None:
@@ -124,6 +128,60 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         ttft_avg_sec=5.3,
         ttft_max_sec=6.1,
     )
+    c3_cold = ConversationSummary(
+        conversation_id="demo0003-0000-0000-0000-000000000003",
+        short_id="demo03",
+        model="Neon XHigh",
+        model_raw="gemini-4-neon-xhigh",
+        context_tokens=22400,
+        max_context_tokens=512000,
+        latest_hit_rate=0.0,
+        latest_cached_in=0,
+        latest_uncached_in=22400,
+        latest_timestamp=now - 55,
+        recent_steps=[
+            StepRecord(1, now - 55, "gemini-4-neon-xhigh", 22400, 0, 320, 22400, 0.0, "expected_cold", "small_ctx"),
+        ],
+        consec_miss=0,
+        consec_miss_start_step=1,
+        single_miss=False,
+        wasted_cold_tokens=0,
+        freshness_remaining_sec=None,
+        freshness_invalid_reason="",
+        ttft_sec=6.4,
+        streaming_sec=2.8,
+        tps=142.0,
+        shard_tag="dm03",
+        speed_status="ok",
+        recent_ttfts=[6.4],
+        recent_tps_list=[142.0],
+        ttft_avg_sec=6.4,
+        ttft_max_sec=6.4,
+        latest_cache_reason="small_ctx",
+        title="新建小上下文演示",
+    )
+    c_carry = ConversationSummary(
+        conversation_id="demo0004-0000-0000-0000-000000000004",
+        short_id="demo04",
+        model="Carbon High",
+        model_raw="gemini-4-carbon-high",
+        context_tokens=168000,
+        max_context_tokens=512000,
+        latest_hit_rate=0.0,
+        latest_cached_in=0,
+        latest_uncached_in=168000,
+        latest_timestamp=now - 35,
+        recent_steps=[],
+        consec_miss=0,
+        consec_miss_start_step=0,
+        single_miss=False,
+        wasted_cold_tokens=0,
+        freshness_remaining_sec=None,
+        freshness_invalid_reason="",
+        latest_cache_reason="account_switch",
+        is_carryover_preview=True,
+        title="同窗口换号过渡演示",
+    )
     return MonitorSnapshot(
         generated_at=now,
         level="red",
@@ -143,7 +201,8 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         today_steps=312,
         daily_steps_warn=800,
         daily_steps_alert=1000,
-        active_conversations=[c1, c2],
+        active_conversations=[c1, c2, c3_cold],
+        carryover_conversations=[c_carry],
         large_freshness_list=[c1],
         recent_503=0,
         today_503=0,
@@ -176,12 +235,87 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
     )
 
 
+def _build_demo_detail_report() -> ConversationDetailReport:
+    now = time.time()
+    pts = []
+    specs = [
+        # (step_idx, model, total, delta, hr, cls, reason, ttft, tps, strm, rev, cmp, acc_sw, mc, mb)
+        (1, "Neon XHigh", 22400, 22400, 0.0, "expected_cold", "small_ctx", 6.8, 152.0, 2.4, False, False, False, 0, 0),
+        (2, "Neon XHigh", 46800, 24400, 0.0, "expected_cold", "first_cacheable", 9.4, 160.0, 3.1, False, False, False, 0, 0),
+        (3, "Neon XHigh", 78500, 31700, 96.4, "hit", "cached", 11.2, 168.0, 4.0, False, False, False, 1, 1_450_000),
+        (4, "Neon XHigh", 124000, 45500, 98.1, "hit", "cached", 19.6, 158.0, 4.5, False, False, False, 2, 3_200_000),
+        (5, "Neon XHigh", 168200, 44200, 98.9, "hit", "cached", 34.8, 162.0, 5.2, False, False, False, 3, 4_850_000),
+        (6, "Carbon High", 192400, 24200, 0.0, "expected_cold", "model_switch", 22.5, 148.0, 6.0, False, False, False, 3, 4_850_000),
+        (7, "Carbon High", 228900, 36500, 98.4, "hit", "cached", 16.4, 156.0, 4.8, False, False, False, 3, 4_850_000),
+        (8, "Carbon High", 264100, 35200, 0.0, "expected_cold", "account_switch", 24.1, 151.0, 4.2, False, False, True, 3, 4_850_000),
+        (9, "Carbon High", 295600, 31500, 99.1, "hit", "cached", 14.2, 165.0, 5.1, False, False, False, 3, 4_850_000),
+        (10, "Carbon High", 118400, -177200, 0.0, "expected_cold", "compact_reset", 18.0, 171.0, 3.8, False, True, False, 0, 0),
+        (11, "Carbon High", 152000, 33600, 98.7, "hit", "cached", 12.1, 174.0, 4.1, False, False, False, 1, 2_100_000),
+        (12, "Neon XHigh", 184600, 32600, 99.2, "hit", "cached", 48.2, 168.0, 5.6, False, False, False, 4, 6_400_000),
+    ]
+    for idx, (sidx, mod, tot, dlt, hr, cls, rsn, ttft, tps, strm, rev, cmp_, acc_sw, mc, mb) in enumerate(specs):
+        cached = int(tot * (hr / 100.0))
+        pts.append(
+            ConversationDetailPoint(
+                step_index=sidx,
+                timestamp=now - (len(specs) - idx) * 28,
+                model=mod,
+                total_tokens=tot,
+                context_delta=dlt,
+                input_tokens=tot - cached,
+                cache_read_tokens=cached,
+                output_tokens=int(tps * strm),
+                hit_rate=hr,
+                classification=cls,
+                reason=rsn,
+                ttft_sec=ttft,
+                tps=tps,
+                streaming_sec=strm,
+                is_revert=rev,
+                is_compact=cmp_,
+                is_account_switch=acc_sw,
+                active_media_count=mc,
+                active_media_bytes=mb,
+            )
+        )
+    return ConversationDetailReport(
+        conversation_id="demo-detail-v72-0000-000000000001",
+        short_id="demo72",
+        is_subagent=False,
+        model="Neon XHigh",
+        model_raw="gemini-4-neon-xhigh",
+        total_steps=len(pts),
+        today_steps=len(pts),
+        peak_context_tokens=295600,
+        latest_context_tokens=184600,
+        latest_context_delta=32600,
+        max_context_tokens=512000,
+        compact_count=1,
+        cache_hit_steps=7,
+        abnormal_miss_steps=0,
+        expected_cold_steps=5,
+        overall_cacheable_hit_ratio=1.0,
+        avg_ttft_sec=19.8,
+        p95_ttft_sec=48.2,
+        max_ttft_sec=48.2,
+        avg_tps=161.2,
+        latest_tps=168.0,
+        latest_ttft_sec=48.2,
+        freshness_remaining_sec=175,
+        freshness_invalid_reason="",
+        freshness_window_sec=210,
+        points=pts,
+        title="v7.2 跨号与多图长线演示",
+        revert_count=0,
+    )
+
+
 def main() -> int:
     _enable_dpi()
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else APP_ROOT / "preview_shots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    engine = AntigravityMonitorEngine()
+    engine = AntigravityMonitorEngine(read_only=True)
     live_snap = engine.poll(force_account=True)
 
     with tempfile.TemporaryDirectory() as td:
@@ -194,6 +328,7 @@ def main() -> int:
             enable_tray=False,
             start_minimized_override=False,
         )
+        dw = None
         try:
             # 1. Live collapsed capsule (Scheme B Midnight Blue)
             app.render_snapshot(live_snap)
@@ -220,17 +355,36 @@ def main() -> int:
             app._on_update_check_result(
                 UpdateCheckResult(
                     checked_at=time.time(),
-                    local_version="7.1.0",
-                    remote_version="7.2.0",
+                    local_version="7.2.0",
+                    remote_version="7.3.0",
                     has_update=True,
-                    summary="新增自动更新提示与后台自动更新重启",
-                    released_at="2026-11-21",
+                    summary="修复 403 误报、换号冷启提示与多图免误判",
+                    released_at="2026-11-22",
                     install_mode="zip",
                     is_manual=True,
                 )
             )
             _capture_widget(app.root, out_dir / "shot_6_update_banner_midnight.png")
+
+            # 7. Detail window simulation (multimodal payload + account-switch line + 1109x722 lock)
+            demo_rep = _build_demo_detail_report()
+            dw = ConversationDetailWindow(
+                parent=app.root,
+                theme=THEMES["midnight_blue"],
+                load_report=lambda _cid: demo_rep,
+                on_toggle_pin=lambda _cid: None,
+                is_pinned_fn=lambda _cid: False,
+            )
+            dw.show_conversation(demo_rep.conversation_id, place_near_parent=True)
+            dw.win.lift()
+            dw.win.attributes("-topmost", True)
+            _capture_widget(dw.win, out_dir / "shot_7_detail_window_midnight.png")
         finally:
+            if dw is not None:
+                try:
+                    dw.close()
+                except Exception:
+                    pass
             app.shutdown()
 
     # 5. Composite strip showing 80x80, 24x24, and 16x16 real taskbar tray icon scales
@@ -242,7 +396,7 @@ def main() -> int:
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=24), (x_base + 14, 108))
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=16), (x_base + 50, 112))
     strip.save(out_dir / "shot_5_tray_three_states.png", "PNG")
-    print(f"Captured 6 verification images in {out_dir}")
+    print(f"Captured 7 verification images in {out_dir}")
     return 0
 
 

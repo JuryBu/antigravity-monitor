@@ -16,11 +16,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.config_store import ConfigStore
 from core.log_monitor import (
+    CACHE_REASON_CN_MAP,
+    COLD_SHORT_BADGE_MAP,
     HISTORY_RANGE_SPECS,
     AntigravityMonitorEngine,
     MonitorSnapshot,
     format_countdown,
     format_delta_tokens,
+    format_media_size,
     format_model_name,
     format_relative_age,
     format_text_summary,
@@ -200,6 +203,7 @@ class AntigravityCapsuleApp:
         self._tooltip_win: Optional[tk.Toplevel] = None
         self._conv_hover_texts: List[str] = []
         self._conv_row_ids: List[str] = []
+        self._conv_row_carryover: List[bool] = []
         self._hovered_row_idx: Optional[int] = None
         self._pinned_conv_id: Optional[str] = None
         self._fresh_hover_text: str = ""
@@ -1759,12 +1763,15 @@ class AntigravityCapsuleApp:
             else snap.primary_hit_classification
         )
         disp_hit_reason = (
-            pinned_conv.recent_steps[-1].reason
-            if (pinned_conv is not None and pinned_conv.recent_steps)
+            (pinned_conv.latest_cache_reason or (pinned_conv.recent_steps[-1].reason if pinned_conv.recent_steps else ""))
+            if pinned_conv is not None
             else (
-                next((c.recent_steps[-1].reason for c in snap.active_conversations if not c.is_subagent and c.recent_steps), "")
-                if snap.active_conversations
-                else ""
+                getattr(snap, "primary_hit_reason", "")
+                or (
+                    next((c.recent_steps[-1].reason for c in snap.active_conversations if not c.is_subagent and c.recent_steps), "")
+                    if snap.active_conversations
+                    else ""
+                )
             )
         )
         disp_tps = pinned_conv.tps if pinned_conv is not None else snap.primary_tps
@@ -1776,13 +1783,20 @@ class AntigravityCapsuleApp:
         if disp_hit is not None:
             if disp_hit >= 70:
                 hit_color = t["green"]
+                hit_disp_txt = f"{disp_hit:.1f}%"
             elif disp_hit_reason == "compact_reset":
                 hit_color = t["purple"]
+                hit_disp_txt = COLD_SHORT_BADGE_MAP.get(disp_hit_reason, "压缩冷") if disp_hit < 0.05 else f"{disp_hit:.1f}%"
+            elif disp_hit_cls == "expected_cold" and disp_hit < 0.05:
+                hit_color = t["orange"]
+                hit_disp_txt = COLD_SHORT_BADGE_MAP.get(disp_hit_reason, "冷启")
             elif disp_hit >= 20 or disp_hit_cls == "expected_cold":
                 hit_color = t["orange"]
+                hit_disp_txt = f"{disp_hit:.1f}%"
             else:
                 hit_color = t["red"]
-            self._lbl_bar_cache_v.configure(text=f"{disp_hit:.1f}%", fg=hit_color)
+                hit_disp_txt = f"{disp_hit:.1f}%"
+            self._lbl_bar_cache_v.configure(text=hit_disp_txt, fg=hit_color)
         else:
             self._lbl_bar_cache_v.configure(text="—", fg=t["text_secondary"])
 
@@ -1883,7 +1897,14 @@ class AntigravityCapsuleApp:
             self._last_main_risk_alerted = False
 
         if self.tray is not None:
-            hit_s = f"{snap.primary_hit_rate:.1f}%" if snap.primary_hit_rate is not None else "—"
+            if snap.primary_hit_rate is not None:
+                p_reason = getattr(snap, "primary_hit_reason", "")
+                if snap.primary_hit_classification == "expected_cold" and snap.primary_hit_rate < 0.05:
+                    hit_s = COLD_SHORT_BADGE_MAP.get(p_reason, "冷启")
+                else:
+                    hit_s = f"{snap.primary_hit_rate:.1f}%"
+            else:
+                hit_s = "—"
             tps_s = f"{snap.primary_tps:.0f}t/s" if snap.primary_tps is not None else "—"
             slot_tip = f" | 槽位 {inv.total_db}/{inv.cap}" if inv is not None else ""
             tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {snap.today_steps}步{slot_tip}"
@@ -2266,27 +2287,29 @@ class AntigravityCapsuleApp:
         delta_s = f" ({format_delta_tokens(conv.latest_context_delta)})" if conv.latest_context_delta != 0 else ""
         total_s = f" · 共 {conv.total_step_count} 步" if getattr(conv, "total_step_count", 0) > 0 else ""
         head_name = f"{conv.title} ({conv.short_id})" if getattr(conv, "title", "") else conv.short_id
+        if getattr(conv, "is_carryover_preview", False):
+            return "\n".join(
+                [
+                    f"{head_name} · {conv.model} · {format_tokens(conv.context_tokens)}（同窗口换号过渡入口，左键看完整长线）",
+                    "说明: 服务端缓存按账号严格隔离，刚切到当前账号时该窗口尚未产生新步。",
+                    "      当前号发出的第 1 步属于换号冷启建缓（≥32K 起建），第 2 步起正常显示命中率。",
+                    "提示: 左键点击此行可打开长线详情，直接查看换号前后的完整跨号轨迹与换号竖线。",
+                ]
+            )
         lines = [f"{head_name} · {conv.model} · {format_tokens(conv.context_tokens)}{delta_s}{total_s}（左键看长线详情）"]
         if conv.ttft_avg_sec is not None and conv.ttft_max_sec is not None:
             cur_t = f"{conv.ttft_sec:.1f}s" if conv.ttft_sec is not None else "—"
             lines.append(f"TTFT: 新 {cur_t}  │  均 {conv.ttft_avg_sec:.1f}s  │  峰 {conv.ttft_max_sec:.1f}s")
+        media_cnt = int(getattr(conv, "active_media_count", 0) or 0)
+        media_bytes = int(getattr(conv, "active_media_bytes", 0) or 0)
+        if media_cnt > 0:
+            exempt_note = "（含多模态上传耗时，已豁免暗限速误判）" if getattr(conv, "media_ttft_exempted", False) else ""
+            lines.append(f"多模态载荷: {media_cnt} 项 ({format_media_size(media_bytes)}){exempt_note}")
         steps = conv.recent_steps[-10:]
         ttfts = conv.recent_ttfts[-len(steps):] if conv.recent_ttfts else []
         tpss = conv.recent_tps_list[-len(steps):] if conv.recent_tps_list else []
         t_offset = len(steps) - len(ttfts)
         s_offset = len(steps) - len(tpss)
-        reason_map = {
-            "cached": "命中",
-            "first_turn": "首轮",
-            "account_switch": "换号冷启",
-            "idle_rewarm": "闲置重热",
-            "model_switch": "切模型",
-            "compact_reset": "压缩重热",
-            "revert_reset": "回溯重热",
-            "small_ctx": "小上下文",
-            "first_cacheable": "首次入窗",
-            "abnormal_zero": "掉缓存!",
-        }
         lines.append("近 10 步逐拍明细（新 → 旧，最新置顶）:")
         step_rows = []
         for i, st in enumerate(steps):
@@ -2297,19 +2320,33 @@ class AntigravityCapsuleApp:
             p_str = f"{p_val:3.0f}t/s" if p_val is not None else "   — "
             ctx_s = f"{format_tokens(st.total_tokens):>6}"
             d_s = f"({format_delta_tokens(st.context_delta):>7})" if st.context_delta != 0 else "(    +0)"
-            mod_s = format_model_name(st.model)
+            mod_s = format_model_name(st.model, enum_map=self.engine._model_enum_map)
             if getattr(st, "is_revert", False) and st.reason == "cached":
                 tag = "回溯·命中"
             elif getattr(st, "is_compact", False) and st.reason == "cached":
                 tag = "压缩·命中"
+            elif getattr(st, "is_account_switch", False) and st.reason == "cached":
+                tag = "换号·命中"
             else:
-                tag = reason_map.get(st.reason, st.reason)
-            step_rows.append((hm, mod_s, ctx_s, d_s, st.hit_rate, t_str, p_str, tag))
+                tag = CACHE_REASON_CN_MAP.get(st.reason, st.reason)
+            st_mc = int(getattr(st, "active_media_count", 0) or 0)
+            st_mb = int(getattr(st, "active_media_bytes", 0) or 0)
+            m_str = f" │ 图{st_mc}({format_media_size(st_mb)})" if st_mc > 0 else ""
+            step_rows.append((hm, mod_s, ctx_s, d_s, st.hit_rate, t_str, p_str, tag, m_str))
         show_per_step_model = len({r[1] for r in step_rows}) >= 2
-        for rev_idx, (hm, mod_s, ctx_s, d_s, hr, t_str, p_str, tag) in enumerate(reversed(step_rows), 1):
+        for rev_idx, (hm, mod_s, ctx_s, d_s, hr, t_str, p_str, tag, m_str) in enumerate(reversed(step_rows), 1):
             badge = "最新" if rev_idx == 1 else f"#{rev_idx:<2}"
             mod_col = f" │ {mod_s:<11}" if show_per_step_model else ""
-            lines.append(f"  {badge:<3} {hm}{mod_col} │ {ctx_s} {d_s} │ 缓存 {hr:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
+            lines.append(f"  {badge:<3} {hm}{mod_col} │ {ctx_s} {d_s}{m_str} │ 缓存 {hr:5.1f}% │ 首字 {t_str} │ {p_str} [{tag}]")
+        latest_r = getattr(conv, "latest_cache_reason", "") or (steps[-1].reason if steps else "")
+        cold_explain = {
+            "small_ctx": "提示: 上下文 <32K 未达服务端缓存门槛，跨过 32K 首建后的下一步起出现命中率。",
+            "first_cacheable": "提示: 本步首次跨过 32K 门槛正在建缓，属于正常冷启，下一步起命中缓存。",
+            "account_switch": "提示: 换号后服务端缓存按账号隔离，本步为新号首次建缓，下一步起命中缓存。",
+            "model_switch": "提示: 切换模型后缓存按模型独立重建，本步为正常冷启，下一步起命中缓存。",
+        }.get(latest_r, "")
+        if cold_explain:
+            lines.append(cold_explain)
         return "\n".join(lines)
 
     def _show_text_tooltip(self, text: str, event: tk.Event) -> None:
@@ -2390,14 +2427,16 @@ class AntigravityCapsuleApp:
             self._show_context_menu(event)
             return
         conv_id = self._conv_row_ids[row_idx]
+        is_carryover = row_idx < len(self._conv_row_carryover) and self._conv_row_carryover[row_idx]
         short_id = conv_id[:6]
         self._hide_conv_tooltip()
         menu = tk.Menu(self.root, tearoff=False)
         menu.add_command(label=f"📈 查看 {short_id} 长线详情", command=lambda cid=conv_id: self.open_conversation_detail(cid))
-        if self._pinned_conv_id == conv_id:
-            menu.add_command(label=f"取消聚焦 {short_id}", command=lambda: self.set_pinned_conversation(None))
-        else:
-            menu.add_command(label=f"📌 聚焦 {short_id} 到主面板", command=lambda cid=conv_id: self.set_pinned_conversation(cid))
+        if not is_carryover:
+            if self._pinned_conv_id == conv_id:
+                menu.add_command(label=f"取消聚焦 {short_id}", command=lambda: self.set_pinned_conversation(None))
+            else:
+                menu.add_command(label=f"📌 聚焦 {short_id} 到主面板", command=lambda cid=conv_id: self.set_pinned_conversation(cid))
         menu.add_separator()
         menu.add_command(label="打开监控主菜单...", command=lambda e=event: self._show_context_menu(e))
         try:
@@ -2573,15 +2612,22 @@ class AntigravityCapsuleApp:
         self._refresh_filter_buttons(len(main_convs), len(sub_convs))
 
         if self._conv_filter == "main":
-            convs = main_convs
+            convs = list(main_convs)
         elif self._conv_filter == "subagent":
-            convs = sub_convs
+            convs = list(sub_convs)
         else:
-            convs = all_convs
+            convs = list(all_convs)
+
+        if self._conv_filter in ("main", "all"):
+            carry_raw = list(getattr(snap, "carryover_conversations", None) or [])
+            if carry_raw:
+                carry_ids = {c.conversation_id for c in carry_raw}
+                convs = (carry_raw + [c for c in convs if c.conversation_id not in carry_ids])[:24]
 
         all_keys = ("id", "title", "model", "ctx", "ttft_canvas", "ttft_val", "canvas", "hit", "speed")
         self._conv_hover_texts = [""] * len(self._conv_rows)
         self._conv_row_ids = [""] * len(self._conv_rows)
+        self._conv_row_carryover = [False] * len(self._conv_rows)
 
         if not convs:
             for row_ui in self._conv_rows:
@@ -2608,15 +2654,25 @@ class AntigravityCapsuleApp:
                 continue
 
             conv = convs[idx]
+            is_carry = bool(getattr(conv, "is_carryover_preview", False))
             self._conv_hover_texts[idx] = self._build_conv_tooltip_text(conv)
             self._conv_row_ids[idx] = conv.conversation_id
-            is_pinned = self._pinned_conv_id == conv.conversation_id
-            id_txt = f"📌{conv.short_id}" if is_pinned else conv.short_id
-            row_ui["id"].configure(text=id_txt, fg=t["cyan"] if is_pinned else t["text_primary"])
+            self._conv_row_carryover[idx] = is_carry
+            is_pinned = (not is_carry) and (self._pinned_conv_id == conv.conversation_id)
+            if is_carry:
+                id_txt = f"↪{conv.short_id}"
+                id_col = t["cyan"]
+            elif is_pinned:
+                id_txt = f"📌{conv.short_id}"
+                id_col = t["cyan"]
+            else:
+                id_txt = conv.short_id
+                id_col = t["text_primary"]
+            row_ui["id"].configure(text=id_txt, fg=id_col)
 
             if conv.title:
                 title_txt = truncate_display_width(conv.title, 16)
-                title_col = t["cyan"] if is_pinned else t["text_primary"]
+                title_col = t["text_secondary"] if is_carry else (t["cyan"] if is_pinned else t["text_primary"])
             elif conv.is_subagent:
                 title_txt = "子代理"
                 title_col = t["text_muted"]
@@ -2626,11 +2682,11 @@ class AntigravityCapsuleApp:
             row_ui["title"].configure(text=title_txt, fg=title_col)
 
             mod_txt = f"子·{conv.model}" if (self._conv_filter == "all" and conv.is_subagent) else conv.model
-            row_ui["model"].configure(text=mod_txt, fg=t["text_muted"] if conv.is_subagent else t["text_secondary"])
+            row_ui["model"].configure(text=mod_txt, fg=t["text_muted"] if (conv.is_subagent or is_carry) else t["text_secondary"])
 
             latest_step = conv.recent_steps[-1] if conv.recent_steps else None
             latest_cls = latest_step.classification if latest_step else ""
-            latest_reason = latest_step.reason if latest_step else ""
+            latest_reason = getattr(conv, "latest_cache_reason", "") or (latest_step.reason if latest_step else "")
             latest_is_rev = bool(latest_step and (getattr(latest_step, "is_revert", False) or latest_reason == "revert_reset"))
             latest_is_cmp = bool(
                 latest_step
@@ -2639,7 +2695,9 @@ class AntigravityCapsuleApp:
             )
 
             ctx_txt = format_tokens(conv.context_tokens)
-            if latest_is_rev:
+            if is_carry:
+                ctx_col = t["text_muted"]
+            elif latest_is_rev:
                 ctx_txt += "↩"
                 ctx_col = t["orange"]
             elif latest_is_cmp:
@@ -2649,25 +2707,37 @@ class AntigravityCapsuleApp:
                 ctx_col = t["text_secondary"]
             row_ui["ctx"].configure(text=ctx_txt, fg=ctx_col)
 
-            if conv.ttft_sec is not None:
-                ttft_txt = f"{conv.ttft_sec:.0f}s" if conv.ttft_sec >= 100 else f"{conv.ttft_sec:.1f}s"
+            if is_carry:
+                row_ui["ttft_val"].configure(text="—", fg=t["text_muted"])
+                row_ui["hit"].configure(text="待首步", fg=t["cyan"])
+                row_ui["speed"].configure(text="—", fg=t["text_muted"])
             else:
-                ttft_txt = "—"
-            row_ui["ttft_val"].configure(text=ttft_txt, fg=self._ttft_color(conv.ttft_sec))
+                if conv.ttft_sec is not None:
+                    ttft_txt = f"{conv.ttft_sec:.0f}s" if conv.ttft_sec >= 100 else f"{conv.ttft_sec:.1f}s"
+                else:
+                    ttft_txt = "—"
+                row_ui["ttft_val"].configure(text=ttft_txt, fg=self._ttft_color(conv.ttft_sec))
 
-            if conv.latest_hit_rate >= 70:
-                hit_col = t["green"]
-            elif latest_reason == "compact_reset":
-                hit_col = t["purple"]
-            elif conv.latest_hit_rate >= 20 or latest_cls == "expected_cold":
-                hit_col = t["orange"]
-            else:
-                hit_col = t["red"]
-            row_ui["hit"].configure(text=f"{conv.latest_hit_rate:.1f}%", fg=hit_col)
+                if conv.latest_hit_rate >= 70:
+                    hit_col = t["green"]
+                    hit_txt = f"{conv.latest_hit_rate:.1f}%"
+                elif latest_reason == "compact_reset":
+                    hit_col = t["purple"]
+                    hit_txt = COLD_SHORT_BADGE_MAP.get(latest_reason, "压缩冷") if conv.latest_hit_rate < 0.05 else f"{conv.latest_hit_rate:.1f}%"
+                elif latest_cls == "expected_cold" and conv.latest_hit_rate < 0.05:
+                    hit_col = t["orange"]
+                    hit_txt = COLD_SHORT_BADGE_MAP.get(latest_reason, "冷启")
+                elif conv.latest_hit_rate >= 20 or latest_cls == "expected_cold":
+                    hit_col = t["orange"]
+                    hit_txt = f"{conv.latest_hit_rate:.1f}%"
+                else:
+                    hit_col = t["red"]
+                    hit_txt = f"{conv.latest_hit_rate:.1f}%"
+                row_ui["hit"].configure(text=hit_txt, fg=hit_col)
 
-            sp_txt = f"{conv.tps:.0f} t/s" if conv.tps is not None else "—"
-            sp_col = t["orange"] if conv.speed_status == "slow" else t["cyan"]
-            row_ui["speed"].configure(text=sp_txt, fg=sp_col)
+                sp_txt = f"{conv.tps:.0f} t/s" if conv.tps is not None else "—"
+                sp_col = t["orange"] if conv.speed_status == "slow" else t["cyan"]
+                row_ui["speed"].configure(text=sp_txt, fg=sp_col)
 
             row_ui["id"].grid(row=idx, column=0, sticky="w", padx=(0, 6), pady=3)
             row_ui["title"].grid(row=idx, column=1, sticky="w", padx=(0, 10), pady=3)
@@ -2684,19 +2754,24 @@ class AntigravityCapsuleApp:
             tc.delete("all")
             tw, tgap = 5, 2
             ttop, tbot = 1, 15
-            t_series = conv.recent_ttfts[-10:]
-            t_pad = 10 - len(t_series)
-            for slot in range(10):
-                x0 = slot * (tw + tgap)
-                x1 = x0 + tw
-                if slot < t_pad or t_series[slot - t_pad] is None:
-                    tc.create_rectangle(x0, tbot - 3, x1, tbot, fill=t["bar_dim"], outline="")
-                    continue
-                sec = float(t_series[slot - t_pad])
-                col = self._ttft_color(sec)
-                h_ratio = min(1.0, max(0.24, sec / 75.0))
-                top_y = tbot - int(round((tbot - ttop) * h_ratio))
-                tc.create_rectangle(x0, top_y, x1, tbot, fill=col, outline="")
+            if is_carry:
+                for slot in range(10):
+                    x0 = slot * (tw + tgap)
+                    tc.create_rectangle(x0, tbot - 3, x0 + tw, tbot, fill=t["bar_dim"], outline="")
+            else:
+                t_series = conv.recent_ttfts[-10:]
+                t_pad = 10 - len(t_series)
+                for slot in range(10):
+                    x0 = slot * (tw + tgap)
+                    x1 = x0 + tw
+                    if slot < t_pad or t_series[slot - t_pad] is None:
+                        tc.create_rectangle(x0, tbot - 3, x1, tbot, fill=t["bar_dim"], outline="")
+                        continue
+                    sec = float(t_series[slot - t_pad])
+                    col = self._ttft_color(sec)
+                    h_ratio = min(1.0, max(0.24, sec / 75.0))
+                    top_y = tbot - int(round((tbot - ttop) * h_ratio))
+                    tc.create_rectangle(x0, top_y, x1, tbot, fill=col, outline="")
 
             # Draw 10-step Cache hit-rate micro-bars (Green=hit, Purple=compact_reset, Orange=expected_cold, Red=abnormal_miss)
             c = row_ui["canvas"]
@@ -2705,29 +2780,38 @@ class AntigravityCapsuleApp:
             bar_gap = 3
             bar_top = 1
             bar_bot = 15
-            steps = conv.recent_steps[-10:]
-            pad_slots = 10 - len(steps)
-            for slot in range(10):
-                x0 = slot * (bar_w + bar_gap)
-                x1 = x0 + bar_w
-                if slot < pad_slots:
-                    c.create_rectangle(x0, bar_top + 4, x1, bar_bot, fill=t["bar_dim"], outline="")
-                    continue
-                st = steps[slot - pad_slots]
-                if st.classification == "hit":
-                    col = t["green"]
-                    h_ratio = max(0.38, min(1.0, st.hit_rate / 100.0))
-                elif st.reason == "compact_reset":
-                    col = t["purple"]
-                    h_ratio = 0.74
-                elif st.classification == "expected_cold":
-                    col = t["orange"]
-                    h_ratio = 0.56
-                else:
-                    col = t["red"]
-                    h_ratio = 1.0
-                top_y = bar_bot - int(round((bar_bot - bar_top) * h_ratio))
-                c.create_rectangle(x0, top_y, x1, bar_bot, fill=col, outline="")
+            if is_carry:
+                for slot in range(10):
+                    x0 = slot * (bar_w + bar_gap)
+                    x1 = x0 + bar_w
+                    if slot == 9:
+                        c.create_rectangle(x0, bar_top + 6, x1, bar_bot, fill="", outline=t["cyan"], width=1)
+                    else:
+                        c.create_rectangle(x0, bar_top + 4, x1, bar_bot, fill=t["bar_dim"], outline="")
+            else:
+                steps = conv.recent_steps[-10:]
+                pad_slots = 10 - len(steps)
+                for slot in range(10):
+                    x0 = slot * (bar_w + bar_gap)
+                    x1 = x0 + bar_w
+                    if slot < pad_slots:
+                        c.create_rectangle(x0, bar_top + 4, x1, bar_bot, fill=t["bar_dim"], outline="")
+                        continue
+                    st = steps[slot - pad_slots]
+                    if st.classification == "hit":
+                        col = t["green"]
+                        h_ratio = max(0.38, min(1.0, st.hit_rate / 100.0))
+                    elif st.reason == "compact_reset":
+                        col = t["purple"]
+                        h_ratio = 0.74
+                    elif st.classification == "expected_cold":
+                        col = t["orange"]
+                        h_ratio = 0.56
+                    else:
+                        col = t["red"]
+                        h_ratio = 1.0
+                    top_y = bar_bot - int(round((bar_bot - bar_top) * h_ratio))
+                    c.create_rectangle(x0, top_y, x1, bar_bot, fill=col, outline="")
 
         self._convs_table.update_idletasks()
         table_h = self._convs_table.winfo_reqheight()

@@ -107,19 +107,20 @@ python -B main.py --json --readonly --conversation-id <id>
 
 ### 3. `cache`、`perf`、`errors_30m`、`errors_today`、`alerts`
 
-- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
-- **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`）。
-- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，并按 `±6s` 反查出事对话短 ID 与标题）、`403`、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；单次流超时或单次 503 报 `WARN`，累计 `>= 2` 次（`503 + timeout >= 2`）才升红 `T2`，且仅当主对话同档/主力模型事后连续稳定响应（中位 TTFT `< 45s`，排除子代理与轻量免疫模型洗白）时才稳定降级观察防反复横跳。
+- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `abnormal_zero`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
+- **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`；已排除极短输出 `<0.15s` 假 TPS 与高 TPS / 多模态原图上传耗时误判）。
+- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，并按 `±6s` 反查出事对话短 ID 与标题）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；单次流超时或单次 503 报 `WARN`，累计 `>= 2` 次（`503 + timeout >= 2`）才升红 `T2`，且仅当主对话同档/主力模型事后连续稳定响应（中位 TTFT `< 45s`，排除子代理与轻量免疫模型洗白）时才稳定降级观察防反复横跳。
 - **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
 - **`models_recent`**：数组，按当前账号观测范围内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg`、`steps_after_last_t2`（最近一次 503/超时后的成功步数）与 `ttft_after_last_t2_median`（事后中位 TTFT，防多模态单步长尾误判）。
 - **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常或 `slots.main_at_risk == true` 时保证包含对应高危告警条目。
 - **`--clean-subagents --json` 输出**：返回 `{ok, dry_run, mode, protect_age_min, candidate_count, removed_count, freed_bytes, skipped_locked_count, skipped_changed_count, remaining_db_count, archive_path, error}`（与 `--readonly` 冲突且未带 `--dry-run` 时返回 `ok: false` 与退出码 `2`）。
 
-### 4. `counts`、`active_conversations` 与 `target_conversation`
+### 4. `counts`、`active_conversations`、`carryover_conversations` 与 `target_conversation`
 
 - **`counts`**：`active_main`、`active_subagent`、`active_total`。
-- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`title`（对话标题，依次三源解析：`annotations/*.pbtxt` 本地元数据 → 在线本地 Hub `GetAllCascadeTrajectories` → 离线 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
-- **`target_conversation`**：仅当传入 `--conversation-id` 时填充；除上述字段外，还包含 `recent_steps`（近 10 步逐拍 `total_tokens`、`context_delta`、`hit_rate`、`classification`、`reason`）。同时顶层附 `target_conversation_query` 与 `target_conversation_found`。
+- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`title`（对话标题，依次三源解析：`annotations/*.pbtxt` 本地元数据 → 在线本地 Hub `GetAllCascadeTrajectories` → 离线 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`latest_cache_reason`、`active_media_count`、`active_media_bytes`、`media_ttft_exempted`、`is_carryover_preview`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
+- **`carryover_conversations`**：可选只读过渡列表（默认实时自动跟随视角下，最多 2 条近 10 分钟活跃但当前账号尚无新步的主对话入口，`is_carryover_preview: true`），严格与 `active_conversations` 及健康评级隔离，仅用于提示同窗口换号待首步及快速进入跨号长线详情。
+- **`target_conversation`**：仅当传入 `--conversation-id` 时填充；除上述字段外，还包含 `recent_steps`（近 10 步逐拍 `total_tokens`、`context_delta`、`hit_rate`、`classification`、`reason`、`is_account_switch`、`active_media_count`、`active_media_bytes`）。同时顶层附 `target_conversation_query` 与 `target_conversation_found`。
 
 ---
 

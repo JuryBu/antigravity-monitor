@@ -7,12 +7,14 @@ import tkinter as tk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.log_monitor import (
+    CACHE_REASON_CN_MAP,
     ConversationDetailPoint,
     ConversationDetailReport,
     MonitorSnapshot,
     format_countdown,
     format_delta_tokens,
     format_detail_text_report,
+    format_media_size,
     format_tokens,
     truncate_display_width,
 )
@@ -110,8 +112,17 @@ def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any
     max_ttft = ttfts[-1] if ttfts else None
     p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
 
-    tpss = [p.tps for p in pts if p.tps is not None]
-    avg_tps = (sum(tpss) / len(tpss)) if tpss else None
+    weighted_out = 0
+    weighted_strm = 0.0
+    for p in pts:
+        if p.streaming_sec is not None and p.streaming_sec >= 0.5 and p.output_tokens > 0:
+            weighted_out += int(p.output_tokens)
+            weighted_strm += float(p.streaming_sec)
+    if weighted_strm > 0.0 and weighted_out > 0:
+        avg_tps: Optional[float] = weighted_out / weighted_strm
+    else:
+        tpss = [p.tps for p in pts if p.tps is not None]
+        avg_tps = (sum(tpss) / len(tpss)) if tpss else None
     latest_tps = next((p.tps for p in reversed(pts) if p.tps is not None), None)
     return {
         "peak_context_tokens": peak_ctx,
@@ -240,9 +251,9 @@ class ConversationDetailWindow:
 
         # 3 long-range Canvas chart cards
         self._chart_specs = [
-            ("ctx", "请求体 / 上下文增长曲线", "顶带=每步模型 · 青线=上下文 · 紫虚=压缩 · 橙虚=回溯"),
+            ("ctx", "请求体 / 上下文增长曲线", "顶带=每步模型 · 青线=上下文 · 紫虚=压缩 · 橙虚=回溯 · 蓝虚=换号"),
             ("ttft", "首字延迟 TTFT 与模型切换趋势", "绿<15s · 青15-45s · 橙45-90s · 红≥90s"),
-            ("cache", "缓存命中率长线轨迹", "绿命中 · 紫压缩重热 · 橙正常冷启/回溯 · 红异常掉缓存"),
+            ("cache", "缓存命中率长线轨迹", "绿命中 · 紫压缩重热 · 橙正常冷启/回溯 · 红异常掉缓存 · 蓝虚=换号"),
         ]
         self._charts: Dict[str, Dict[str, Any]] = {}
         chart_heights = {"ctx": 118, "ttft": 112, "cache": 82}
@@ -770,12 +781,24 @@ class ConversationDetailWindow:
                     sx = self._x_for_idx(idx, n, pad_l, plot_w)
                     new_col = _model_band_color(pts[idx].model, t)
                     cv.create_line(sx, plot_top, sx, plot_bot, fill=new_col, width=1.1, dash=(2, 3))
-                    if sx - last_lbl_x >= 54.0 and sx < pad_l + plot_w - 42.0:
+                    tag_txt = f"→{_short_model_tag(pts[idx].model)}"
+                    if sx < pad_l + plot_w - 42.0:
+                        if sx - last_lbl_x >= 54.0:
+                            cv.create_text(
+                                sx + 2,
+                                y1 + 6,
+                                text=tag_txt,
+                                anchor="w",
+                                font=(MONO_FONT, 7, "bold"),
+                                fill=new_col,
+                            )
+                            last_lbl_x = sx
+                    elif sx - last_lbl_x >= 56.0:
                         cv.create_text(
-                            sx + 2,
+                            sx - 2,
                             y1 + 6,
-                            text=f"→{_short_model_tag(pts[idx].model)}",
-                            anchor="w",
+                            text=tag_txt,
+                            anchor="e",
                             font=(MONO_FONT, 7, "bold"),
                             fill=new_col,
                         )
@@ -833,7 +856,7 @@ class ConversationDetailWindow:
             cv.create_line(pad_l, yy, pad_l + plot_w, yy, fill=t["divider"], dash=(2, 3))
             cv.create_text(pad_l - 6, yy, text=format_tokens(int(y_max * frac)), anchor="e", font=(MONO_FONT, 7), fill=t["text_muted"])
 
-        # Highlight compaction drops (purple) & user Undo/revert branch points (orange)
+        # Highlight compaction drops (purple), user Undo/revert branch points (orange), & account switches (cyan)
         n = len(pts)
         coords: List[float] = []
         last_lbl_x = -999.0
@@ -841,15 +864,23 @@ class ConversationDetailWindow:
             x = self._x_for_idx(idx, n, pad_l, plot_w)
             y = pad_t + plot_h * (1.0 - min(1.0, pt.total_tokens / float(y_max)))
             coords.extend([x, y])
+            is_acc_sw = bool(getattr(pt, "is_account_switch", False) or pt.reason == "account_switch")
+            mark_spec: Optional[Tuple[str, str, Tuple[int, int]]] = None
             if getattr(pt, "is_revert", False) or pt.reason == "revert_reset":
-                cv.create_line(x, pad_t, x, pad_t + plot_h, fill=t["orange"], width=1.2, dash=(2, 2))
-                if x - last_lbl_x >= 34.0 and x < pad_l + plot_w - 22.0:
-                    cv.create_text(x + 2, pad_t + 7, text="回溯", anchor="w", font=(UI_FONT, 7, "bold"), fill=t["orange"])
-                    last_lbl_x = x
+                mark_spec = ("回溯", t["orange"], (2, 2))
             elif getattr(pt, "is_compact", False) or pt.reason == "compact_reset":
-                cv.create_line(x, pad_t, x, pad_t + plot_h, fill=t["purple"], width=1.2, dash=(3, 2))
-                if x - last_lbl_x >= 34.0 and x < pad_l + plot_w - 22.0:
-                    cv.create_text(x + 2, pad_t + 7, text="压缩", anchor="w", font=(UI_FONT, 7, "bold"), fill=t["purple"])
+                mark_spec = ("压缩", t["purple"], (3, 2))
+            elif is_acc_sw:
+                mark_spec = ("换号", t["cyan"], (4, 2))
+            if mark_spec is not None:
+                m_txt, m_col, m_dash = mark_spec
+                cv.create_line(x, pad_t, x, pad_t + plot_h, fill=m_col, width=1.2, dash=m_dash)
+                if x < pad_l + plot_w - 22.0:
+                    if x - last_lbl_x >= 34.0:
+                        cv.create_text(x + 2, pad_t + 7, text=m_txt, anchor="w", font=(UI_FONT, 7, "bold"), fill=m_col)
+                        last_lbl_x = x
+                elif x - last_lbl_x >= 34.0:
+                    cv.create_text(x - 2, pad_t + 7, text=m_txt, anchor="e", font=(UI_FONT, 7, "bold"), fill=m_col)
                     last_lbl_x = x
 
         # Subtle shaded polygon + crisp cyan polyline
@@ -985,6 +1016,19 @@ class ConversationDetailWindow:
             yy = y_base - plot_h * ratio
             cv.create_rectangle(x - bar_w / 2.0, yy, x + bar_w / 2.0, y_base, fill=col, outline="")
 
+        last_sw_x = -999.0
+        for idx, pt in enumerate(pts):
+            if getattr(pt, "is_account_switch", False) or pt.reason == "account_switch":
+                sx = self._x_for_idx(idx, n, pad_l, plot_w)
+                cv.create_line(sx, pad_t, sx, y_base, fill=t["cyan"], width=1.1, dash=(3, 2))
+                if sx < pad_l + plot_w - 22.0:
+                    if sx - last_sw_x >= 34.0:
+                        cv.create_text(sx + 2, pad_t + 6, text="换号", anchor="w", font=(UI_FONT, 7, "bold"), fill=t["cyan"])
+                        last_sw_x = sx
+                elif sx - last_sw_x >= 34.0:
+                    cv.create_text(sx - 2, pad_t + 6, text="换号", anchor="e", font=(UI_FONT, 7, "bold"), fill=t["cyan"])
+                    last_sw_x = sx
+
         self._draw_axis_footer(cv, pts, pad_l, plot_w, h)
 
     def _on_chart_hover(self, chart_key: str, event: tk.Event) -> None:
@@ -1033,18 +1077,6 @@ class ConversationDetailWindow:
             self._update_readout_for_point(self._display_points[-1], prefix="最新步")
 
     def _update_readout_for_point(self, pt: ConversationDetailPoint, prefix: str = "选定步") -> None:
-        reason_map = {
-            "cached": "命中",
-            "first_turn": "首轮",
-            "account_switch": "换号冷启",
-            "idle_rewarm": "闲置重热",
-            "model_switch": "切模型",
-            "compact_reset": "压缩重热",
-            "revert_reset": "回溯重热",
-            "small_ctx": "小上下文",
-            "first_cacheable": "首次入窗",
-            "abnormal_zero": "掉缓存!",
-        }
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f} t/s" if pt.tps is not None else "—"
@@ -1052,12 +1084,18 @@ class ConversationDetailWindow:
             tag = "回溯·命中"
         elif getattr(pt, "is_compact", False) and pt.reason == "cached":
             tag = "压缩·命中"
+        elif getattr(pt, "is_account_switch", False) and pt.reason == "cached":
+            tag = "换号·命中"
         else:
-            tag = reason_map.get(pt.reason, pt.reason)
-        mod_s = pt.model or "未知模型"
+            tag = CACHE_REASON_CN_MAP.get(pt.reason, pt.reason)
+        mod_s = truncate_display_width(pt.model or "未知模型", 14)
+        disp_prefix = "选定" if prefix == "选定步" else ("最新" if prefix == "最新步" else prefix)
+        m_cnt = int(getattr(pt, "active_media_count", 0) or 0)
+        m_bytes = int(getattr(pt, "active_media_bytes", 0) or 0)
+        m_seg = f" │ 图{m_cnt}({format_media_size(m_bytes)})" if m_cnt > 0 else ""
         msg = (
-            f"{prefix} #{pt.step_index} ({hm}) │ [{mod_s}] │ 请求体 {format_tokens(pt.total_tokens)} "
-            f"({format_delta_tokens(pt.context_delta)}) │ 缓存 {pt.hit_rate:.1f}% [{tag}] │ 首字 {t_s} │ {p_s}"
+            f"{disp_prefix}#{pt.step_index} {hm} │ [{mod_s}] │ {format_tokens(pt.total_tokens)} "
+            f"({format_delta_tokens(pt.context_delta)}){m_seg} │ {pt.hit_rate:.1f}% [{tag}] │ 首字 {t_s} │ {p_s}"
         )
         t = self.theme
         fg = (
@@ -1069,7 +1107,11 @@ class ConversationDetailWindow:
                 else (
                     t["purple"]
                     if (getattr(pt, "is_compact", False) or pt.reason == "compact_reset")
-                    else (t["orange"] if pt.classification == "expected_cold" else t["text_primary"])
+                    else (
+                        t["cyan"]
+                        if (getattr(pt, "is_account_switch", False) or pt.reason == "account_switch")
+                        else (t["orange"] if pt.classification == "expected_cold" else t["text_primary"])
+                    )
                 )
             )
         )

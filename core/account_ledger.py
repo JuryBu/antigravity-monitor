@@ -120,7 +120,12 @@ class AccountSwitchLedger:
         except OSError:
             pass
 
-    def observe_online(self, short_label: str, now_ts: float) -> None:
+    def observe_online(
+        self,
+        short_label: str,
+        now_ts: float,
+        hint_switch_ts: Optional[float] = None,
+    ) -> None:
         """Record an observed online masked account if it differs from the most recent known state."""
         if _is_invalid_label(short_label):
             return
@@ -132,17 +137,28 @@ class AccountSwitchLedger:
         self._own_events = [(ts, lab) for ts, lab in self._own_events if ts >= cutoff]
         if self._own_events and self._own_events[-1][1].lower() == lbl.lower():
             return
-        # If Cockpit already recorded a switch to this exact account within the last 120s, avoid duplicating
+        # If Cockpit already recorded a switch to this exact account within the last 180s
+        # AND strictly after our latest own event (never inserting backwards before a newer manual switch), anchor to it.
+        prev_own_ts = self._own_events[-1][0] if self._own_events else 0.0
         cockpit_evs = self._read_cockpit_switches(now_ts - 2 * 86400)
         if cockpit_evs:
             last_ck_ts, last_ck_lbl = cockpit_evs[-1]
-            if last_ck_lbl.lower() == lbl.lower() and abs(now_ts - last_ck_ts) <= 180.0:
-                if not self._own_events or self._own_events[-1][1].lower() != lbl.lower():
-                    self._own_events.append((last_ck_ts, lbl))
-                    self._own_events.sort(key=lambda x: x[0])
-                    self._save_own()
+            if (
+                last_ck_lbl.lower() == lbl.lower()
+                and abs(now_ts - last_ck_ts) <= 180.0
+                and last_ck_ts > prev_own_ts
+            ):
+                self._own_events.append((last_ck_ts, lbl))
+                self._own_events.sort(key=lambda x: x[0])
+                self._save_own()
                 return
-        self._own_events.append((now_ts, lbl))
+        # Without Cockpit switch log, honor an engine-validated cold-start hint timestamp (never crossing prior events)
+        rec_ts = now_ts
+        if hint_switch_ts is not None and (now_ts - 60.0) <= hint_switch_ts <= now_ts:
+            prev_ts = max(prev_own_ts, cockpit_evs[-1][0] if cockpit_evs else 0.0)
+            if hint_switch_ts > prev_ts:
+                rec_ts = hint_switch_ts
+        self._own_events.append((rec_ts, lbl))
         self._own_events.sort(key=lambda x: x[0])
         self._save_own()
 
@@ -161,6 +177,9 @@ class AccountSwitchLedger:
                 continue
         dated.sort(key=lambda item: item[0], reverse=True)
         candidates = [p for _, p in dated[:12]]
+        valid_keys = {str(p) for p in candidates}
+        for stale_key in [k for k in self._cockpit_cache if k not in valid_keys]:
+            self._cockpit_cache.pop(stale_key, None)
 
         merged: List[Tuple[float, str]] = []
         for lp in candidates:
@@ -193,7 +212,16 @@ class AccountSwitchLedger:
             for ts, lbl in rows:
                 if ts >= since_ts:
                     merged.append((ts, lbl))
-        return merged
+        merged.sort(key=lambda x: x[0])
+        deduped: List[Tuple[float, str]] = []
+        seen: set[Tuple[float, str]] = set()
+        for ts, lbl in merged:
+            sig = (round(ts, 3), lbl.lower())
+            if sig in seen:
+                continue
+            seen.add(sig)
+            deduped.append((ts, lbl))
+        return deduped
 
     def get_timeline(self, since_ts: float) -> List[Tuple[float, str]]:
         """Return deduplicated, chronological (timestamp, masked_label) switch transitions."""

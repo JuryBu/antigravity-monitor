@@ -139,13 +139,11 @@ def parse_gen_metadata_row(idx: int, blob: bytes) -> Optional[GenTelemetry]:
     ttft_sec = _parse_duration_sec(m1.get(11, [None])[0] if m1.get(11) else None)
     streaming_sec = _parse_duration_sec(m1.get(12, [None])[0] if m1.get(12) else None)
 
-    # Prefer pure streaming TPS when streaming duration is meaningful (>0.15s); fall back to total duration.
+    # Compute pure streaming TPS only when streaming_sec >= 0.15s; never divide by (ttft + streaming)
+    # on instant burst tool-calls (<0.15s), which would mix multi-second TTFT into fake low TPS.
     tps: Optional[float] = None
-    if total_out > 0:
-        if streaming_sec is not None and streaming_sec >= 0.15:
-            tps = total_out / streaming_sec
-        elif ttft_sec is not None and streaming_sec is not None and (ttft_sec + streaming_sec) > 0:
-            tps = total_out / (ttft_sec + streaming_sec)
+    if total_out > 0 and streaming_sec is not None and streaming_sec >= 0.15:
+        tps = total_out / streaming_sec
 
     max_context = 0
     if m1.get(9) and isinstance(m1[9][0], bytes):
@@ -164,14 +162,36 @@ def parse_gen_metadata_row(idx: int, blob: bytes) -> Optional[GenTelemetry]:
             if isinstance(err_val, bytes):
                 retry_error = err_val.decode("utf-8", errors="ignore").strip()
 
+    # Model label priority: m1[21] (display label) -> m1[20]["model_enum"] -> m1[19] (slug) -> top[21]/top[19] (legacy/tests)
     model_label = ""
-    for fn in (21, 19):
-        vals = top.get(fn)
-        if vals and isinstance(vals[0], bytes):
-            cand = vals[0].decode("utf-8", errors="ignore").strip()
+    m1_21 = m1.get(21)
+    if m1_21 and isinstance(m1_21[0], bytes):
+        cand = m1_21[0].decode("utf-8", errors="ignore").strip()
+        if cand:
+            model_label = cand
+    if not model_label and m1.get(20):
+        for entry in m1[20]:
+            if isinstance(entry, bytes):
+                em = parse_pb_map(entry)
+                if em.get(1) and em[1][0] == b"model_enum" and em.get(2) and isinstance(em[2][0], bytes):
+                    cand = em[2][0].decode("utf-8", errors="ignore").strip()
+                    if cand:
+                        model_label = cand
+                        break
+    if not model_label:
+        m1_19 = m1.get(19)
+        if m1_19 and isinstance(m1_19[0], bytes):
+            cand = m1_19[0].decode("utf-8", errors="ignore").strip()
             if cand:
                 model_label = cand
-                break
+    if not model_label:
+        for fn in (21, 19):
+            vals = top.get(fn)
+            if vals and isinstance(vals[0], bytes):
+                cand = vals[0].decode("utf-8", errors="ignore").strip()
+                if cand:
+                    model_label = cand
+                    break
 
     return GenTelemetry(
         idx=idx,
