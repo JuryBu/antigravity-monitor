@@ -110,11 +110,25 @@ class TrayManager:
                 self._invoke("toggle_auto_clean"),
                 checked=lambda _item: bool(self._getters.get("auto_clean", lambda: True)()),
             ),
+            pystray.MenuItem(
+                "后台检查更新提示",
+                self._invoke("toggle_update_check"),
+                checked=lambda _item: bool(self._getters.get("update_check", lambda: True)()),
+            ),
+            pystray.MenuItem(
+                "发现更新时自动更新重启",
+                self._invoke("toggle_auto_update"),
+                checked=lambda _item: bool(self._getters.get("auto_update", lambda: False)()),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("查看本机 500 槽位详情", self._invoke("open_slots")),
             pystray.MenuItem(
                 lambda _item: str(self._getters.get("clean_label", lambda: "立即清理 2h 外子代理")()),
                 self._invoke("clean_subagents"),
+            ),
+            pystray.MenuItem(
+                lambda _item: str(self._getters.get("update_label", lambda: "立即检查更新")()),
+                self._invoke("check_or_apply_update"),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("立即刷新采样", self._invoke("refresh_now")),

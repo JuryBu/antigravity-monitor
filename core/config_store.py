@@ -35,6 +35,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "slot_auto_trigger_threshold": 420,
     "slot_clean_mode": "recycle",
     "slot_archive_dir": "",
+    "update_check_enabled": True,
+    "auto_update_restart": False,
+    "update_check_interval_min": 30,
+    "update_ignored_version": "",
 }
 
 VALID_THEMES = ("midnight_blue", "obsidian_dark")
@@ -100,6 +104,12 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
         cfg["slot_clean_mode"] = clean_mode
     arch_dir = raw.get("slot_archive_dir")
     cfg["slot_archive_dir"] = str(arch_dir).strip() if isinstance(arch_dir, str) else ""
+
+    cfg["update_check_enabled"] = bool(raw.get("update_check_enabled", True))
+    cfg["auto_update_restart"] = bool(raw.get("auto_update_restart", False)) and cfg["update_check_enabled"]
+    cfg["update_check_interval_min"] = _clamp_int(raw.get("update_check_interval_min"), 30, 10, 1440)
+    ign_ver = raw.get("update_ignored_version")
+    cfg["update_ignored_version"] = str(ign_ver).strip()[:32] if isinstance(ign_ver, str) else ""
 
     for coord in ("window_x", "window_y"):
         val = raw.get(coord)

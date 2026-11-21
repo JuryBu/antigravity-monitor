@@ -42,6 +42,8 @@ python -B main.py --json --readonly --conversation-id <id>
 | `--clean-subagents` | 显式触发安全清理超过保护期的已结束老旧子代理以腾出本机 500 槽位（遵守 6 重防误删校验，绝不触碰主对话或未知 `.db`；默认移入系统回收站，按配置支持 `archive` / `delete`） |
 | `--dry-run` | 配合 `--clean-subagents` 仅预览待清理条数与预计释放空间，严格零写盘 |
 | `--min-age <minutes>` | 配合 `--clean-subagents` 指定保护期（分钟；硬下限锁死 `>= 30` 分钟，`0` 或省略沿用配置默认 `120` 分钟） |
+| `--version` | 输出当前本地版本号与更新源（搭配 `--json` 返回结构化 JSON）后立即退出，严格零写盘 |
+| `--check-update` | 联网查询 GitHub 远端 `version.json` 并报告是否有新版本与本地安装模式（`git` / `zip`，搭配 `--json` 返回结构化 JSON） |
 
 ---
 

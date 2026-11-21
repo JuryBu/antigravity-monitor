@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -74,23 +75,29 @@ class SingleInstanceGuard:
         self.event_handle: Optional[int] = None
         self.already_running: bool = False
 
-    def acquire(self) -> bool:
+    def acquire(self, wait_timeout_sec: float = 0.0) -> bool:
         if os.name != "nt" or self._k32 is None:
             return True
-        ctypes.set_last_error(0)
-        handle = self._k32.CreateMutexW(None, False, MUTEX_NAME)
-        last_err = ctypes.get_last_error()
-        if not handle:
-            return True
-        self.mutex_handle = int(handle)
-        if last_err == ERROR_ALREADY_EXISTS:
+        deadline = time.monotonic() + max(0.0, float(wait_timeout_sec))
+        while True:
+            ctypes.set_last_error(0)
+            handle = self._k32.CreateMutexW(None, False, MUTEX_NAME)
+            last_err = ctypes.get_last_error()
+            if not handle:
+                return True
+            self.mutex_handle = int(handle)
+            if last_err != ERROR_ALREADY_EXISTS:
+                ev = self._k32.CreateEventW(None, False, False, WAKE_EVENT_NAME)
+                self.event_handle = int(ev) if ev else None
+                return True
+            if wait_timeout_sec > 0.0 and time.monotonic() < deadline:
+                self.release()
+                time.sleep(0.1)
+                continue
             self.already_running = True
             self._signal_existing_instance()
             self.release()
             return False
-        ev = self._k32.CreateEventW(None, False, False, WAKE_EVENT_NAME)
-        self.event_handle = int(ev) if ev else None
-        return True
 
     def _signal_existing_instance(self) -> None:
         if self._k32 is None:
@@ -153,20 +160,30 @@ class SingleInstanceGuard:
             self.mutex_handle = None
 
 
-def _spawn_restarted_self(no_tray: bool = False) -> None:
-    """Relaunch using the current interpreter's pythonw.exe to preserve active venv dependencies."""
+def _spawn_restarted_self(no_tray: bool = False, minimized: bool = False, readonly: bool = False) -> None:
+    """Relaunch using the current interpreter's pythonw.exe to preserve active venv dependencies and launch flags."""
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
     launcher = str(pyw) if os.name == "nt" and pyw.is_file() else str(exe)
-    cmd = [launcher, str(APP_ROOT / "main.py")]
+    cmd = [launcher, str(APP_ROOT / "main.py"), "--restarting"]
     if no_tray:
         cmd.append("--no-tray")
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    subprocess.Popen(cmd, cwd=str(APP_ROOT), creationflags=flags)
+    if minimized:
+        cmd.append("--minimized")
+    if readonly:
+        cmd.append("--readonly")
+    env = os.environ.copy()
+    env.pop("PYTHONUTF8", None)
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(cmd, cwd=str(APP_ROOT), env=env, creationflags=flags)
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Antigravity 实时缓存与健康度桌面监控器")
+    parser.add_argument("--version", action="store_true", help="输出当前版本号并退出")
+    parser.add_argument("--check-update", action="store_true", help="检查 GitHub 远端是否有新版本并退出")
     parser.add_argument("--cli", action="store_true", help="仅运行单次命令行脱敏体检摘要并退出（默认零写盘）")
     parser.add_argument("--json", action="store_true", help="输出结构化脱敏 JSON 体检快照并退出（默认零写盘）")
     parser.add_argument("--readonly", action="store_true", help="严格零写盘模式（不更新 account_ledger.json，不执行任何清理）")
@@ -178,12 +195,54 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-age", type=int, default=0, help="配合 --clean-subagents 指定子代理保护期（分钟，硬下限 30 分钟，0 表示沿用配置默认 120m）")
     parser.add_argument("--minimized", action="store_true", help="启动后静默最小化到系统托盘")
     parser.add_argument("--no-tray", action="store_true", help="禁用系统托盘（调试/截图模式）")
+    parser.add_argument("--restarting", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     _configure_stdio_utf8()
     args = _parse_args(argv)
+
+    from core.version import read_local_version_info
+
+    if args.version:
+        info = read_local_version_info(APP_ROOT)
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+        else:
+            print(f"Antigravity Monitor v{info['version']} ({info['repo']}@{info['branch']})")
+        return 0
+
+    if args.check_update:
+        from core.updater import UpdateManager
+
+        updater = UpdateManager(app_root=APP_ROOT)
+        res = updater.check_for_update(is_manual=True)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": not bool(res.error),
+                        "local_version": res.local_version,
+                        "remote_version": res.remote_version,
+                        "has_update": res.has_update,
+                        "summary": res.summary,
+                        "released_at": res.released_at,
+                        "install_mode": res.install_mode,
+                        "error": res.error,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            if res.error:
+                print(res.error, file=sys.stderr)
+            elif res.has_update:
+                print(f"发现新版本 v{res.remote_version}（当前 v{res.local_version}，安装模式={res.install_mode}）：{res.summary}")
+            else:
+                print(f"当前已是最新版本 v{res.local_version}（安装模式={res.install_mode}）")
+        return 2 if res.error else 0
 
     from core.config_store import ConfigStore
     from core.log_monitor import (
@@ -307,9 +366,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     _enable_high_dpi()
     guard = SingleInstanceGuard()
-    if not guard.acquire():
+    if not guard.acquire(wait_timeout_sec=3.0 if args.restarting else 0.0):
         return 0
 
+    from core.updater import UpdateManager
     from ui.capsule_app import AntigravityCapsuleApp
 
     restart_requested = False
@@ -318,6 +378,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         nonlocal restart_requested
         restart_requested = True
 
+    updater = UpdateManager(app_root=APP_ROOT)
     wake_stop = threading.Event()
     app = AntigravityCapsuleApp(
         app_root=APP_ROOT,
@@ -326,18 +387,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         enable_tray=not args.no_tray,
         start_minimized_override=True if args.minimized else None,
         on_restart=_mark_restart,
+        update_manager=updater,
     )
     wake_thread = guard.start_wakeup_listener(wake_stop, lambda: app.dispatch_to_ui(app.show_window))
     try:
         app.run()
     finally:
+        restart_minimized = bool(args.minimized or (not args.no_tray and not app._visible))
         wake_stop.set()
         guard.signal_stop()
         if wake_thread is not None and wake_thread.is_alive():
             wake_thread.join(timeout=1.0)
         guard.release()
         if restart_requested:
-            _spawn_restarted_self(no_tray=args.no_tray)
+            _spawn_restarted_self(
+                no_tray=args.no_tray,
+                minimized=restart_minimized,
+                readonly=bool(args.readonly),
+            )
     return 0
 
 

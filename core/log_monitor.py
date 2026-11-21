@@ -46,8 +46,9 @@ EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2
 RETRY_RE = re.compile(r"(?:^|[\s\[/\\])run\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
 # Strip Go/glog wrapper prefix so timestamp microseconds (e.g. .350309) and "ERROR: logging before google.Init:" never false-match!
 GLOG_PREFIX_RE = re.compile(
-    r"^(?:ERROR:\s+logging before google\.Init:\s+)?([IWEF])(\d{2})(\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+\d+\s+([^\]]+)\]\s*(.*)$"
+    r"^(?:ERROR:\s+logging before google\.Init:\s+)?([IWEF])(\d{2})(\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\.(\d+))?\s+(\d+)\s+([^\]]+)\]\s*(.*)$"
 )
+ATTEMPT_NUM_RE = re.compile(r"\battempt\s+(\d+)\b", re.IGNORECASE)
 # Supports both ISO-8601 (YYYY-MM-DD...) and Go stdlog slash dates (YYYY/MM/DD HH:MM:SS)
 FULL_TS_RE = re.compile(
     r"^.{0,12}?(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s*(.*)$"
@@ -98,6 +99,22 @@ IGNORED_LOG_SOURCES = (
     "runner.go",
     "code_assist_client.go",
     "conversationsearch",
+    "telemetry.go",
+)
+
+# Non-inference background RPCs (analytics, telemetry, experiments, profile, metadata) must never trigger model 503/T2 alerts
+NON_INFERENCE_RPC_MARKERS = (
+    "recordtrajectoryanalytics",
+    "recording trajectory segment analytics",
+    "listexperiments",
+    "fetchconfig",
+    "loadcodeassist",
+    "fetchavailablemodels",
+    "retrieveuserquota",
+    "recordsidecarevent",
+    "counttokens",
+    "clearcut",
+    "peopleinfo",
 )
 
 MODEL_SHORT_MAP = (
@@ -780,6 +797,75 @@ class LanguageServerLogTailer:
         self._events: Deque[LogEvent] = deque(maxlen=self.max_events)
         self._initialized: bool = False
         self._last_seen_ts: Optional[float] = None
+        # Bounded O(1) dedup & non-inference goroutine tracking (prevents errorreport.go double counting)
+        self._ignored_goroutines: OrderedDict[str, float] = OrderedDict()
+        self._recent_error_sigs: OrderedDict[Tuple[str, str], Tuple[float, str, str]] = OrderedDict()
+        self._last_event_by_cat: Dict[str, Tuple[float, str, str]] = {}
+        self._last_header_gid: str = ""
+        self._last_header_src: str = ""
+        self._block_emitted_cats: set[str] = set()
+        self._skip_continuation_lines: int = 0
+        self._skip_brace_depth: int = 0
+
+    @staticmethod
+    def _source_base_name(source: str) -> str:
+        low = (source or "").strip().lower()
+        return low.split(":", 1)[0]
+
+    def _mark_ignored_goroutine(self, goroutine_id: str, ts: float) -> None:
+        if not goroutine_id:
+            return
+        self._ignored_goroutines[goroutine_id] = ts
+        self._ignored_goroutines.move_to_end(goroutine_id)
+        while len(self._ignored_goroutines) > 64:
+            self._ignored_goroutines.popitem(last=False)
+
+    def _is_recent_ignored_goroutine(self, goroutine_id: str, ts: float, window_sec: float = 3.0) -> bool:
+        if not goroutine_id:
+            return False
+        prev = self._ignored_goroutines.get(goroutine_id)
+        if prev is None:
+            return False
+        return abs(ts - prev) <= window_sec
+
+    def _mark_error_sig(self, goroutine_id: str, category: str, ts: float, source_base: str, attempt_num: str = "") -> None:
+        if not goroutine_id:
+            return
+        key = (goroutine_id, category)
+        self._recent_error_sigs[key] = (ts, source_base, attempt_num)
+        self._recent_error_sigs.move_to_end(key)
+        while len(self._recent_error_sigs) > 64:
+            self._recent_error_sigs.popitem(last=False)
+
+    def _is_cross_layer_echo(
+        self,
+        goroutine_id: str,
+        category: str,
+        ts: float,
+        source_base: str,
+        attempt_num: str = "",
+        window_sec: float = 3.0,
+    ) -> bool:
+        """Suppress cross-layer duplicate echoes on the same goroutine (e.g. caller.go + errorreport.go)
+        while preserving distinct retry attempts emitted repeatedly by the same source file (e.g. run.go attempt 1..4)."""
+        if not goroutine_id:
+            return False
+        prev = self._recent_error_sigs.get((goroutine_id, category))
+        if prev is None:
+            return False
+        prev_ts, prev_src, prev_attempt = prev
+        if abs(ts - prev_ts) > window_sec:
+            return False
+        # Distinct explicit retry attempt number (e.g. attempt 1 -> attempt 2) is always a genuine new upstream try
+        if attempt_num and prev_attempt and attempt_num != prev_attempt:
+            return False
+        # Cross-layer echo: errorreport.go echoing a prior non-errorreport source, or a caller echoing an earlier
+        # errorreport/http_helpers log from a different source file on the exact same goroutine.
+        if source_base == "errorreport.go" and prev_src and prev_src != "errorreport.go":
+            return True
+        if prev_src and source_base and prev_src != source_base:
+            return True
+        return False
 
     def poll(self, now_ts: Optional[float] = None) -> None:
         now = now_ts if now_ts is not None else time.time()
@@ -796,6 +882,14 @@ class LanguageServerLogTailer:
             self._offset = 0
             self._events.clear()
             self._last_seen_ts = None
+            self._ignored_goroutines.clear()
+            self._recent_error_sigs.clear()
+            self._last_event_by_cat.clear()
+            self._last_header_gid = ""
+            self._last_header_src = ""
+            self._block_emitted_cats.clear()
+            self._skip_continuation_lines = 0
+            self._skip_brace_depth = 0
 
         if size == self._offset and self._initialized:
             return
@@ -843,15 +937,51 @@ class LanguageServerLogTailer:
         if "127.0.0.1" in low_full or "localhost" in low_full or "tls handshake error" in low_full:
             return None
 
-        ts, source, body = self._split_header_and_body(line, fallback_ts, is_cold_start=is_cold_start)
-        if ts is not None:
+        ts, severity_ch, goroutine_id, source, body = self._split_header_meta(line, fallback_ts, is_cold_start=is_cold_start)
+        is_continuation = ts is None
+        if not is_continuation:
             self._last_seen_ts = ts
+            self._last_header_gid = goroutine_id
+            self._last_header_src = self._source_base_name(source)
+            self._block_emitted_cats.clear()
+            self._skip_continuation_lines = 0
+            self._skip_brace_depth = 0
+        else:
+            if self._skip_continuation_lines > 0:
+                self._skip_continuation_lines -= 1
+                self._skip_brace_depth += body.count("{") - body.count("}")
+                if self._skip_brace_depth <= 0 and "}" in body:
+                    self._skip_continuation_lines = 0
+                    self._skip_brace_depth = 0
+                return None
+            # Inherit originating goroutine & source base for multi-line JSON error payloads (e.g. http_helpers.go)
+            goroutine_id = self._last_header_gid
+            if not source and self._last_header_src:
+                source = self._last_header_src
+
+        effective_ts = ts if ts is not None else (self._last_seen_ts if self._last_seen_ts is not None else (0.0 if is_cold_start else fallback_ts))
 
         src_low = source.lower()
+        src_base = self._source_base_name(source)
         body_low = body.lower()
-        if any(ign in src_low or ign in body_low[:80] for ign in IGNORED_LOG_SOURCES):
-            return None
-        if "monitor sir_" in body_low or "llm monitor" in body_low:
+        is_ignored_source = any(ign in src_low or ign in body_low[:80] for ign in IGNORED_LOG_SOURCES)
+        is_non_inference_rpc = any(marker in body_low for marker in NON_INFERENCE_RPC_MARKERS)
+        if is_ignored_source or is_non_inference_rpc or "monitor sir_" in body_low or "llm monitor" in body_low:
+            # Only tag goroutine as ignored non-inference when this line is actually an error/warning or failed RPC,
+            # preventing normal INFO telemetry lines from ever muting a later real error on the same goroutine.
+            is_err_like = (
+                severity_ch in ("E", "W", "F")
+                or is_non_inference_rpc
+                or ("error" in body_low)
+                or ("failed" in body_low)
+                or ("unavailable" in body_low)
+                or ("503" in body_low)
+            )
+            if goroutine_id and effective_ts > 0.0 and is_err_like:
+                self._mark_ignored_goroutine(goroutine_id, effective_ts)
+            if not is_continuation and body.rstrip().endswith("{"):
+                self._skip_continuation_lines = 64
+                self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
             return None
 
         category: Optional[str] = None
@@ -875,7 +1005,12 @@ class LanguageServerLogTailer:
                 label = f"流超时 ({norm_dur})" if norm_dur else "流超时"
         elif HTTP_503_RE.search(body):
             category = "503"
-            label = "服务端 503 No capacity"
+            if "capacity" in body_low:
+                label = "服务端 503 No capacity"
+            elif "resource_exhausted" in body_low:
+                label = "服务端 503 资源耗尽"
+            else:
+                label = "服务端 503 Unavailable"
         elif RETRY_RE.search(line) and "context canceled" not in body_low and "shutting down" not in body_low:
             category = "retry"
             label = "代理/流断连重试"
@@ -884,9 +1019,40 @@ class LanguageServerLogTailer:
             return None
 
         # On cold start, ignore lines that have no verifiable timestamp at all rather than stamping them as "now"
-        effective_ts = ts if ts is not None else (self._last_seen_ts if self._last_seen_ts is not None else (0.0 if is_cold_start else fallback_ts))
         if effective_ts <= 0.0:
             return None
+
+        # Within a single multi-line JSON block, emit at most one event per category
+        if is_continuation and category in self._block_emitted_cats:
+            return None
+
+        # Suppress follow-up errorreport.go echoes for an ignored non-inference goroutine (never mute real 403/timeout)
+        if (
+            goroutine_id
+            and src_base == "errorreport.go"
+            and category in ("503", "retry")
+            and self._is_recent_ignored_goroutine(goroutine_id, effective_ts)
+        ):
+            return None
+
+        m_att = ATTEMPT_NUM_RE.search(body)
+        attempt_num = m_att.group(1) if m_att else ""
+
+        # Deduplicate cross-layer echoes of the exact same goroutine error (e.g. http_helpers/caller + errorreport.go)
+        if goroutine_id and self._is_cross_layer_echo(goroutine_id, category, effective_ts, src_base, attempt_num=attempt_num):
+            return None
+
+        # Fallback echo suppression when prior line had no goroutine ID and errorreport.go echoes within 1.5s
+        if src_base == "errorreport.go":
+            last_cat = self._last_event_by_cat.get(category)
+            if last_cat is not None:
+                last_ts, last_gid, last_src_base = last_cat
+                if abs(effective_ts - last_ts) <= 1.5 and last_src_base != "errorreport.go" and (not last_gid or last_gid == goroutine_id):
+                    return None
+
+        self._block_emitted_cats.add(category)
+        self._mark_error_sig(goroutine_id, category, effective_ts, src_base, attempt_num=attempt_num)
+        self._last_event_by_cat[category] = (effective_ts, goroutine_id, src_base)
 
         hm = datetime.datetime.fromtimestamp(effective_ts).strftime("%H:%M:%S")
         clean_detail = mask_email(body.strip())
@@ -897,29 +1063,38 @@ class LanguageServerLogTailer:
         return LogEvent(timestamp=effective_ts, category=category, summary=summary, event_key=event_key)
 
     @staticmethod
-    def _split_header_and_body(line: str, fallback_ts: float, is_cold_start: bool = False) -> Tuple[Optional[float], str, str]:
+    def _split_header_meta(line: str, fallback_ts: float, is_cold_start: bool = False) -> Tuple[Optional[float], str, str, str, str]:
         # 1. glog format: [ERROR: logging before google.Init: ]W1120 05:08:41.350309 607 file.go:54] body
         m_glog = GLOG_PREFIX_RE.match(line)
         if m_glog:
-            mm, dd, hms, source, body = int(m_glog.group(2)), int(m_glog.group(3)), m_glog.group(4), m_glog.group(5), m_glog.group(6)
+            sev = m_glog.group(1)
+            mm, dd, hms = int(m_glog.group(2)), int(m_glog.group(3)), m_glog.group(4)
+            frac = (m_glog.group(5) or "")[:6]
+            usec = int(frac.ljust(6, "0")) if frac else 0
+            goroutine_id, source, body = m_glog.group(6), m_glog.group(7), m_glog.group(8)
             now_dt = datetime.datetime.fromtimestamp(fallback_ts)
             try:
                 h, mi, s = (int(p) for p in hms.split(":"))
-                cand = now_dt.replace(month=mm, day=dd, hour=h, minute=mi, second=s, microsecond=0)
+                cand = now_dt.replace(month=mm, day=dd, hour=h, minute=mi, second=s, microsecond=usec)
                 if cand.timestamp() > fallback_ts + 86400:
                     cand = cand.replace(year=now_dt.year - 1)
-                return cand.timestamp(), source, body
+                return cand.timestamp(), sev, goroutine_id, source, body
             except ValueError:
-                return None, source, body
+                return None, sev, goroutine_id, source, body
 
         # 2. ISO / Go stdlog slash format: 2026/11/20 02:18:54 body
         m_full = FULL_TS_RE.match(line)
         if m_full:
             iso_norm = f"{m_full.group(1)}-{m_full.group(2)}-{m_full.group(3)}T{m_full.group(4)}"
             parsed = parse_iso_timestamp(iso_norm)
-            return parsed, "", m_full.group(5)
+            return parsed, "", "", "", m_full.group(5)
 
-        return None, "", line
+        return None, "", "", "", line
+
+    @classmethod
+    def _split_header_and_body(cls, line: str, fallback_ts: float, is_cold_start: bool = False) -> Tuple[Optional[float], str, str]:
+        ts, _sev, _gid, source, body = cls._split_header_meta(line, fallback_ts, is_cold_start=is_cold_start)
+        return ts, source, body
 
     def get_counts(
         self,

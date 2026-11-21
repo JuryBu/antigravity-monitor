@@ -8,6 +8,7 @@ import datetime
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
@@ -28,6 +29,8 @@ from core.log_monitor import (
 )
 from core.slot_manager import SlotCleanupResult, SlotInventorySnapshot, format_bytes_human
 from core.startup_manager import is_startup_enabled, set_startup_enabled
+from core.updater import UpdateApplyResult, UpdateCheckResult, UpdateManager
+from core.version import APP_VERSION, read_local_version_info
 from ui.detail_window import ConversationDetailWindow
 from ui.slots_window import ConversationSlotsWindow
 from ui.themes import THEMES, get_theme
@@ -127,6 +130,7 @@ class AntigravityCapsuleApp:
         enable_tray: bool = True,
         start_minimized_override: Optional[bool] = None,
         on_restart: Optional[Callable[[], None]] = None,
+        update_manager: Optional[UpdateManager] = None,
     ) -> None:
         self.app_root = Path(app_root).resolve()
         self.config_store = config_store
@@ -137,6 +141,8 @@ class AntigravityCapsuleApp:
         self._on_restart = on_restart
         self._enable_tray = enable_tray
         self._start_minimized_override = start_minimized_override
+        self._updater: Optional[UpdateManager] = update_manager
+        self._local_version: str = str(read_local_version_info(self.app_root).get("version") or APP_VERSION)
 
         self._expanded: bool = False
         self._visible: bool = True
@@ -188,6 +194,8 @@ class AntigravityCapsuleApp:
         self._var_notifications = tk.BooleanVar(value=bool(self.config["notifications_enabled"]))
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
         self._var_auto_clean = tk.BooleanVar(value=bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_update_check = tk.BooleanVar(value=bool(self.config.get("update_check_enabled", True)))
+        self._var_auto_update = tk.BooleanVar(value=bool(self.config.get("auto_update_restart", False)))
 
         self._tooltip_win: Optional[tk.Toplevel] = None
         self._conv_hover_texts: List[str] = []
@@ -203,6 +211,14 @@ class AntigravityCapsuleApp:
         self._auto_clean_thread: Optional[threading.Thread] = None
         self._last_main_risk_alerted: bool = False
         self._ctx_clean_menu_idx: Optional[int] = None
+        self._ctx_update_menu_idx: Optional[int] = None
+        self._latest_update: Optional[UpdateCheckResult] = None
+        self._update_busy: bool = False
+        self._notified_update_version: str = ""
+        self._update_banner_visible: bool = False
+        self._update_banner_is_error: bool = False
+        self._temp_banner_until: float = 0.0
+        self._temp_banner_text: str = ""
         self._conv_filter: str = str(self.config.get("conv_filter", "main"))
         self._view_account: str = ""
         self._history_range: str = "30m"
@@ -270,6 +286,11 @@ class AntigravityCapsuleApp:
         self._lbl_bar_slots = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["orange"], cursor="hand2")
         self._lbl_bar_slots.bind("<Button-1>", lambda _e: self.open_slots_window())
         self._lbl_bar_slots.bind("<Button-3>", self._show_context_menu)
+
+        self._sep_upd = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
+        self._lbl_bar_update = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["cyan"], cursor="hand2")
+        self._lbl_bar_update.bind("<Button-1>", lambda _e: self._on_bar_update_click())
+        self._lbl_bar_update.bind("<Button-3>", self._show_context_menu)
 
         self._btn_hide = tk.Label(self._bar, text="—", font=(UI_FONT, 9, "bold"), padx=5, pady=1, cursor="hand2")
         self._btn_hide.pack(side="right", padx=(2, 0))
@@ -424,6 +445,68 @@ class AntigravityCapsuleApp:
         self._lbl_slot_risk.pack(fill="x")
         self._slot_risk_frame.bind("<Button-1>", lambda _e: self.open_slots_window())
         self._lbl_slot_risk.bind("<Button-1>", lambda _e: self.open_slots_window())
+
+        # Dynamic auto-update prompt banner (hidden at 0px until a newer version is detected)
+        # Pack right-side action buttons FIRST so high-DPI / narrow windows never clip buttons.
+        self._update_banner_frame = tk.Frame(self._card_head, padx=8, pady=5, highlightthickness=1)
+        self._update_banner_top = tk.Frame(self._update_banner_frame)
+        self._update_banner_top.pack(fill="x")
+        self._update_banner_btns = tk.Frame(self._update_banner_top)
+        self._update_banner_btns.pack(side="right", padx=(6, 0))
+
+        self._lbl_update_banner = tk.Label(
+            self._update_banner_top,
+            text="",
+            font=(UI_FONT, 8, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        )
+        self._lbl_update_banner.pack(side="left", fill="x", expand=True)
+
+        def _sync_update_wrap(_event: tk.Event) -> None:
+            try:
+                total_w = int(self._update_banner_top.winfo_width())
+                btns_w = int(self._update_banner_btns.winfo_reqwidth())
+                if total_w > 120:
+                    self._lbl_update_banner.configure(wraplength=max(160, total_w - btns_w - 18))
+            except tk.TclError:
+                pass
+
+        self._update_banner_top.bind("<Configure>", _sync_update_wrap)
+
+        self._btn_update_now = tk.Label(
+            self._update_banner_btns,
+            text="立即更新重启",
+            font=(UI_FONT, 8, "bold"),
+            padx=7,
+            pady=1,
+            cursor="hand2",
+        )
+        self._btn_update_now.pack(side="left", padx=(0, 4))
+        self._btn_update_now.bind("<Button-1>", lambda _e: self.trigger_apply_update())
+
+        self._btn_update_auto = tk.Label(
+            self._update_banner_btns,
+            text="自动更新:关",
+            font=(UI_FONT, 8),
+            padx=6,
+            pady=1,
+            cursor="hand2",
+        )
+        self._btn_update_auto.pack(side="left", padx=(0, 4))
+        self._btn_update_auto.bind("<Button-1>", lambda _e: self.toggle_auto_update_restart())
+
+        self._btn_update_dismiss = tk.Label(
+            self._update_banner_btns,
+            text="忽略",
+            font=(UI_FONT, 8),
+            padx=5,
+            pady=1,
+            cursor="hand2",
+        )
+        self._btn_update_dismiss.pack(side="left")
+        self._btn_update_dismiss.bind("<Button-1>", lambda _e: self.dismiss_current_update())
 
         # --- Module 2: 2-Column Diagnostics (Real-time Speed + Large Context Freshness) ---
         self._mid_row = tk.Frame(self._details)
@@ -668,10 +751,14 @@ class AntigravityCapsuleApp:
         self._ctx_menu.add_checkbutton(label="启动时缩进托盘", variable=self._var_start_min, command=self.toggle_start_minimized)
         self._ctx_menu.add_checkbutton(label="启用异常通知", variable=self._var_notifications, command=self.toggle_notifications)
         self._ctx_menu.add_checkbutton(label="自动清理老旧子代理", variable=self._var_auto_clean, command=self.toggle_auto_clean_slots)
+        self._ctx_menu.add_checkbutton(label="后台检查更新提示", variable=self._var_update_check, command=self.toggle_update_check_enabled)
+        self._ctx_menu.add_checkbutton(label="发现更新时自动更新重启", variable=self._var_auto_update, command=self.toggle_auto_update_restart)
         self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="查看本机 500 槽位详情", command=self.open_slots_window)
         self._ctx_menu.add_command(label=self._format_clean_menu_label(), command=self.trigger_manual_subagent_cleanup)
         self._ctx_clean_menu_idx = self._ctx_menu.index("end")
+        self._ctx_menu.add_command(label=self._format_update_menu_label(), command=self.check_or_apply_update)
+        self._ctx_update_menu_idx = self._ctx_menu.index("end")
         self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="立即刷新采样", command=self.request_immediate_poll)
         self._ctx_menu.add_command(label="复制文字体检摘要", command=self.copy_summary_to_clipboard)
@@ -691,13 +778,14 @@ class AntigravityCapsuleApp:
         self._lbl_bar_status.configure(bg=t["panel_bg"])
         self._lbl_bar_cache_k.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._lbl_bar_cache_v.configure(bg=t["panel_bg"])
-        for sep in (self._sep1, self._sep2, self._sep3, self._sep4, self._sep5):
+        for sep in (self._sep1, self._sep2, self._sep3, self._sep4, self._sep5, self._sep_upd):
             sep.configure(bg=t["panel_bg"], fg=t["divider"])
         self._lbl_bar_tps.configure(bg=t["panel_bg"])
         self._lbl_bar_fresh.configure(bg=t["panel_bg"])
         self._lbl_bar_acc.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._lbl_bar_steps.configure(bg=t["panel_bg"], fg=t["text_secondary"])
         self._lbl_bar_slots.configure(bg=t["panel_bg"])
+        self._lbl_bar_update.configure(bg=t["panel_bg"], fg=t["cyan"])
         for b in (self._btn_expand, self._btn_hide):
             b.configure(bg=t["panel_bg"], fg=t["text_secondary"])
 
@@ -709,7 +797,11 @@ class AntigravityCapsuleApp:
         for card in (self._card_head, self._card_speed, self._card_fresh, self._card_convs, self._card_logs):
             card.configure(bg=t["card_bg"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
             for child in card.winfo_children():
-                if isinstance(child, tk.Frame) and child not in (self._banner_frame, self._slot_risk_frame):
+                if isinstance(child, tk.Frame) and child not in (
+                    self._banner_frame,
+                    self._slot_risk_frame,
+                    self._update_banner_frame,
+                ):
                     child.configure(bg=t["card_bg"])
 
         self._lbl_headline.configure(bg=t["card_bg"])
@@ -737,6 +829,7 @@ class AntigravityCapsuleApp:
         self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
         self._lbl_slot_risk.configure(bg=t["red_bg"], fg=t["red"])
         self._sync_slots_auto_button()
+        self._apply_update_banner_theme()
 
         self._lbl_speed_title.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_pin_badge.configure(bg=t["btn_hover"], fg=t["cyan"])
@@ -877,9 +970,16 @@ class AntigravityCapsuleApp:
         self._var_start_min.set(bool(self.config["start_minimized"]))
         self._var_notifications.set(bool(self.config["notifications_enabled"]))
         self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_update_check.set(bool(self.config.get("update_check_enabled", True)))
+        self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
         if self._ctx_clean_menu_idx is not None:
             try:
                 self._ctx_menu.entryconfigure(self._ctx_clean_menu_idx, label=self._format_clean_menu_label())
+            except tk.TclError:
+                pass
+        if self._ctx_update_menu_idx is not None:
+            try:
+                self._ctx_menu.entryconfigure(self._ctx_update_menu_idx, label=self._format_update_menu_label())
             except tk.TclError:
                 pass
         try:
@@ -1330,6 +1430,284 @@ class AntigravityCapsuleApp:
             menu.grab_release()
             self.root.after(500, lambda m=menu: m.destroy() if m.winfo_exists() else None)
 
+    def _ensure_updater(self) -> UpdateManager:
+        if self._updater is None:
+            self._updater = UpdateManager(app_root=self.app_root)
+        return self._updater
+
+    def _set_temp_banner_notice(self, text: str, duration_sec: float = 6.0) -> None:
+        self._temp_banner_text = text
+        self._temp_banner_until = time.monotonic() + max(1.0, float(duration_sec))
+        self._lbl_banner.configure(text=text)
+
+    def _active_update_candidate(self) -> Optional[UpdateCheckResult]:
+        upd = self._latest_update
+        if upd is None or not upd.has_update or not upd.remote_version:
+            return None
+        ignored = str(self.config.get("update_ignored_version") or "").strip()
+        if ignored and ignored == upd.remote_version and not bool(self.config.get("auto_update_restart", False)):
+            return None
+        return upd
+
+    def _format_update_menu_label(self) -> str:
+        if self._update_busy:
+            return "正在更新中…"
+        upd = self._active_update_candidate()
+        if upd is not None:
+            return f"更新至 v{upd.remote_version} 并重启"
+        return f"立即检查更新 (v{self._local_version})"
+
+    def _apply_update_banner_theme(self, is_error: Optional[bool] = None) -> None:
+        if is_error is not None:
+            self._update_banner_is_error = bool(is_error)
+        err_flag = self._update_banner_is_error
+        t = self.theme
+        bg = t["orange_bg"] if err_flag else t["card_alt_bg"]
+        border = t["orange"] if err_flag else t["cyan"]
+        fg = t["orange"] if err_flag else t["cyan"]
+        self._update_banner_frame.configure(bg=bg, highlightbackground=border, highlightcolor=border)
+        self._update_banner_top.configure(bg=bg)
+        self._update_banner_btns.configure(bg=bg)
+        self._lbl_update_banner.configure(bg=bg, fg=fg)
+        self._btn_update_now.configure(
+            bg=t["orange"] if err_flag else t["cyan"],
+            fg="#0B111C",
+        )
+        self._btn_update_dismiss.configure(bg=t["btn_bg"], fg=t["text_secondary"])
+        self._sync_update_auto_button()
+
+    def _sync_update_auto_button(self) -> None:
+        t = self.theme
+        enabled = bool(self.config.get("auto_update_restart", False))
+        if enabled:
+            self._btn_update_auto.configure(text="自动更新:开", bg=t["green_bg"], fg=t["green"])
+        else:
+            self._btn_update_auto.configure(text="自动更新:关", bg=t["btn_bg"], fg=t["text_secondary"])
+
+    def _on_bar_update_click(self) -> None:
+        self.show_window()
+        if not self._expanded:
+            self.set_expanded(True)
+
+    def _show_update_banner(self, text: str, is_error: bool = False, badge_ver: str = "") -> None:
+        self._lbl_update_banner.configure(text=text)
+        self._apply_update_banner_theme(is_error=is_error)
+        if self._update_busy:
+            self._btn_update_now.configure(text="更新中…")
+        else:
+            self._btn_update_now.configure(text="立即更新重启")
+        geometry_changed = False
+        if not self._update_banner_visible:
+            self._update_banner_frame.pack(fill="x", pady=(5, 0))
+            self._update_banner_visible = True
+            geometry_changed = True
+        if badge_ver:
+            self._lbl_bar_update.configure(text=f"↑v{badge_ver}")
+            if not self._lbl_bar_update.winfo_manager():
+                self._sep_upd.pack(side="left")
+                self._lbl_bar_update.pack(side="left", padx=(0, 6))
+                geometry_changed = True
+        if geometry_changed and self._visible:
+            self._clamp_window_to_screen()
+
+    def _hide_update_banner(self) -> None:
+        changed = False
+        if self._update_banner_visible or self._update_banner_frame.winfo_manager():
+            self._update_banner_frame.pack_forget()
+            self._update_banner_visible = False
+            changed = True
+        if self._lbl_bar_update.winfo_manager():
+            self._sep_upd.pack_forget()
+            self._lbl_bar_update.pack_forget()
+            changed = True
+        if changed and self._visible:
+            self._clamp_window_to_screen()
+
+    def toggle_update_check_enabled(self) -> None:
+        new_val = not bool(self.config.get("update_check_enabled", True))
+        self.config["update_check_enabled"] = new_val
+        if not new_val:
+            # Disabling background update checks must also turn off auto-update-restart to keep UI/state consistent
+            self.config["auto_update_restart"] = False
+            self._var_auto_update.set(False)
+        self.config = self.config_store.save(self.config)
+        self._var_update_check.set(new_val)
+        self._sync_update_auto_button()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+        if new_val:
+            self.check_for_updates_now(is_manual=False)
+
+    def toggle_auto_update_restart(self) -> None:
+        new_val = not bool(self.config.get("auto_update_restart", False))
+        self.config["auto_update_restart"] = new_val
+        if new_val:
+            self.config["update_check_enabled"] = True
+            self._var_update_check.set(True)
+        self.config = self.config_store.save(self.config)
+        self._var_auto_update.set(new_val)
+        self._sync_update_auto_button()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+        # If user turns on auto-update while a new version is already detected, apply right away
+        upd = self._active_update_candidate()
+        if new_val and upd is not None and not self._update_busy:
+            self._ensure_updater().clear_failed_auto_version(upd.remote_version)
+            self.trigger_apply_update(auto_triggered=True)
+
+    def dismiss_current_update(self) -> None:
+        if self._update_busy:
+            return
+        upd = self._latest_update
+        if upd is not None and upd.remote_version:
+            self.config["update_ignored_version"] = upd.remote_version
+            self.config = self.config_store.save(self.config)
+        self._latest_update = None
+        self._hide_update_banner()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+
+    def check_for_updates_now(self, is_manual: bool = True) -> None:
+        if self._closing or self._update_busy:
+            return
+        if is_manual:
+            self._set_temp_banner_notice(f"正在检查 GitHub 更新（当前 v{self._local_version}）…", duration_sec=6.0)
+        updater = self._ensure_updater()
+        updater.trigger_async_check(
+            on_result=lambda res: self.dispatch_to_ui(lambda r=res: self._on_update_check_result(r)),
+            is_manual=is_manual,
+        )
+
+    def check_or_apply_update(self) -> None:
+        upd = self._active_update_candidate()
+        if upd is not None and not self._update_busy:
+            self.trigger_apply_update(auto_triggered=False)
+        else:
+            self.check_for_updates_now(is_manual=True)
+
+    def trigger_apply_update(self, auto_triggered: bool = False) -> None:
+        if self._closing or self._update_busy:
+            return
+        updater = self._ensure_updater()
+        upd = self._active_update_candidate()
+        target_ver = upd.remote_version if upd is not None else ""
+        self._update_busy = True
+        ver_txt = f"v{target_ver}" if target_ver else "最新版"
+        prefix = "已开启自动更新，正在拉取" if auto_triggered else "正在下载并更新至"
+        self._show_update_banner(f"{prefix} {ver_txt}，完成后将自动重启…", is_error=False, badge_ver=target_ver)
+        if self.tray is not None:
+            self.tray.refresh_menu()
+            if auto_triggered and bool(self.config.get("notifications_enabled", True)):
+                self.tray.notify("反重力监控 · 自动更新", f"检测到 {ver_txt}，正在后台自动更新并重启…")
+
+        updater.trigger_async_apply(
+            expected_remote_version=target_ver,
+            on_done=lambda res, tv=target_ver: self.dispatch_to_ui(
+                lambda r=res, a=auto_triggered, exp=tv: self._on_update_apply_done(r, a, expected_version=exp)
+            ),
+        )
+
+    def _on_update_check_result(self, res: UpdateCheckResult) -> None:
+        if self._closing:
+            return
+        self._local_version = res.local_version or self._local_version
+        if res.error:
+            if res.is_manual:
+                self._set_temp_banner_notice(f"更新检查暂不可用：{res.error}", duration_sec=8.0)
+                if self.tray is not None and (not self._visible or not self._expanded):
+                    self.tray.notify("反重力监控 · 更新检查失败", res.error[:180])
+            return
+
+        if not res.has_update:
+            self._latest_update = res
+            self._hide_update_banner()
+            if res.is_manual:
+                msg = f"✓ 当前已是最新版本 v{res.local_version}（{res.install_mode} 模式）"
+                self._set_temp_banner_notice(msg, duration_sec=6.0)
+                if self.tray is not None and (not self._visible or not self._expanded):
+                    self.tray.notify("反重力监控 · 已是最新", msg)
+            if self.tray is not None:
+                self.tray.refresh_menu()
+            return
+
+        ignored = str(self.config.get("update_ignored_version") or "").strip()
+        if (not res.is_manual) and ignored and ignored == res.remote_version and not bool(self.config.get("auto_update_restart", False)):
+            self._latest_update = None
+            return
+
+        self._latest_update = res
+        summary_tail = f" · {truncate_display_width(res.summary, 42)}" if res.summary else ""
+        banner_txt = f"发现新版本 v{res.remote_version}（当前 v{res.local_version}）{summary_tail}"
+        self._show_update_banner(banner_txt, is_error=False, badge_ver=res.remote_version)
+
+        if self.tray is not None:
+            self.tray.refresh_menu()
+            if self._notified_update_version != res.remote_version:
+                self._notified_update_version = res.remote_version
+                if bool(self.config.get("notifications_enabled", True)) and not bool(self.config.get("auto_update_restart", False)):
+                    self.tray.notify(
+                        f"反重力监控 · 新版本 v{res.remote_version}",
+                        f"当前 v{res.local_version}{summary_tail}，点开悬浮窗可一键更新重启",
+                    )
+
+        # Auto update & restart when user explicitly enabled the switch (with failed-version loop guard)
+        if bool(self.config.get("auto_update_restart", False)) and not self._update_busy:
+            updater = self._ensure_updater()
+            if not updater.has_failed_auto_version(res.remote_version):
+                self.trigger_apply_update(auto_triggered=True)
+
+    def _on_update_apply_done(self, res: UpdateApplyResult, auto_triggered: bool, expected_version: str = "") -> None:
+        if self._closing:
+            return
+        self._update_busy = False
+        if res.ok and res.needs_restart:
+            if self.config.get("update_ignored_version"):
+                self.config["update_ignored_version"] = ""
+                self.config = self.config_store.save(self.config)
+            if res.missing_requirements:
+                miss_txt = ", ".join(res.missing_requirements[:4])
+                warn_msg = f"已更新至 v{res.to_version}，缺少新依赖({miss_txt})，请先执行 pip install -r requirements.txt 后手动重启"
+                self._show_update_banner(warn_msg, is_error=True, badge_ver=res.to_version)
+                if self.tray is not None:
+                    self.tray.refresh_menu()
+                    self.tray.notify("反重力监控 · 需补装依赖", warn_msg)
+                return
+            self._show_update_banner(
+                f"✓ 已更新至 v{res.to_version}，正在安全重启监控…",
+                is_error=False,
+                badge_ver=res.to_version,
+            )
+            if self.tray is not None:
+                self.tray.refresh_menu()
+            aid = self.root.after(350, self.restart_app)
+            self._after_ids.append(aid)
+            return
+
+        if res.ok and not res.needs_restart:
+            self._latest_update = None
+            self._hide_update_banner()
+            msg = res.message or f"✓ 当前已是最新版本 v{res.to_version}"
+            self._set_temp_banner_notice(msg, duration_sec=6.0)
+            if self.tray is not None:
+                self.tray.refresh_menu()
+                if not self._visible or not self._expanded:
+                    self.tray.notify("反重力监控 · 已是最新", msg)
+            return
+
+        # Failure path: distinguish permanent blockers (dirty tree/fork) vs transient network blips
+        updater = self._ensure_updater()
+        for ver_key in {v for v in (expected_version, res.to_version) if v}:
+            if res.dirty_blocked:
+                updater.mark_auto_version_failed(ver_key, permanent=True)
+            elif auto_triggered:
+                updater.mark_auto_version_failed(ver_key, permanent=False)
+        err_short = truncate_display_width(res.error or "更新失败，请稍后重试", 54)
+        self._show_update_banner(f"更新未完成：{err_short}", is_error=True, badge_ver=res.to_version or expected_version)
+        if self.tray is not None:
+            self.tray.refresh_menu()
+            if not self._visible or not self._expanded or auto_triggered:
+                self.tray.notify("反重力监控 · 更新未完成", res.error[:180] if res.error else "更新失败，请稍后重试")
+
     def restart_app(self) -> None:
         cb = self._on_restart
         self.shutdown()
@@ -1729,7 +2107,10 @@ class AntigravityCapsuleApp:
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1, offline_muted=True)
             self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999, offline_muted=True)
 
-        if snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (snap.max_consec_miss >= 2 or snap.max_abnormal_recent10 >= 4):
+        if time.monotonic() < self._temp_banner_until and self._temp_banner_text:
+            self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"])
+            self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=self._temp_banner_text)
+        elif snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (snap.max_consec_miss >= 2 or snap.max_abnormal_recent10 >= 4):
             self._banner_frame.configure(bg=t["alert_banner_bg"], highlightbackground=t["alert_banner_border"])
             self._lbl_banner.configure(
                 bg=t["alert_banner_bg"],
@@ -2445,8 +2826,11 @@ class AntigravityCapsuleApp:
                 "toggle_start_minimized": self.toggle_start_minimized,
                 "toggle_mute": self.toggle_notifications,
                 "toggle_auto_clean": self.toggle_auto_clean_slots,
+                "toggle_update_check": self.toggle_update_check_enabled,
+                "toggle_auto_update": self.toggle_auto_update_restart,
                 "open_slots": self.open_slots_window,
                 "clean_subagents": self.trigger_manual_subagent_cleanup,
+                "check_or_apply_update": self.check_or_apply_update,
                 "refresh_now": self.request_immediate_poll,
                 "copy_summary": self.copy_summary_to_clipboard,
                 "open_logs": self.open_logs_folder,
@@ -2460,7 +2844,10 @@ class AntigravityCapsuleApp:
                 "start_minimized": lambda: self.config["start_minimized"],
                 "notifications": lambda: self.config["notifications_enabled"],
                 "auto_clean": lambda: self.config.get("slot_auto_clean_enabled", True),
+                "update_check": lambda: self.config.get("update_check_enabled", True),
+                "auto_update": lambda: self.config.get("auto_update_restart", False),
                 "clean_label": self._format_clean_menu_label,
+                "update_label": self._format_update_menu_label,
             },
         )
         self.tray.start()
@@ -2472,6 +2859,13 @@ class AntigravityCapsuleApp:
         self._worker_thread = threading.Thread(target=self._worker_loop, name="MonitorPollThread", daemon=True)
         self._worker_thread.start()
         self._ui_drain_tick()
+        if self._updater is not None:
+            self._updater.start_background_loop(
+                is_enabled_fn=lambda: bool(self.config.get("update_check_enabled", True)),
+                interval_min_fn=lambda: int(self.config.get("update_check_interval_min", 30)),
+                on_result=lambda res: self.dispatch_to_ui(lambda r=res: self._on_update_check_result(r)),
+                initial_delay_sec=8.0,
+            )
 
     def run(self) -> None:
         try:
@@ -2513,6 +2907,9 @@ class AntigravityCapsuleApp:
         if self._auto_clean_thread is not None and self._auto_clean_thread.is_alive():
             self._auto_clean_thread.join(timeout=3.0)
             self._auto_clean_thread = None
+
+        if self._updater is not None:
+            self._updater.stop()
 
         try:
             self.root.quit()

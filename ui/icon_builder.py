@@ -22,7 +22,8 @@ def build_tray_icon(base_png_path: Path | None, level: str = "green", size: int 
 
     if base_png_path and base_png_path.is_file():
         try:
-            base = Image.open(base_png_path).convert("RGBA")
+            with Image.open(base_png_path) as raw_img:
+                base = raw_img.convert("RGBA")
             inset = int(hi_size * 0.06)
             inner = hi_size - inset * 2
             base_resized = base.resize((inner, inner), Image.Resampling.LANCZOS)

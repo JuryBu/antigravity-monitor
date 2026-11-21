@@ -28,6 +28,8 @@ venv/
 
 # Local verification artifacts & OS clutter
 preview_shots/
+.update_backup/
+.update_staging/
 .DS_Store
 Thumbs.db
 desktop.ini

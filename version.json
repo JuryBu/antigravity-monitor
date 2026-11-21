@@ -1,0 +1,8 @@
+{
+  "version": "7.1.0",
+  "channel": "main",
+  "released_at": "2026-11-21",
+  "repo": "JuryBu/antigravity-monitor",
+  "branch": "main",
+  "summary": "修复后台遥测 503 复读误报 T2，新增自动更新提醒与可开启自动更新重启"
+}

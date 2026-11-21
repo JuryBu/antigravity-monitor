@@ -212,6 +212,24 @@ def main() -> int:
             app.set_theme("obsidian_dark")
             app.render_snapshot(live_snap)
             _capture_widget(app.root, out_dir / "shot_4_live_expanded_obsidian.png")
+
+            # 6. Auto-update prompt banner simulation (Scheme B Midnight Blue)
+            from core.updater import UpdateCheckResult
+            app.set_theme("midnight_blue")
+            app.render_snapshot(live_snap)
+            app._on_update_check_result(
+                UpdateCheckResult(
+                    checked_at=time.time(),
+                    local_version="7.1.0",
+                    remote_version="7.2.0",
+                    has_update=True,
+                    summary="新增自动更新提示与后台自动更新重启",
+                    released_at="2026-11-21",
+                    install_mode="zip",
+                    is_manual=True,
+                )
+            )
+            _capture_widget(app.root, out_dir / "shot_6_update_banner_midnight.png")
         finally:
             app.shutdown()
 
@@ -224,7 +242,7 @@ def main() -> int:
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=24), (x_base + 14, 108))
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=16), (x_base + 50, 112))
     strip.save(out_dir / "shot_5_tray_three_states.png", "PNG")
-    print(f"Captured 5 verification images in {out_dir}")
+    print(f"Captured 6 verification images in {out_dir}")
     return 0
 
 

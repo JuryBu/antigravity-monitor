@@ -2830,6 +2830,418 @@ class TestShortcutsAndIcons(unittest.TestCase):
             self.assertFalse((convs / "sub-hw-45m.db").exists())
             self.assertTrue((convs / "sub-hw-lock.db").exists())
 
+    def test_v71_telemetry_503_filtered_and_errorreport_dedup(self) -> None:
+        """v7.1: telemetry recordTrajectoryAnalytics 503 must count 0; same-goroutine echoes dedup to 1; labels distinct."""
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "language_server.log"
+            now_dt = datetime.datetime.now()
+            mmdd = now_dt.strftime("%m%d")
+            hms1 = (now_dt - datetime.timedelta(seconds=20)).strftime("%H:%M:%S")
+            hms2 = (now_dt - datetime.timedelta(seconds=10)).strftime("%H:%M:%S")
+            hms3 = (now_dt - datetime.timedelta(seconds=5)).strftime("%H:%M:%S")
+            hms4 = (now_dt - datetime.timedelta(seconds=2)).strftime("%H:%M:%S")
+
+            lines = [
+                # 1. Exact replay of real 10:20:27 telemetry 503 + same-goroutine errorreport echo -> MUST count 0!
+                f'ERROR: logging before google.Init: I{mmdd} {hms1}.560447  865341 http_helpers.go:876] Failed to make code assist backend request (https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics): {{',
+                '  "error": {',
+                '    "code": 503,',
+                '    "message": "The service is currently unavailable.",',
+                '    "status": "UNAVAILABLE"',
+                '  }',
+                '}',
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.565732  865341 telemetry.go:141] error recording trajectory segment analytics: UNAVAILABLE (code 503): The service is currently unavailable.",
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.565732  865341 errorreport.go:307] UNAVAILABLE (code 503): The service is currently unavailable.",
+                # 2. Real model 503 No capacity echoed by errorreport.go on SAME goroutine -> MUST dedup to 1!
+                f"ERROR: logging before google.Init: E{mmdd} {hms2}.100000  910001 planner_generator.go:512] UNAVAILABLE (code 503): No capacity available for model gemini-4-neon-xhigh",
+                f"ERROR: logging before google.Init: E{mmdd} {hms2}.100120  910001 errorreport.go:307] UNAVAILABLE (code 503): No capacity available for model gemini-4-neon-xhigh",
+                # 3. Genuine concurrent 503 Unavailable on a DIFFERENT goroutine -> MUST count +1 with Unavailable label!
+                f"ERROR: logging before google.Init: E{mmdd} {hms3}.200000  910002 stream_client.go:220] UNAVAILABLE (code 503): The service is currently unavailable.",
+                # 4. Standalone errorreport.go 503 with no prior ignored telemetry goroutine -> MUST NOT be lost (+1)!
+                f"ERROR: logging before google.Init: E{mmdd} {hms4}.300000  910099 errorreport.go:307] UNAVAILABLE (code 503): No capacity available",
+            ]
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            tailer = LanguageServerLogTailer(log_path)
+            now_ts = now_dt.timestamp()
+            tailer.poll(now_ts=now_ts)
+            recent, today, events = tailer.get_counts(now_ts=now_ts, window_min=30)
+            self.assertEqual(recent["503"], 3)
+            self.assertEqual(today["503"], 3)
+            summaries = [ev.summary for ev in events if ev.category == "503"]
+            self.assertEqual(len(summaries), 3)
+            self.assertIn("服务端 503 No capacity", summaries[0])
+            self.assertIn("服务端 503 Unavailable", summaries[1])
+            self.assertIn("服务端 503 No capacity", summaries[2])
+
+    def _build_test_release_zip(self, version: str, extra_files: dict[str, bytes] | None = None, wrap_dir: str = "antigravity-monitor-main") -> bytes:
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        base_files = {
+            "main.py": f'# main v{version}\n'.encode("utf-8"),
+            "version.json": json.dumps({"version": version, "summary": f"release {version}", "repo": "JuryBu/antigravity-monitor", "branch": "main"}).encode("utf-8"),
+            "core/log_monitor.py": f'# log_monitor v{version}\n'.encode("utf-8"),
+            "core/config_store.py": f'# config_store v{version}\n'.encode("utf-8"),
+            "ui/capsule_app.py": f'# capsule_app v{version}\n'.encode("utf-8"),
+            "assets/app-icon.ico": b"ICON-UNCHANGED-BYTES",
+            "requirements.txt": b"pystray>=0.19.5\nPillow>=10.0.0\n",
+        }
+        if extra_files:
+            base_files.update(extra_files)
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for rel, data in base_files.items():
+                arc = f"{wrap_dir}/{rel}" if wrap_dir else rel
+                zf.writestr(arc, data)
+        return buf.getvalue()
+
+    def test_v71_updater_version_compare_and_zip_apply_preserves_user_files(self) -> None:
+        """v7.1: ZIP/non-Git users get atomic update while user config.json & account_ledger.json remain untouched."""
+        from core.updater import UpdateManager
+        from core.version import is_newer_version, parse_version_tuple
+
+        self.assertEqual(parse_version_tuple("v7.1.0"), (7, 1, 0))
+        self.assertTrue(is_newer_version("7.2.0", "7.1.0"))
+        self.assertTrue(is_newer_version("7.1.1", "7.1.0"))
+        self.assertFalse(is_newer_version("7.1.0", "7.1.0"))
+        self.assertFalse(is_newer_version("7.0.9", "7.1.0"))
+        self.assertFalse(is_newer_version("invalid", "7.1.0"))
+
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "monitor_zip_user"
+            (app_dir / "core").mkdir(parents=True)
+            (app_dir / "ui").mkdir(parents=True)
+            (app_dir / "assets").mkdir(parents=True)
+            (app_dir / "version.json").write_text(json.dumps({"version": "7.1.0", "repo": "JuryBu/antigravity-monitor", "branch": "main"}), encoding="utf-8")
+            (app_dir / "main.py").write_text("# old main\n", encoding="utf-8")
+            (app_dir / "core" / "log_monitor.py").write_text("# old log\n", encoding="utf-8")
+            (app_dir / "core" / "config_store.py").write_text("# old cfg\n", encoding="utf-8")
+            (app_dir / "ui" / "capsule_app.py").write_text("# old ui\n", encoding="utf-8")
+            (app_dir / "assets" / "app-icon.ico").write_bytes(b"ICON-UNCHANGED-BYTES")
+            (app_dir / "requirements.txt").write_text("pystray>=0.19.5\nPillow>=10.0.0\n", encoding="utf-8")
+            # User private runtime files MUST survive untouched even if archive tries to ship them
+            (app_dir / "config.json").write_text('{"theme":"obsidian_dark","auto_update_restart":true}\n', encoding="utf-8")
+            (app_dir / "account_ledger.json").write_text('{"accounts":["al***1"]}\n', encoding="utf-8")
+
+            zip_payload = self._build_test_release_zip(
+                "7.2.0",
+                extra_files={
+                    "config.json": b'{"theme":"SHOULD_NEVER_OVERWRITE"}\n',
+                    "account_ledger.json": b'{"accounts":["POISON"]}\n',
+                    "core/new_module.py": b"# added in 7.2.0\n",
+                },
+            )
+            manifest_payload = json.dumps({
+                "version": "7.2.0",
+                "released_at": "2026-11-22",
+                "summary": "新增特性测试",
+                "repo": "JuryBu/antigravity-monitor",
+                "branch": "main",
+            }).encode("utf-8")
+
+            def fake_http(url: str, timeout: float, max_bytes: int) -> bytes:
+                if "version.json" in url:
+                    return manifest_payload
+                if "/zip/refs/heads/" in url:
+                    return zip_payload
+                raise AssertionError(f"Unexpected URL: {url}")
+
+            mgr = UpdateManager(app_root=app_dir, http_get_fn=fake_http)
+            self.assertEqual(mgr.detect_install_mode(), "zip")
+            chk = mgr.check_for_update(is_manual=True)
+            self.assertEqual(chk.error, "")
+            self.assertTrue(chk.has_update)
+            self.assertEqual(chk.remote_version, "7.2.0")
+
+            res = mgr.apply_update(expected_remote_version="7.2.0")
+            self.assertTrue(res.ok, res.error)
+            self.assertEqual(res.method, "zip")
+            self.assertTrue(res.needs_restart)
+            self.assertEqual(res.to_version, "7.2.0")
+            self.assertIn("# main v7.2.0", (app_dir / "main.py").read_text(encoding="utf-8"))
+            self.assertTrue((app_dir / "core" / "new_module.py").is_file())
+            # Unchanged icon skipped, user private files untouched, backup cleaned up
+            self.assertIn("obsidian_dark", (app_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertIn("al***1", (app_dir / "account_ledger.json").read_text(encoding="utf-8"))
+            self.assertFalse((app_dir / ".update_backup").exists())
+
+    def test_v71_updater_zip_security_and_rollback(self) -> None:
+        """v7.1: updater blocks untrusted hosts, Zip-Slip paths, malformed archives, and rolls back on write errors."""
+        import io
+        import zipfile
+        from unittest import mock
+        from core.updater import UpdateManager, _validate_https_url
+
+        with self.assertRaises(ValueError):
+            _validate_https_url("http://raw.githubusercontent.com/JuryBu/antigravity-monitor/main/version.json")
+        with self.assertRaises(ValueError):
+            _validate_https_url("https://evil.example.com/payload.zip")
+
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "app"
+            (app_dir / "core").mkdir(parents=True)
+            (app_dir / "ui").mkdir(parents=True)
+            (app_dir / "version.json").write_text('{"version":"7.1.0"}', encoding="utf-8")
+            (app_dir / "main.py").write_text("# original v7.1.0\n", encoding="utf-8")
+            (app_dir / "core" / "log_monitor.py").write_text("# orig log\n", encoding="utf-8")
+            (app_dir / "core" / "config_store.py").write_text("# orig cfg\n", encoding="utf-8")
+            (app_dir / "ui" / "capsule_app.py").write_text("# orig ui\n", encoding="utf-8")
+
+            # 1. Zip Slip archive MUST be rejected cleanly without writing outside app_dir
+            slip_buf = io.BytesIO()
+            with zipfile.ZipFile(slip_buf, "w") as zf:
+                zf.writestr("../escaped.txt", b"pwn")
+                zf.writestr("main.py", b"# bad")
+            slip_bytes = slip_buf.getvalue()
+            mgr_slip = UpdateManager(app_root=app_dir, http_get_fn=lambda u, t, m: slip_bytes)
+            res_slip = mgr_slip.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_slip.ok)
+            self.assertIn("非法路径", res_slip.error)
+            self.assertFalse((Path(td) / "escaped.txt").exists())
+
+            # 2. Mid-write OSError MUST roll back already replaced files to original 7.1.0 state
+            good_zip = self._build_test_release_zip("7.2.0", extra_files={"core/brand_new.py": b"# new\n"})
+            mgr_rb = UpdateManager(app_root=app_dir, http_get_fn=lambda u, t, m: good_zip)
+            real_replace = os.replace
+            calls = {"n": 0}
+
+            def flaky_replace(src, dst):
+                calls["n"] += 1
+                if calls["n"] >= 3:
+                    raise PermissionError("simulated file lock")
+                return real_replace(src, dst)
+
+            with mock.patch("core.updater.os.replace", side_effect=flaky_replace):
+                res_rb = mgr_rb.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_rb.ok)
+            self.assertIn("回滚", res_rb.error)
+            self.assertEqual((app_dir / "main.py").read_text(encoding="utf-8"), "# original v7.1.0\n")
+            self.assertEqual(json.loads((app_dir / "version.json").read_text(encoding="utf-8"))["version"], "7.1.0")
+            self.assertFalse((app_dir / "core" / "brand_new.py").exists())
+
+    def test_v71_updater_git_dirty_guard_and_ff_update(self) -> None:
+        """v7.1: Git mode protects uncommitted edits and cleanly fast-forwards clean checkouts."""
+        import subprocess
+        from core.updater import UpdateManager
+
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            remote = root / "remote.git"
+            work_up = root / "up"
+            local = root / "local"
+
+            def git(cwd: Path, *args: str) -> None:
+                subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+            remote.mkdir()
+            git(remote, "init", "--bare", "-b", "main")
+            work_up.mkdir()
+            git(work_up, "init", "-b", "main")
+            git(work_up, "config", "user.email", "test@example.com")
+            git(work_up, "config", "user.name", "Test")
+            (work_up / "version.json").write_text('{"version":"7.1.0","repo":"JuryBu/antigravity-monitor","branch":"main"}\n', encoding="utf-8")
+            (work_up / "main.py").write_text("# v7.1.0\n", encoding="utf-8")
+            git(work_up, "add", ".")
+            git(work_up, "commit", "-m", "v7.1.0")
+            git(work_up, "remote", "add", "origin", str(remote))
+            git(work_up, "push", "-u", "origin", "main")
+
+            subprocess.run(["git", "clone", "-b", "main", str(remote), str(local)], check=True, capture_output=True)
+
+            # Push v7.2.0 to remote
+            (work_up / "version.json").write_text('{"version":"7.2.0","repo":"JuryBu/antigravity-monitor","branch":"main"}\n', encoding="utf-8")
+            (work_up / "main.py").write_text("# v7.2.0\n", encoding="utf-8")
+            git(work_up, "add", ".")
+            git(work_up, "commit", "-m", "v7.2.0")
+            git(work_up, "push", "origin", "main")
+
+            mgr = UpdateManager(app_root=local)
+            self.assertEqual(mgr.detect_install_mode(), "git")
+
+            # 1. Dirty local working tree MUST be protected
+            (local / "main.py").write_text("# local unsaved edit\n", encoding="utf-8")
+            res_dirty = mgr.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_dirty.ok)
+            self.assertTrue(res_dirty.dirty_blocked)
+            self.assertEqual((local / "main.py").read_text(encoding="utf-8"), "# local unsaved edit\n")
+
+            # 2. Clean checkout MUST fast-forward cleanly to 7.2.0
+            git(local, "checkout", "--", "main.py")
+            res_ff = mgr.apply_update(expected_remote_version="7.2.0")
+            self.assertTrue(res_ff.ok, res_ff.error)
+            self.assertEqual(res_ff.method, "git")
+            self.assertTrue(res_ff.needs_restart)
+            self.assertEqual(res_ff.to_version, "7.2.0")
+            self.assertEqual((local / "main.py").read_text(encoding="utf-8"), "# v7.2.0\n")
+
+    def test_v71_config_update_options_and_auto_loop_guard(self) -> None:
+        """v7.1: update config options clamp safely and failed auto-update versions are suppressed from retry loops."""
+        from core.config_store import sanitize_config
+        from core.updater import UpdateManager
+
+        cfg = sanitize_config({
+            "update_check_enabled": True,
+            "auto_update_restart": True,
+            "update_check_interval_min": 2,
+            "update_ignored_version": " 7.2.0 ",
+        })
+        self.assertTrue(cfg["update_check_enabled"])
+        self.assertTrue(cfg["auto_update_restart"])
+        self.assertEqual(cfg["update_check_interval_min"], 10)  # clamped >= 10
+        self.assertEqual(cfg["update_ignored_version"], "7.2.0")
+
+        with tempfile.TemporaryDirectory() as td:
+            mgr = UpdateManager(app_root=Path(td))
+            self.assertFalse(mgr.has_failed_auto_version("7.2.0"))
+            # Transient failures retry up to 3 times before stopping; permanent locks immediately
+            mgr.mark_auto_version_failed("7.2.0", permanent=False)
+            mgr.mark_auto_version_failed("7.2.0", permanent=False)
+            self.assertFalse(mgr.has_failed_auto_version("7.2.0"))
+            mgr.mark_auto_version_failed("7.2.0", permanent=False)
+            self.assertTrue(mgr.has_failed_auto_version("7.2.0"))
+            mgr.clear_failed_auto_version("7.2.0")
+            self.assertFalse(mgr.has_failed_auto_version("7.2.0"))
+            mgr.mark_auto_version_failed("7.2.0", permanent=True)
+            self.assertTrue(mgr.has_failed_auto_version("7.2.0"))
+
+    def test_v71_dual_review_hardening_regressions(self) -> None:
+        """v7.1 dual-review regressions: multiline model 503 dedup, INFO telemetry non-muting,
+        per-hop redirect allowlist, ZIP bombs/drive-colon/version-last, Git untracked/branch/lag, SemVer prerelease."""
+        import io
+        import subprocess
+        import urllib.request
+        import zipfile
+        from core.config_store import sanitize_config
+        from core.updater import UpdateManager, _SafeRedirectHandler, _validate_https_url
+        from core.version import is_newer_version
+
+        # 1. SemVer prerelease & config coupling
+        self.assertTrue(is_newer_version("7.2.0", "7.2.0-beta.1"))
+        self.assertFalse(is_newer_version("7.2.0-beta.1", "7.2.0"))
+        cfg_off = sanitize_config({"update_check_enabled": False, "auto_update_restart": True})
+        self.assertFalse(cfg_off["update_check_enabled"])
+        self.assertFalse(cfg_off["auto_update_restart"])
+
+        # 2. Per-hop redirect validation & port/userinfo blocking
+        with self.assertRaises(ValueError):
+            _validate_https_url("https://user:pass@raw.githubusercontent.com/JuryBu/antigravity-monitor/main/version.json")
+        with self.assertRaises(ValueError):
+            _validate_https_url("https://raw.githubusercontent.com:8443/JuryBu/antigravity-monitor/main/version.json")
+        handler = _SafeRedirectHandler(max_hops=2)
+        req = urllib.request.Request("https://github.com/JuryBu/antigravity-monitor/archive/refs/heads/main.zip")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example.com/bad.zip")
+
+        # 3. Multiline real model 503 JSON + caller + errorreport MUST count strictly 1 (never 2->T2),
+        #    and normal INFO log on ignored source MUST NOT mute a real 403/timeout on the same goroutine!
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "language_server.log"
+            now_dt = datetime.datetime.now()
+            mmdd = now_dt.strftime("%m%d")
+            hms1 = (now_dt - datetime.timedelta(seconds=20)).strftime("%H:%M:%S")
+            hms2 = (now_dt - datetime.timedelta(seconds=10)).strftime("%H:%M:%S")
+            lines = [
+                # Real streamGenerateContent 503 with multi-line JSON + caller + errorreport on same goroutine 77001 -> strictly 1!
+                f'ERROR: logging before google.Init: I{mmdd} {hms1}.100000  77001 http_helpers.go:876] Failed to make code assist backend request (https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse): {{',
+                '  "error": {',
+                '    "code": 503,',
+                '    "message": "No capacity available for model gemini-4-neon-xhigh",',
+                '    "status": "RESOURCE_EXHAUSTED"',
+                '  }',
+                '}',
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.105000  77001 planner_generator.go:512] UNAVAILABLE (code 503): No capacity available",
+                f"ERROR: logging before google.Init: E{mmdd} {hms1}.105100  77001 errorreport.go:307] UNAVAILABLE (code 503): No capacity available",
+                # Normal INFO line from telemetry.go on goroutine 77002 followed by real 403 -> 403 MUST NOT be muted!
+                f"ERROR: logging before google.Init: I{mmdd} {hms2}.100000  77002 telemetry.go:88] flushed metrics batch ok",
+                f"ERROR: logging before google.Init: E{mmdd} {hms2}.200000  77002 errorreport.go:307] PERMISSION_DENIED (code 403): TOS_VIOLATION",
+                # Background loadCodeAssist 503 + errorreport echo on goroutine 77003 -> strictly 0!
+                f'ERROR: logging before google.Init: I{mmdd} {hms2}.500000  77003 http_helpers.go:876] Failed to make code assist backend request (https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist): {{',
+                '  "error": {"code": 503, "message": "No capacity"}',
+                '}',
+                f"ERROR: logging before google.Init: E{mmdd} {hms2}.505000  77003 errorreport.go:307] UNAVAILABLE (code 503): The service is currently unavailable.",
+            ]
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tailer = LanguageServerLogTailer(log_path)
+            tailer.poll(now_ts=now_dt.timestamp())
+            recent, _today, _evs = tailer.get_counts(now_ts=now_dt.timestamp(), window_min=30)
+            self.assertEqual(recent["503"], 1)
+            self.assertEqual(recent["403"], 1)
+
+        # 4. ZIP entry bomb & nested drive-colon rejection & corrupted version.json rejection
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "app"
+            (app_dir / "core").mkdir(parents=True)
+            (app_dir / "ui").mkdir(parents=True)
+            (app_dir / "version.json").write_text('{"version":"7.1.0"}', encoding="utf-8")
+            (app_dir / "main.py").write_text("# v7.1.0\n", encoding="utf-8")
+            (app_dir / "core" / "log_monitor.py").write_text("# v7.1.0\n", encoding="utf-8")
+            (app_dir / "core" / "config_store.py").write_text("# v7.1.0\n", encoding="utf-8")
+            (app_dir / "ui" / "capsule_app.py").write_text("# v7.1.0\n", encoding="utf-8")
+
+            # Nested drive colon in second segment
+            colon_buf = io.BytesIO()
+            with zipfile.ZipFile(colon_buf, "w") as zf:
+                zf.writestr("wrap/C:evil.txt", b"x")
+                zf.writestr("wrap/main.py", b"x")
+            mgr_c = UpdateManager(app_root=app_dir, http_get_fn=lambda u, t, m: colon_buf.getvalue())
+            res_c = mgr_c.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_c.ok)
+            self.assertIn("非法路径", res_c.error)
+
+            # Corrupt version.json inside archive must report error (NOT "already latest")
+            bad_ver_zip = self._build_test_release_zip("7.2.0", extra_files={"version.json": b"{corrupt json"})
+            mgr_bv = UpdateManager(app_root=app_dir, http_get_fn=lambda u, t, m: bad_ver_zip)
+            res_bv = mgr_bv.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_bv.ok)
+            self.assertIn("version.json", res_bv.error)
+
+            # Entry count bomb (>500 files)
+            bomb_buf = io.BytesIO()
+            with zipfile.ZipFile(bomb_buf, "w") as zf:
+                for idx in range(505):
+                    zf.writestr(f"wrap/f_{idx}.txt", b"a")
+            mgr_b = UpdateManager(app_root=app_dir, http_get_fn=lambda u, t, m: bomb_buf.getvalue())
+            res_b = mgr_b.apply_update(expected_remote_version="7.2.0")
+            self.assertFalse(res_b.ok)
+            self.assertIn("条目", res_b.error)
+
+        # 5. Git mode: untracked unignored file & origin lagging behind target version MUST block cleanly
+        if shutil.which("git") is not None:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                remote = root / "remote.git"
+                up = root / "up"
+                loc = root / "loc"
+                remote.mkdir()
+                up.mkdir()
+                subprocess.run(["git", "init", "--bare", "-b", "main"], cwd=str(remote), check=True, capture_output=True)
+                subprocess.run(["git", "init", "-b", "main"], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.email", "t@e.com"], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "config", "user.name", "T"], cwd=str(up), check=True, capture_output=True)
+                (up / "version.json").write_text('{"version":"7.1.0","repo":"JuryBu/antigravity-monitor","branch":"main"}\n', encoding="utf-8")
+                (up / "main.py").write_text("# v7.1.0\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "init"], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(up), check=True, capture_output=True)
+                subprocess.run(["git", "clone", "-b", "main", str(remote), str(loc)], check=True, capture_output=True)
+
+                mgr_g = UpdateManager(app_root=loc)
+                # Untracked file blocks safely
+                (loc / "untracked_conflict.py").write_text("# local\n", encoding="utf-8")
+                r_un = mgr_g.apply_update(expected_remote_version="7.2.0")
+                self.assertFalse(r_un.ok)
+                self.assertTrue(r_un.dirty_blocked)
+                (loc / "untracked_conflict.py").unlink()
+                # Remote origin still at 7.1.0 while target is 7.2.0 -> returns ok=False (no silent loop)
+                r_lag = mgr_g.apply_update(expected_remote_version="7.2.0")
+                self.assertFalse(r_lag.ok)
+                self.assertTrue(r_lag.dirty_blocked)
+
 
 if __name__ == "__main__":
     unittest.main()
