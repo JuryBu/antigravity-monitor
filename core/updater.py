@@ -832,12 +832,14 @@ class UpdateManager:
                     except OSError:
                         pass
 
+                is_perm_err = isinstance(apply_exc, PermissionError) or ("access is denied" in str(apply_exc).lower()) or ("拒绝访问" in str(apply_exc))
+                perm_hint = "（目录无写权限，建议移出 Program Files 等受保护目录）" if is_perm_err else ""
                 if not rollback_errors:
                     shutil.rmtree(backup_dir, ignore_errors=True)
-                    err_msg = f"写入更新文件失败并已自动回滚: {apply_exc}"
+                    err_msg = f"写入更新文件失败并已自动回滚{perm_hint}: {apply_exc}"
                 else:
                     err_msg = (
-                        f"写入更新文件失败({apply_exc})，部分文件回滚未完成（已保留 .update_backup）: "
+                        f"写入更新文件失败({apply_exc}){perm_hint}，部分文件回滚未完成（已保留 .update_backup）: "
                         + "; ".join(rollback_errors[:2])
                     )
                 return UpdateApplyResult(

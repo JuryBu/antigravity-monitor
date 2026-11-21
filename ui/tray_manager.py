@@ -116,9 +116,27 @@ class TrayManager:
                 checked=lambda _item: bool(self._getters.get("update_check", lambda: True)()),
             ),
             pystray.MenuItem(
-                "发现更新时自动更新重启",
-                self._invoke("toggle_auto_update"),
-                checked=lambda _item: bool(self._getters.get("auto_update", lambda: False)()),
+                "更新方式",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "后台下载（下次启动生效）",
+                        self._invoke("update_mode_download"),
+                        checked=lambda _item: str(self._getters.get("update_mode", lambda: "download")()) == "download",
+                        radio=True,
+                    ),
+                    pystray.MenuItem(
+                        "自动下载并立即重启",
+                        self._invoke("update_mode_auto_restart"),
+                        checked=lambda _item: str(self._getters.get("update_mode", lambda: "download")()) == "auto_restart",
+                        radio=True,
+                    ),
+                    pystray.MenuItem(
+                        "仅提示（手动点击更新）",
+                        self._invoke("update_mode_notify"),
+                        checked=lambda _item: str(self._getters.get("update_mode", lambda: "download")()) == "notify",
+                        radio=True,
+                    ),
+                ),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("查看本机 500 槽位详情", self._invoke("open_slots")),

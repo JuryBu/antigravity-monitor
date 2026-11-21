@@ -3080,6 +3080,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
 
     def test_v71_config_update_options_and_auto_loop_guard(self) -> None:
         """v7.1: update config options clamp safely and failed auto-update versions are suppressed from retry loops."""
+        from dataclasses import replace
+
         from core.config_store import sanitize_config
         from core.updater import UpdateManager
 
@@ -3115,6 +3117,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
         import subprocess
         import urllib.request
         import zipfile
+        from dataclasses import replace
+
         from core.config_store import sanitize_config
         from core.updater import UpdateManager, _SafeRedirectHandler, _validate_https_url
         from core.version import is_newer_version
@@ -4017,6 +4021,679 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 rendered_ids = [rid for rid in app._conv_row_ids if rid]
                 self.assertEqual(rendered_ids.count(cid), 1)
             finally:
+                app.shutdown()
+
+    def test_v721_heavy_media_timeout_snapshots_survive_compact_and_resend_and_unclipped_notable(self) -> None:
+        """v7.2.1 Module 1: point-in-time snapshots survive later /compact & USER_INPUT resend; rel_rank 1 beats 2; Stage 2 overrides rel_rank 2; unclipped notable excludes heavy-media from T2, last_t2_error_ts, prior_hist_warning & alerts (post-baseline)."""
+        import re
+        from core.log_monitor import AccountQuotaInfo, format_json_snapshot
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            def _iso(dt_s: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_s, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            def _glog(dt_s: float) -> str:
+                dt = datetime.datetime.fromtimestamp(now + dt_s)
+                return dt.strftime("%m%d %H:%M:%S.123456")
+
+            big_img = root / "big.png"
+            big_img.write_bytes(b"x" * (6 * 1024 * 1024))  # 6 MB single image -> >= 5MB heavy media
+            med_img = root / "med.png"
+            med_img.write_bytes(b"y" * (2_500_000))        # 2.5 MB -> triggers 400K + >=2MB compound heavy media
+
+            # Conv A: Stage 1 empty ERROR_MESSAGE at t-400s while holding 6MB image, THEN /compact clears media at t-100s!
+            cid_a = "heavya01-1111-2222-3333-444444444444"
+            dir_a = root / "brain" / cid_a / ".system_generated" / "logs"
+            dir_a.mkdir(parents=True)
+            (dir_a / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-1000), "media": [{"uri": big_img.as_uri()}]}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-980), "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 80000, "output_tokens": 400}),
+                    json.dumps({"step_index": 3, "type": "ERROR_MESSAGE", "created_at": _iso(-400), "content": ""}),
+                    # Later /compact wipes active media -> snapshot MUST STILL remember 6MB!
+                    json.dumps({"step_index": 4, "type": "CHECKPOINT", "created_at": _iso(-100)}),
+                    json.dumps({"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": _iso(-60), "model": "gemini-4-neon-xhigh", "input_tokens": 3000, "cache_read_tokens": 50000, "output_tokens": 300}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Conv C: Unrelated non-empty tool error 0.2s closer to both t-400s AND t-300s (rel_rank=2 MUST lose to empty error rel_rank=1 AND be overridden by Stage 2!)
+            cid_c = "noise003-1111-2222-3333-444444444444"
+            dir_c = root / "brain" / cid_c / ".system_generated" / "logs"
+            dir_c.mkdir(parents=True)
+            (dir_c / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-900)}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-880), "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 40000, "output_tokens": 200}),
+                    json.dumps({"step_index": 3, "type": "ERROR_MESSAGE", "created_at": _iso(-400.2), "content": "file not found: unrelated tool error"}),
+                    json.dumps({"step_index": 4, "type": "ERROR_MESSAGE", "created_at": _iso(-300.2), "content": "syntax error in bash script"}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # Conv B: Stage 2 /compact USER_INPUT at t-900s (10m timeout at t-300s) with 420K ctx + 2.5MB media, THEN new USER_INPUT at t-30s!
+            cid_b = "heavyb02-1111-2222-3333-444444444444"
+            dir_b = root / "brain" / cid_b / ".system_generated" / "logs"
+            dir_b.mkdir(parents=True)
+            (dir_b / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-1200), "media": [{"uri": med_img.as_uri()}]}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-1180), "model": "gemini-4-neon-xhigh", "input_tokens": 10000, "cache_read_tokens": 410000, "output_tokens": 400}),
+                    # /compact submitted at t-900s -> times out after 10m at t-300s (no ERROR_MESSAGE written)
+                    json.dumps({"step_index": 3, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-900)}),
+                    # Later resend at t-30s must NOT overwrite the t-900s snapshot!
+                    json.dumps({"step_index": 3, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-30)}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            # 4 heavy-media timeouts in 30m window (exceeding old [-3:] slice!) -> MUST NOT clip or falsely escalate T2!
+            log_path = root / "language_server.log"
+            log_lines = [
+                f"ERROR: logging before google.Init: W{_glog(-402)} 101 run.go:317] Run: attempt 1 failed (stream idle timeout (10m0s))",
+                f"ERROR: logging before google.Init: W{_glog(-400)} 102 run.go:317] Run: attempt 1 failed (stream idle timeout (10m0s))",
+                f"ERROR: logging before google.Init: W{_glog(-301)} 103 retry.go:62] attempt 1 failed (timed out after 10m0s)",
+                f"ERROR: logging before google.Init: W{_glog(-300)} 104 retry.go:62] attempt 2 failed (timed out after 10m0s)",
+            ]
+            log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": log_path,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="te***1", online=True, observed_at=now)
+            eng._last_account_poll = now
+            eng._ledger.observe_online("te***1", now - 2000)
+            # Mark baseline ready BEFORE polling so _collect_new_alerts truly evaluates alerts (no first-poll mute!)
+            eng._baseline_ready = True
+
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.recent_timeout, 4)
+            self.assertEqual(snap.heavy_media_timeout_recent, 4)
+            self.assertEqual(snap.grade, "WARN")
+            self.assertEqual(snap.level, "orange")
+            self.assertEqual(snap.last_t2_error_ts, 0.0)
+            self.assertEqual(snap.alerts, [])
+            self.assertIn("多图上传超时", snap.sub_headline)
+            # Check JSON schema_version="1.0" + new optional fields
+            jobj = json.loads(format_json_snapshot(snap))
+            self.assertEqual(jobj["schema_version"], "1.0")
+            self.assertEqual(jobj["errors_30m"]["heavy_media_timeout"], 4)
+            # Ensure recent_events retains [HH:MM:SS] prefix & accurate snapshot tags (never stolen by noise003!)
+            self.assertEqual(len(snap.recent_events), 3)
+            self.assertTrue(all(ev.is_heavy_media_timeout for ev in snap.recent_events))
+            self.assertTrue(all(ev.culprit_cid != cid_c for ev in snap.recent_events))
+            self.assertTrue(all(re.match(r"^\[\d{2}:\d{2}:\d{2}\] 多图上传超时 \(10m\)", ev.summary) for ev in snap.recent_events))
+            # get_counts(max_notable=0) returns empty notable list (not full list!)
+            _, _, zero_ev = eng._log_tailer.get_counts(now, 30, max_notable=0)
+            self.assertEqual(zero_ev, [])
+
+            # Verify prior_hist_warning excludes historical heavy-media timeouts when switching back on a cold first step!
+            eng._ledger.observe_online("ot***2", now - 120)
+            eng._ledger.observe_online("te***1", now - 25)
+            with (dir_a / "transcript.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"step_index": 6, "type": "PLANNER_RESPONSE", "created_at": _iso(-10), "model": "gemini-4-neon-xhigh", "input_tokens": 55000, "cache_read_tokens": 0, "output_tokens": 200}) + "\n")
+            snap_prior = eng.poll(now_ts=now, force_account=False)
+            self.assertNotIn("前序历史曾触发 T2 限流", snap_prior.sub_headline)
+
+            # Verify 384-entry cache eviction keeps the hottest (newest mtime) conversation instead of inverting LRU!
+            eng_lru = AntigravityMonitorEngine(read_only=True)
+            for idx in range(388):
+                fcid = f"lru-{idx:04d}"
+                # Descending mtime_ns (idx=0 is hottest newest!)
+                eng_lru._transcript_cache[fcid] = (((10_000_000 - idx) * 1_000_000_000, 100), [], True, False)
+                eng_lru._transcript_error_ts[fcid] = [(now - idx, "", 12, 6_000_000, 100_000)]
+                eng_lru._transcript_tail_meta[fcid] = ([(now - idx, 12, 6_000_000, 100_000)], 12, 6_000_000, 100_000)
+                while len(eng_lru._transcript_cache) > 384:
+                    evicted_cid = min(eng_lru._transcript_cache.keys(), key=lambda k: eng_lru._transcript_cache[k][0][0])
+                    eng_lru._transcript_cache.pop(evicted_cid, None)
+                    eng_lru._transcript_error_ts.pop(evicted_cid, None)
+                    eng_lru._transcript_tail_meta.pop(evicted_cid, None)
+            self.assertIn("lru-0000", eng_lru._transcript_cache)
+            self.assertIn("lru-0000", eng_lru._transcript_error_ts)
+            self.assertIn("lru-0000", eng_lru._transcript_tail_meta)
+            self.assertNotIn("lru-0387", eng_lru._transcript_cache)
+
+    def test_v721_t2_recovery_heavy_media_exemption_and_large_ctx_calibration_guards(self) -> None:
+        """v7.2.1 Modules 2 & 4: strict heavy-media full-speed exemption, >=2 unexempted steps for T0, >=4 unexempted steps for spike tolerance, <300K/200K zero allowance, low-TPS never exempted, raw median preserved."""
+        from core.log_monitor import (
+            ConversationSummary,
+            StepRecord,
+            compute_large_ctx_ttft_allowance,
+        )
+
+        # 1. Pure formula boundary checks
+        self.assertEqual(compute_large_ctx_ttft_allowance(150_000, 200_000), 0.0)
+        self.assertEqual(compute_large_ctx_ttft_allowance(299_999, 512_000), 0.0)
+        self.assertAlmostEqual(compute_large_ctx_ttft_allowance(360_000, 512_000), 10.0, places=1)
+        self.assertGreater(compute_large_ctx_ttft_allowance(473_800, 512_000), 25.0)
+        self.assertEqual(compute_large_ctx_ttft_allowance(512_000, 512_000), 30.0)
+
+        now = time.time()
+        err_ts = now - 700.0
+        eng = AntigravityMonitorEngine(read_only=True)
+
+        class _FakeGen:
+            def __init__(self, ttft: float, tps: float, strm: float, out: int) -> None:
+                self.ttft_sec = ttft
+                self.tps = tps
+                self.streaming_sec = strm
+                self.output_tokens = out
+
+        def _make_conv(steps_spec: list) -> ConversationSummary:
+            steps = []
+            gens = []
+            for idx, (dt_off, ctx, mc, mb, ttft, tps, strm, out) in enumerate(steps_spec, 1):
+                steps.append(
+                    StepRecord(
+                        idx, err_ts + dt_off, "gemini-4-neon-xhigh", 3000, ctx - 3000, out, ctx,
+                        99.0, "hit", "cached", active_media_count=mc, active_media_bytes=mb,
+                    )
+                )
+                gens.append(_FakeGen(ttft, tps, strm, out))
+            c = ConversationSummary(
+                conversation_id="mod24-0001", short_id="mod240", model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                context_tokens=steps[-1].total_tokens, max_context_tokens=512_000,
+                latest_hit_rate=99.0, latest_cached_in=steps[-1].cache_read_tokens, latest_uncached_in=3000,
+                latest_timestamp=steps[-1].timestamp, recent_steps=steps, consec_miss=0, consec_miss_start_step=0,
+                single_miss=False, wasted_cold_tokens=0, freshness_remaining_sec=180,
+                recent_ttfts=[g.ttft_sec for g in gens], recent_tps_list=[g.tps for g in gens],
+            )
+            c._scoped_steps_all = steps
+            c._scoped_gens_all = gens
+            return c
+
+        # Case A: 6 heavy-media sustained full-speed steps -> soften T2 to WARN, NEVER green T0!
+        c_media = _make_conv([
+            (30, 290_000, 25, 4_770_000, 218.0, 125.0, 16.5, 2060),
+            (60, 292_000, 25, 4_770_000, 195.0, 130.0, 14.0, 1820),
+            (90, 294_000, 25, 4_770_000, 180.0, 128.0, 12.0, 1536),
+            (120, 296_000, 25, 4_770_000, 175.0, 122.0, 10.0, 1220),
+            (150, 298_000, 25, 4_770_000, 170.0, 135.0, 11.0, 1485),
+            (180, 299_000, 25, 4_770_000, 165.0, 140.0, 10.0, 1400),
+        ])
+        ms_a = eng._compute_recent_model_stats([c_media], err_ts - 60, last_t2_error_ts=err_ts, slow_tps_th=40.0, slow_ttft_th=45.0)
+        self.assertEqual(ms_a[0].main_media_exempt_post_steps, 6)
+        self.assertEqual(ms_a[0].main_unexempt_ttft_steps_after_last_t2, 0)
+        lvl_a, grd_a, _, sub_a, _ = eng._evaluate_health(
+            "Neon XHigh", {"503": 2, "timeout": 0, "403": 0, "retry": 0}, {"503": 2, "timeout": 0, "403": 0, "retry": 0},
+            0, False, False, 10, c_media, model_stats=ms_a, last_t2_error_ts=err_ts, now_ts=now,
+        )
+        self.assertEqual((lvl_a, grd_a), ("orange", "WARN"))
+        self.assertIn("多图满速正常", sub_a)
+
+        # Case A2: 3 heavy-media exempted steps + 2 fast normal + 1 slow 140s normal (unexempt=3 < 4) MUST NOT trigger <150s spike tolerance -> stays T2!
+        c_dilute = _make_conv([
+            (30, 290_000, 25, 4_770_000, 190.0, 130.0, 10.0, 1300),
+            (60, 292_000, 25, 4_770_000, 185.0, 130.0, 10.0, 1300),
+            (90, 294_000, 25, 4_770_000, 180.0, 130.0, 10.0, 1300),
+            (120, 120_000, 0, 0, 18.0, 150.0, 5.0, 750),
+            (150, 122_000, 0, 0, 20.0, 150.0, 5.0, 750),
+            (180, 124_000, 0, 0, 140.0, 15.0, 40.0, 600),
+        ])
+        ms_a2 = eng._compute_recent_model_stats([c_dilute], err_ts - 60, last_t2_error_ts=err_ts, slow_tps_th=40.0, slow_ttft_th=45.0)
+        self.assertEqual(ms_a2[0].main_unexempt_ttft_steps_after_last_t2, 3)
+        _, grd_a2, _, _, _ = eng._evaluate_health(
+            "Neon XHigh", {"503": 2, "timeout": 0, "403": 0, "retry": 0}, {"503": 2, "timeout": 0, "403": 0, "retry": 0},
+            0, False, False, 10, c_dilute, model_stats=ms_a2, last_t2_error_ts=err_ts, now_ts=now,
+        )
+        self.assertEqual(grd_a2, "T2")
+
+        # Case B: 1 tiny image (20KB) + 0.3s short burst fake high TPS MUST NOT be exempted -> stays red T2!
+        c_fake = _make_conv([
+            (30, 120_000, 1, 20_000, 180.0, 500.0, 0.3, 150),
+            (60, 122_000, 1, 20_000, 190.0, 480.0, 0.35, 168),
+        ])
+        ms_b = eng._compute_recent_model_stats([c_fake], err_ts - 60, last_t2_error_ts=err_ts, slow_tps_th=40.0, slow_ttft_th=45.0)
+        self.assertEqual(ms_b[0].main_media_exempt_post_steps, 0)
+        _, grd_b, _, _, _ = eng._evaluate_health(
+            "Neon XHigh", {"503": 2, "timeout": 0, "403": 0, "retry": 0}, {"503": 2, "timeout": 0, "403": 0, "retry": 0},
+            0, False, False, 10, c_fake, model_stats=ms_b, last_t2_error_ts=err_ts, now_ts=now,
+        )
+        self.assertEqual(grd_b, "T2")
+
+        # Case C: 473K full-speed (TTFT=55s, tps=210) gets +29s allowance -> adj=26s -> recovers cleanly while displaying TRUE raw median 55.0s + (大上下文校准)!
+        c_big_ok = _make_conv([
+            (30 + i * 30, 473_800, 0, 0, 55.0, 210.0, 6.0, 1260) for i in range(6)
+        ])
+        ms_c = eng._compute_recent_model_stats([c_big_ok], err_ts - 60, last_t2_error_ts=err_ts, slow_tps_th=40.0, slow_ttft_th=45.0)
+        self.assertTrue(ms_c[0].main_large_ctx_calibrated)
+        self.assertAlmostEqual(ms_c[0].main_ttft_after_last_t2_median, 55.0, places=1)
+        self.assertLess(ms_c[0].main_adj_ttft_after_last_t2_median, 30.0)
+        lvl_c, grd_c, _, _, note_c = eng._evaluate_health(
+            "Neon XHigh", {"503": 2, "timeout": 0, "403": 0, "retry": 0}, {"503": 2, "timeout": 0, "403": 0, "retry": 0},
+            0, False, False, 10, c_big_ok, model_stats=ms_c, last_t2_error_ts=err_ts, now_ts=now,
+        )
+        self.assertEqual((lvl_c, grd_c), ("green", "T0"))
+        self.assertIn("TTFT 中位 55.0s(大上下文校准)", note_c)
+
+        # Case D: 473K TRUE low-TPS throttling (TTFT=65s, tps=18 t/s, out=900) MUST NOT get ctx allowance -> stays red T2!
+        c_big_slow = _make_conv([
+            (30, 473_800, 0, 0, 65.0, 18.0, 50.0, 900),
+            (100, 475_000, 0, 0, 68.0, 19.0, 48.0, 912),
+        ])
+        ms_d = eng._compute_recent_model_stats([c_big_slow], err_ts - 60, last_t2_error_ts=err_ts, slow_tps_th=40.0, slow_ttft_th=45.0)
+        self.assertFalse(ms_d[0].main_large_ctx_calibrated)
+        self.assertAlmostEqual(ms_d[0].main_adj_ttft_after_last_t2_median, 66.5, places=1)
+        _, grd_d, _, _, _ = eng._evaluate_health(
+            "Neon XHigh", {"503": 2, "timeout": 0, "403": 0, "retry": 0}, {"503": 2, "timeout": 0, "403": 0, "retry": 0},
+            0, False, False, 10, c_big_slow, model_stats=ms_d, last_t2_error_ts=err_ts, now_ts=now,
+        )
+        self.assertEqual(grd_d, "T2")
+
+    def test_v721_proxy_outage_burst_dedup_responseid_guard_and_account_history_isolation(self) -> None:
+        """v7.2.1 Module 3: retry.go capture, ResponseID Eof non-match, 127.0.0.1 googleapis allowlist, cache.go singleflight dedup, account/IDLE/history isolation, >30m idle-return burst detection & 300s+6step settle."""
+        from core.log_monitor import AccountQuotaInfo
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            def _glog(dt_s: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_s).strftime("%m%d %H:%M:%S.123456")
+            def _iso(dt_s: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_s, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+            log_path = root / "language_server.log"
+            # Part 1: False-positive traps (synthetic ResponseID containing "Eof", local MCP 127.0.0.1 non-google error, 10-gid singleflight cache.go storm)
+            trap_lines = [
+                f"ERROR: logging before google.Init: I{_glog(-200)} 201 http_helpers.go:709] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse ResponseID: demoRespEof123456789aA",
+                f"ERROR: logging before google.Init: E{_glog(-199)} 202 mcp.go:88] Post \"http://127.0.0.1:9999/mcp\": EOF",
+                f"ERROR: logging before google.Init: W{_glog(-198)} 203 http.go:10] http: TLS handshake error from 127.0.0.1:55501: EOF",
+            ]
+            # 10 goroutines emitting fetchUserInfo EOF in the exact same second (singleflight fanout -> collapses to 1 event!)
+            for g in range(300, 310):
+                trap_lines.append(
+                    f"ERROR: logging before google.Init: E{_glog(-150)} {g} cache.go:189] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo\": EOF"
+                )
+            log_path.write_text("\n".join(trap_lines) + "\n", encoding="utf-8")
+            tailer = LanguageServerLogTailer(log_path)
+            tailer.poll(now_ts=now)
+            cnt0, _, _, _ = tailer.get_proxy_outage_info(now, 30)
+            self.assertEqual(cnt0, 0)
+
+            # Part 2: Genuine cross-endpoint proxy outage at t-90s (including localhost HTTP proxy -> googleapis.com & retry.go)
+            real_burst = [
+                f"ERROR: logging before google.Init: E{_glog(-95)} 401 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": wsarecv -> 127.0.0.1:7890: forcibly closed by remote host",
+                f"ERROR: logging before google.Init: W{_glog(-92)} 402 run.go:317] Run: attempt 1 failed (stream reading error: unexpected EOF)",
+                f"ERROR: logging before google.Init: W{_glog(-90)} 403 retry.go:62] attempt 2 failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF",
+                f"ERROR: logging before google.Init: E{_glog(-88)} 404 client.go:88] Post \"https://play.googleapis.com/log\": EOF",
+            ]
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write("\n".join(real_burst) + "\n")
+            tailer.poll(now_ts=now)
+            recent_c, _, notable_c = tailer.get_counts(now, 30)
+            self.assertEqual(recent_c["retry"], 2)  # both run.go and retry.go captured
+            self.assertEqual(notable_c, [])         # retries NEVER pollute notable_events
+            cnt1, _s1, _e1, b1 = tailer.get_proxy_outage_info(now, 30)
+            self.assertGreaterEqual(cnt1, 3)
+            self.assertGreaterEqual(b1, 3)
+
+            # Part 3: End-to-end engine check:
+            # First test >30m idle-return hitting immediate proxy outage (only old step 45m ago -> MUST STILL warn live, not hide behind historical T0!)
+            cid = "prox0001-1111-2222-3333-444444444444"
+            tdir = root / "brain" / cid / ".system_generated" / "logs"
+            tdir.mkdir(parents=True)
+            tp = tdir / "transcript.jsonl"
+            tp.write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-2800)}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-2700), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 300}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": log_path,
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng._ledger.observe_online("ac***1", now - 3600)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***1", online=True, observed_at=now)
+            eng._last_account_poll = now
+            eng._baseline_ready = True  # verify genuine ZERO desktop alert spam (not first-poll mute!)
+            snap_live = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_live.grade, "WARN")
+            self.assertGreaterEqual(snap_live.proxy_outage_recent, 3)
+            self.assertIn("代理线路疑似断流", snap_live.sub_headline)
+            self.assertEqual(snap_live.alerts, [])
+
+            # Historical 'today' view MUST NOT escalate WARN solely for transient proxy outage
+            snap_hist = eng.poll(now_ts=now, force_account=False, history_range="today")
+            self.assertEqual(snap_hist.grade, "T0")
+
+            # Verify 300s + 5 steps stays WARN, then 300s + 6 steps settles cleanly back to green T0 with "已平复"!
+            t_settle = now + 260.0  # 348s after outage_e (-88s)
+            eng._last_account_poll = t_settle
+            eng._account_cache = AccountQuotaInfo(short_label="ac***1", online=True, observed_at=t_settle)
+            with tp.open("a", encoding="utf-8") as fh:
+                for idx in range(3, 8):  # 5 post-outage steps
+                    fh.write(json.dumps({"step_index": idx, "type": "PLANNER_RESPONSE", "created_at": _iso(10 + idx * 20), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 52000 + idx * 100, "output_tokens": 300}) + "\n")
+            snap_5 = eng.poll(now_ts=t_settle, force_account=False)
+            self.assertEqual(snap_5.grade, "WARN")
+            with tp.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"step_index": 8, "type": "PLANNER_RESPONSE", "created_at": _iso(200), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 55000, "output_tokens": 300}) + "\n")
+            snap_6 = eng.poll(now_ts=t_settle, force_account=False)
+            self.assertEqual(snap_6.grade, "T0")
+            self.assertEqual(snap_6.proxy_outage_recent, 0)
+            self.assertIn("已平复", snap_6.sub_headline)
+
+            # Switched new account MUST isolate prior account's proxy outage completely
+            t_switch = t_settle + 20.0
+            t_after_switch = t_switch + 20.0
+            eng._ledger.observe_online("ac***2", t_switch)
+            eng._last_account_poll = t_after_switch
+            eng._account_cache = AccountQuotaInfo(short_label="ac***2", online=True, observed_at=t_after_switch)
+            snap_new = eng.poll(now_ts=t_after_switch, force_account=False)
+            self.assertEqual(snap_new.proxy_outage_recent, 0)
+            self.assertEqual(snap_new.grade, "WAIT")
+
+            # Offline IDLE MUST clear proxy outage fields
+            t_idle = t_after_switch + 60.0
+            eng._last_account_poll = t_idle
+            eng._account_cache = AccountQuotaInfo(short_label="离线", online=False, observed_at=t_idle)
+            snap_idle = eng.poll(now_ts=t_idle, force_account=False)
+            self.assertEqual(snap_idle.grade, "IDLE")
+            self.assertEqual(snap_idle.proxy_outage_recent, 0)
+            self.assertEqual(snap_idle.proxy_outage_note, "")
+
+    def test_v721_adaptive_daily_steps_limits_ledger_persistence_and_no_chase_today(self) -> None:
+        """v7.2.1 Module 5: adaptive daily step limits (including old-peak vs newer-degrade chronology), end-to-end historical transcript scan (CHECKPOINT + tool_calls immunity + no chasing today), corrupt ledger tolerance & activity-based 32-account eviction."""
+        from core.log_monitor import AccountQuotaInfo, compute_adaptive_daily_steps_limits
+
+        # 1. Pure algorithm checks (including old-peak vs newer-degrade chronology!)
+        w0, a0, m0, _, p0 = compute_adaptive_daily_steps_limits(960, 1200, [])
+        self.assertEqual((w0, a0, m0, p0), (960, 1200, "default", 0))
+
+        # Proven healthy 1400 steps -> 1400*1.15=1610 -> ceil_100=1700, warn=1360
+        w1, a1, m1, n1, p1 = compute_adaptive_daily_steps_limits(
+            960, 1200, [{"date": "2026-11-21", "safe_steps": 1400, "degraded_at": None}]
+        )
+        self.assertEqual((w1, a1, m1, p1), (1360, 1700, "adaptive_up", 1400))
+        self.assertIn("1400", n1)
+
+        # Older healthy high (1500) followed by NEWER degradation at 800 MUST tighten to 650 (NEVER boost to 1800!)
+        w_od, a_od, m_od, _, _ = compute_adaptive_daily_steps_limits(
+            960, 1200,
+            [
+                {"date": "2026-11-18", "safe_steps": 1500, "degraded_at": None},
+                {"date": "2026-11-21", "safe_steps": 799, "degraded_at": 800},
+            ],
+        )
+        self.assertEqual((w_od, a_od, m_od), (520, 650, "adaptive_down"))
+
+        # Older healthy 1100 followed by NEWER degradation at 800 MUST tighten (not fall back to default!)
+        w_od2, a_od2, m_od2, _, _ = compute_adaptive_daily_steps_limits(
+            960, 1200,
+            [
+                {"date": "2026-11-18", "safe_steps": 1100, "degraded_at": None},
+                {"date": "2026-11-21", "safe_steps": 799, "degraded_at": 800},
+            ],
+        )
+        self.assertEqual((w_od2, a_od2, m_od2), (520, 650, "adaptive_down"))
+
+        # Cold-start degradation at step 9 (<400) MUST NOT tighten baseline
+        w3, a3, m3, _, _ = compute_adaptive_daily_steps_limits(
+            960, 1200, [{"date": "2026-11-20", "safe_steps": 8, "degraded_at": 9}]
+        )
+        self.assertEqual((w3, a3, m3), (960, 1200, "default"))
+
+        # Later healthy recovery surpassing old degradation clears old tightening & scales up
+        w4, a4, m4, _, p4 = compute_adaptive_daily_steps_limits(
+            960, 1200,
+            [
+                {"date": "2026-11-18", "safe_steps": 500, "degraded_at": 600},
+                {"date": "2026-11-21", "safe_steps": 1500, "degraded_at": None},
+            ],
+        )
+        self.assertEqual((w4, a4, m4, p4), (1440, 1800, "adaptive_up", 1500))
+
+        # 2. AccountSwitchLedger persistence, corrupt JSON/UTF-8 resilience, case-insensitive merge & activity eviction
+        with tempfile.TemporaryDirectory() as td:
+            lp = Path(td) / "account_ledger.json"
+            # Corrupt non-dict JSON & invalid UTF-8 must NOT crash startup
+            lp.write_text("null", encoding="utf-8")
+            self.assertEqual(AccountSwitchLedger(ledger_path=lp, read_only=True).get_account_daily_profiles("al***1"), {})
+            lp.write_bytes(b"\xff\xfe\x00invalid")
+            self.assertEqual(AccountSwitchLedger(ledger_path=lp, read_only=True).get_account_daily_profiles("al***1"), {})
+            lp.unlink()
+
+            lgr_ro = AccountSwitchLedger(ledger_path=lp, read_only=True)
+            lgr_ro.record_daily_step_profile("al***1", "2026-11-21", 1400, is_healthy=True, is_degraded=False)
+            self.assertFalse(lp.exists())
+
+            lgr = AccountSwitchLedger(ledger_path=lp, read_only=False)
+            lgr.record_daily_step_profile("alpha1@example.com", "2026-11-21", 1400, is_healthy=True, is_degraded=False)
+            raw_txt = lp.read_text(encoding="utf-8")
+            self.assertNotIn("alpha1@example.com", raw_txt)
+            self.assertIn("al***1", raw_txt)
+            # Add 33 older inactive accounts -> active main al***1 (2026-11-21) MUST survive eviction!
+            for idx in range(33):
+                lgr.record_daily_step_profile(f"z{idx:02d}***9", "2026-10-01", 200, is_healthy=True, is_degraded=False)
+            self.assertIn("2026-11-21", lgr.get_account_daily_profiles("al***1"))
+            self.assertLessEqual(len(lgr._daily_step_profiles), 32)
+
+        # 3. End-to-end engine historical transcript scan (yesterday 1350 healthy steps with CHECKPOINT + tool_calls fake model key) AND no chasing today's live steps!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            today_start = datetime.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            yest_base = today_start - 7200.0
+            cid_h = "hist0001-1111-2222-3333-444444444444"
+            hdir = root / "brain" / cid_h / ".system_generated" / "logs"
+            hdir.mkdir(parents=True)
+            def _iso_ts(ts_v: float) -> str:
+                return datetime.datetime.fromtimestamp(ts_v, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            lines_h = [json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso_ts(yest_base - 10)})]
+            for i in range(1, 1301):
+                # Include a CHECKPOINT + moderate 0.80x shrink at step 500 and a tool_calls blob containing a fake "model" key!
+                if i == 500:
+                    lines_h.append(json.dumps({"step_index": i, "type": "CHECKPOINT", "created_at": _iso_ts(yest_base + i * 2 - 1)}))
+                    lines_h.append(json.dumps({"step_index": i, "type": "PLANNER_RESPONSE", "created_at": _iso_ts(yest_base + i * 2), "model": "gemini-4-neon-xhigh", "input_tokens": 80000, "cache_read_tokens": 0, "output_tokens": 300}))
+                else:
+                    lines_h.append(json.dumps({"step_index": i, "type": "PLANNER_RESPONSE", "created_at": _iso_ts(yest_base + i * 2), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 300, "tool_calls": [{"arguments": {"model": "fake-tool-model"}}]}))
+            # Add 5 live steps today
+            for j in range(5):
+                lines_h.append(json.dumps({"step_index": 1301 + j, "type": "PLANNER_RESPONSE", "created_at": _iso_ts(now - 60 + j * 10), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 300}))
+            (hdir / "transcript.jsonl").write_text("\n".join(lines_h) + "\n", encoding="utf-8")
+
+            eng_h = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "language_server.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng_h._account_cache = AccountQuotaInfo(short_label="de***5", online=True, observed_at=now)
+            eng_h._last_account_poll = now
+            snap_h = eng_h.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_h.daily_steps_limit_mode, "adaptive_up")
+            self.assertEqual(snap_h.account_hist_safe_peak, 1300)
+            self.assertEqual(snap_h.daily_steps_alert, 1500)  # ceil(1300*1.15/100)*100 = 1500
+            self.assertEqual(snap_h.today_steps, 5)
+
+    def test_v721_ui_log_cells_orange_banner_tooltips_update_modes_and_detail_window_width_lock(self) -> None:
+        """v7.2.1 UI & Updater: heavy-media timeout cell orange (not red), proxy outage lights retry & orange banner, historical retry unlit, KPI2 title calibration zero-clipping (reqwidth<=width), default 'download' update mode (no forced restart) & failure alert."""
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            ConversationDetailPoint,
+            ConversationDetailReport,
+            ConversationSummary,
+            ModelPerfStats,
+            MonitorSnapshot,
+            StepRecord,
+            format_detail_text_report,
+            format_text_summary,
+        )
+        from dataclasses import replace
+
+        from core.config_store import sanitize_config
+        from core.updater import UpdateApplyResult, UpdateCheckResult
+        from ui.capsule_app import AntigravityCapsuleApp
+        from ui.detail_window import ConversationDetailWindow
+        from ui.themes import THEMES
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg_store = ConfigStore(root / "cfg.json")
+            # Default config must use "download" mode (download in background, apply on next launch)
+            default_cfg = cfg_store.load()
+            self.assertEqual(default_cfg["update_mode"], "download")
+            self.assertFalse(default_cfg["auto_update_restart"])
+            # Legacy auto_update_restart=True migrates cleanly to "auto_restart"
+            migrated = sanitize_config({"auto_update_restart": True})
+            self.assertEqual(migrated["update_mode"], "auto_restart")
+            self.assertTrue(migrated["auto_update_restart"])
+
+            eng = AntigravityMonitorEngine(read_only=True)
+            app = AntigravityCapsuleApp(
+                app_root=Path(__file__).resolve().parent.parent,
+                config_store=cfg_store,
+                engine=eng,
+                enable_tray=False,
+                start_minimized_override=False,
+            )
+            dw = None
+            try:
+                app.root.withdraw()
+                now = time.time()
+                c_big = ConversationSummary(
+                    conversation_id="big473-0001", short_id="big473",
+                    model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                    context_tokens=473_800, max_context_tokens=512_000,
+                    latest_hit_rate=99.5, latest_cached_in=471_400, latest_uncached_in=2_400,
+                    latest_timestamp=now - 5,
+                    recent_steps=[StepRecord(1, now - 5, "gemini-4-neon-xhigh", 2400, 471400, 500, 473800, 99.5, "hit", "cached")],
+                    consec_miss=0, consec_miss_start_step=0, single_miss=False, wasted_cold_tokens=0,
+                    freshness_remaining_sec=190, ttft_sec=59.0, tps=210.0, speed_status="ok",
+                    ttft_avg_sec=48.0, ttft_max_sec=88.0, large_ctx_ttft_allowance_sec=28.9, title="超大上下文测试",
+                )
+                ms = ModelPerfStats(
+                    model="Neon XHigh", step_count=10, hit_count=10, abnormal_miss_count=0,
+                    ttft_avg_sec=48.0, ttft_max_sec=88.0, latest_ttft_sec=59.0, tps_avg=210.0,
+                    latest_timestamp=now - 5, steps_after_last_t2=6, main_steps_after_last_t2=6,
+                    main_ttft_after_last_t2_median=55.0, main_adj_ttft_after_last_t2_median=26.1,
+                    main_large_ctx_calibrated=True,
+                )
+                snap = MonitorSnapshot(
+                    generated_at=now, level="orange", grade="WARN", headline="留意预警 · Neon XHigh",
+                    sub_headline="代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流) / 多图上传超时 (10m) · demo01 (2次)，建议压图或/compact",
+                    active_model="Neon XHigh", primary_hit_rate=99.5, primary_hit_classification="hit",
+                    primary_tps=210.0, primary_ttft=59.0, primary_speed_status="ok",
+                    min_freshness_sec=190, min_freshness_conv="big473", min_freshness_ctx=473800,
+                    min_freshness_invalid_reason="", today_steps=1100, daily_steps_warn=1280, daily_steps_alert=1600,
+                    active_conversations=[c_big], large_freshness_list=[c_big],
+                    recent_503=0, today_503=0, recent_timeout=2, today_timeout=2,
+                    recent_403=0, today_403=0, recent_retry=2, today_retry=2,
+                    recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+                    account=AccountQuotaInfo(short_label="de***6", online=True, observed_at=now),
+                    sliding_window_min=30, freshness_window_sec=210, model_stats=[ms],
+                    resolved_account="de***6", steps_scope_label="de***6",
+                    heavy_media_timeout_recent=2, proxy_outage_recent=12,
+                    proxy_outage_note="代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流)",
+                    daily_steps_limit_mode="adaptive_up", daily_steps_limit_note="按历史安全峰值 1400 步自适应上调",
+                    daily_steps_base_alert=1200, account_hist_safe_peak=1400,
+                )
+                app.set_expanded(True)
+                app.render_snapshot(snap)
+                app.root.update()
+                t = app.theme
+                self.assertEqual(app._log_cells["timeout"]["val"].cget("fg"), t["orange"])
+                self.assertEqual(app._log_cells["retry"]["val"].cget("fg"), t["orange"])
+                self.assertEqual(app._lbl_banner.cget("fg"), t["orange"])
+                self.assertIn("自适应", app._lbl_steps_title.cget("text"))
+                self.assertIn("1400", app._steps_hover_text)
+                self.assertIn("大上下文校准", app._conv_hover_texts[0])
+                self.assertIn("[大窗校准]", app._speed_hover_text)
+                txt_sum = format_text_summary(snap)
+                self.assertIn("[自适应·按历史安全峰值 1400 步自适应上调]", txt_sum)
+                self.assertIn("多图超时:", txt_sum)
+                self.assertIn("代理状态:", txt_sum)
+
+                # Historical view with proxy_outage_recent > 0 & retry < 5 MUST NOT light retry cell orange
+                snap_h = replace(snap, is_historical_rating=True, grade="T0", level="green")
+                app.render_snapshot(snap_h)
+                app.root.update()
+                self.assertEqual(app._log_cells["retry"]["val"].cget("fg"), t["text_primary"])
+
+                # Update modes: default "download" prepares update without forcing restart; failure ALWAYS notifies tray!
+                notified_msgs = []
+                class _FakeTray:
+                    def refresh_menu(self) -> None:
+                        pass
+                    def notify(self, title: str, msg: str) -> None:
+                        notified_msgs.append((title, msg))
+                    def stop(self) -> None:
+                        pass
+                app.tray = _FakeTray()
+                restarted = []
+                app._on_restart = lambda: restarted.append(True)
+                app._on_update_apply_done(
+                    UpdateApplyResult(ok=True, method="zip", from_version="7.2.1", to_version="7.3.0", needs_restart=True),
+                    auto_triggered=True,
+                    expected_version="7.3.0",
+                    restart_on_done=False,
+                )
+                self.assertEqual(app._downloaded_ready_version, "7.3.0")
+                self.assertEqual(app._btn_update_now.cget("text"), "立即重启")
+                self.assertIn("下次启动自动生效", app._lbl_update_banner.cget("text"))
+                self.assertEqual(restarted, [])
+                # Failure notification fires even when window is visible & expanded!
+                app._on_update_apply_done(
+                    UpdateApplyResult(ok=False, method="zip", from_version="7.2.1", to_version="7.3.0", error="写入更新文件失败并已自动回滚（目录无写权限，建议移出 Program Files 等受保护目录）: PermissionError"),
+                    auto_triggered=False,
+                    expected_version="7.3.0",
+                    restart_on_done=True,
+                )
+                self.assertTrue(any("更新异常提醒" in ttl and "Program Files" in msg for ttl, msg in notified_msgs))
+
+                # Detail window keeps locked width & KPI2 title + sub BOTH fit without horizontal clipping!
+                pt = ConversationDetailPoint(
+                    1, now - 10, "Neon XHigh", 473800, 1200, 2400, 471400, 500, 99.5, "hit", "cached",
+                    ttft_sec=59.0, tps=210.0, streaming_sec=2.4,
+                )
+                rep = ConversationDetailReport(
+                    conversation_id="big473-0001", short_id="big473", is_subagent=False,
+                    model="Neon XHigh", model_raw="gemini-4-neon-xhigh", total_steps=1, today_steps=1,
+                    peak_context_tokens=473800, latest_context_tokens=473800, latest_context_delta=1200,
+                    max_context_tokens=512000, compact_count=0, cache_hit_steps=1, abnormal_miss_steps=0,
+                    expected_cold_steps=0, overall_cacheable_hit_ratio=1.0, avg_ttft_sec=59.0,
+                    p95_ttft_sec=119.7, max_ttft_sec=218.5, avg_tps=210.0, latest_tps=210.0, latest_ttft_sec=59.0,
+                    freshness_remaining_sec=190, freshness_invalid_reason="", freshness_window_sec=210,
+                    points=[pt], title="超大上下文测试",
+                )
+                self.assertIn("大上下文校准:", format_detail_text_report(rep))
+                dw = ConversationDetailWindow(
+                    parent=app.root, theme=THEMES["midnight_blue"],
+                    load_report=lambda _cid: rep, on_toggle_pin=lambda _cid: None, is_pinned_fn=lambda _cid: False,
+                )
+                dw.win.withdraw()
+                locked = dw._lock_window_size()
+                dw.show_conversation("big473-0001", place_near_parent=False)
+                dw.win.update()
+                self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), locked)
+                self.assertIn("+29s校", dw._kpi_cards[2]["title"].cget("text"))
+                self.assertLessEqual(dw._kpi_cards[2]["title"].winfo_reqwidth(), dw._kpi_cards[2]["title"].winfo_width() + 2)
+                self.assertLessEqual(dw._kpi_cards[2]["sub"].winfo_reqwidth(), dw._kpi_cards[2]["sub"].winfo_width() + 2)
+            finally:
+                if dw is not None:
+                    dw.close()
                 app.shutdown()
 
 

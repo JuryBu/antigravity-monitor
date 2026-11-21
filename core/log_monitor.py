@@ -15,6 +15,7 @@ import ctypes
 from ctypes import wintypes
 import datetime
 import json
+import math
 import os
 import re
 import sqlite3
@@ -44,7 +45,18 @@ from core.slot_manager import (
 from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, parse_pb_map
 
 EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
-RETRY_RE = re.compile(r"(?:^|[\s\[/\\])run\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
+RETRY_RE = re.compile(r"(?:^|[\s\[/\\])(?:run|retry)\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
+_PROXY_EOF_RE = re.compile(
+    r"(?:\bunexpected\s+eof\b|:\s*eof\b|\bforcibly closed\b|\bconnection reset\b|\bbroken pipe\b)",
+    re.IGNORECASE,
+)
+_PROXY_IGNORED_SOURCES = frozenset({"runner.go", "llm_monitor.go", "extract_searchable_content.go"})
+_FAST_CREATED_AT_RE = re.compile(r'"created_at"\s*:\s*"([^"]+)"')
+_FAST_STEP_IDX_RE = re.compile(r'"step_index"\s*:\s*(\d+)')
+_FAST_MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]*)"')
+_FAST_IN_TOK_RE = re.compile(r'"input_tokens"\s*:\s*(\d+)')
+_FAST_CR_TOK_RE = re.compile(r'"cache_read_tokens"\s*:\s*(\d+)')
+_FAST_OUT_TOK_RE = re.compile(r'"output_tokens"\s*:\s*(\d+)')
 # Strip Go/glog wrapper prefix so timestamp microseconds (e.g. .350309) and "ERROR: logging before google.Init:" never false-match!
 GLOG_PREFIX_RE = re.compile(
     r"^(?:ERROR:\s+logging before google\.Init:\s+)?([IWEF])(\d{2})(\d{2})\s+(\d{2}:\d{2}:\d{2})(?:\.(\d+))?\s+(\d+)\s+([^\]]+)\]\s*(.*)$"
@@ -90,6 +102,88 @@ def _is_light_immune_model(model_name: str) -> bool:
     """Lightweight models (Hydrogen / Flash) are largely immune to flagship T1/T2 throttling and must not whitewash flagship T2."""
     low = (model_name or "").lower()
     return ("hydrogen" in low) or ("flash" in low)
+
+
+def compute_large_ctx_ttft_allowance(context_tokens: int, max_context_tokens: int = 512000) -> float:
+    """Return bounded natural TTFT allowance (0..30s) when approaching the 512K compaction window.
+
+    Calibrated from 6,424 local main-conversation steps: pure-text cached P90 stays flat <=32s
+    up to 360K, then climbs sharply to 50.6s (360-420K) and 59.1s (420K+) even at >=200 t/s.
+    Hard floor at 300K guarantees zero impact on <300K conversations and 200K-window models.
+    """
+    ctx = int(context_tokens or 0)
+    if ctx < 300_000:
+        return 0.0
+    cap = int(max_context_tokens or 0)
+    eff_ratio = ctx / 512_000.0
+    if cap >= 300_000:
+        eff_ratio = max(eff_ratio, ctx / float(cap))
+    r_start = 300_000.0 / 512_000.0  # 0.5859375
+    r_knee = 360_000.0 / 512_000.0   # 0.703125
+    r_cap = 480_000.0 / 512_000.0    # 0.9375
+    if eff_ratio <= r_start:
+        return 0.0
+    if eff_ratio <= r_knee:
+        val = 10.0 * (eff_ratio - r_start) / (r_knee - r_start)
+    else:
+        val = 10.0 + 20.0 * min(1.0, (eff_ratio - r_knee) / (r_cap - r_knee))
+    return round(min(30.0, max(0.0, val)), 1)
+
+
+def compute_adaptive_daily_steps_limits(
+    base_warn: int,
+    base_alert: int,
+    history_days: List[Dict[str, Any]],
+) -> Tuple[int, int, str, str, int]:
+    """Adapt per-account daily step protection thresholds from strictly completed historical days.
+
+    Uses ``base_alert`` (default 1200) / ``base_warn`` (default 960) as the initial baseline:
+    - Never chases today's live step count (only completed days strictly earlier than today qualify).
+    - Scales up smoothly (+15% rounded up to nearest 100, capped at max(3x base, 5000)) when an
+      account has proven healthy full-day capacity above ``base_alert``.
+    - Tightens conservatively (85% of first high-volume degradation step >=400, floor 600) if an
+      account degraded after running high volume and has not subsequently surpassed it healthily.
+    Returns ``(eff_warn, eff_alert, mode, note, hist_safe_peak)``.
+    """
+    b_alert = max(50, int(base_alert))
+    b_warn = max(1, min(b_alert - 1, int(base_warn)))
+    warn_ratio = min(0.95, max(0.50, float(b_warn) / float(b_alert)))
+
+    hist_safe_peak = 0
+    latest_high_deg_date = ""
+    latest_high_deg_steps: Optional[int] = None
+    ordered = sorted(
+        (d for d in (history_days or []) if isinstance(d, dict) and d.get("date")),
+        key=lambda d: str(d.get("date", "")),
+    )
+    for rec in ordered:
+        d_str = str(rec.get("date", ""))
+        safe_s = max(0, int(rec.get("safe_steps", 0) or 0))
+        deg_raw = rec.get("degraded_at")
+        deg_at = max(1, int(deg_raw)) if deg_raw is not None else None
+        if deg_at is None:
+            if safe_s > hist_safe_peak:
+                hist_safe_peak = safe_s
+            if latest_high_deg_steps is not None and d_str > latest_high_deg_date and safe_s >= latest_high_deg_steps:
+                latest_high_deg_steps = None
+                latest_high_deg_date = ""
+        elif deg_at >= 400:
+            latest_high_deg_date = d_str
+            latest_high_deg_steps = deg_at
+
+    if hist_safe_peak > b_alert and latest_high_deg_steps is None:
+        raw_target = int(math.ceil((hist_safe_peak * 1.15) / 100.0) * 100)
+        eff_alert = min(max(b_alert * 3, 5000), max(b_alert, raw_target))
+        eff_warn = max(1, min(eff_alert - 1, int(round((eff_alert * warn_ratio) / 10.0) * 10)))
+        return eff_warn, eff_alert, "adaptive_up", f"按历史安全峰值 {hist_safe_peak} 步自适应上调", hist_safe_peak
+
+    if latest_high_deg_steps is not None and latest_high_deg_steps < b_alert:
+        eff_alert = max(600, min(b_alert, int(math.floor((latest_high_deg_steps * 0.85) / 50.0) * 50)))
+        if eff_alert < b_alert:
+            eff_warn = max(1, min(eff_alert - 1, int(round((eff_alert * warn_ratio) / 10.0) * 10)))
+            return eff_warn, eff_alert, "adaptive_down", f"按历史 {latest_high_deg_steps} 步曾降档保守收紧", hist_safe_peak
+
+    return b_warn, b_alert, "default", "初始建议值", hist_safe_peak
 TOS_403_RE = re.compile(
     r"(?:"
     r"tos_violation"
@@ -500,6 +594,7 @@ class ConversationSummary:
     active_media_bytes: int = 0
     media_ttft_exempted: bool = False
     is_carryover_preview: bool = False
+    large_ctx_ttft_allowance_sec: float = 0.0
     _scoped_steps_all: List[StepRecord] = field(default_factory=list, repr=False, compare=False)
     _scoped_gens_all: List[Optional[Any]] = field(default_factory=list, repr=False, compare=False)
 
@@ -567,6 +662,11 @@ class LogEvent:
     summary: str
     event_key: str
     model: str = ""
+    duration_sec: Optional[float] = None
+    is_heavy_media_timeout: bool = False
+    media_count: int = 0
+    media_bytes: int = 0
+    culprit_cid: str = ""
 
 
 @dataclass(frozen=True)
@@ -588,6 +688,12 @@ class ModelPerfStats:
     main_ttft_after_last_t2_median: Optional[float] = None
     main_ttft_after_last_t2_latest: Optional[float] = None
     main_ttft_after_last_t2_recent2_max: Optional[float] = None
+    main_adj_ttft_after_last_t2_median: Optional[float] = None
+    main_adj_ttft_after_last_t2_latest: Optional[float] = None
+    main_adj_ttft_after_last_t2_recent2_max: Optional[float] = None
+    main_media_exempt_post_steps: int = 0
+    main_unexempt_ttft_steps_after_last_t2: int = 0
+    main_large_ctx_calibrated: bool = False
 
 
 @dataclass
@@ -693,6 +799,13 @@ class MonitorSnapshot:
     is_host_idle_offline: bool = False
     primary_hit_reason: str = ""
     carryover_conversations: List[ConversationSummary] = field(default_factory=list)
+    heavy_media_timeout_recent: int = 0
+    proxy_outage_recent: int = 0
+    proxy_outage_note: str = ""
+    daily_steps_limit_mode: str = "default"
+    daily_steps_limit_note: str = ""
+    daily_steps_base_alert: int = 1200
+    account_hist_safe_peak: int = 0
 
 
 HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
@@ -935,6 +1048,65 @@ class LanguageServerLogTailer:
         self._block_emitted_cats: set[str] = set()
         self._skip_continuation_lines: int = 0
         self._skip_brace_depth: int = 0
+        # Bounded cross-endpoint proxy outage burst tracking (separated from notable events so single retry stays clean)
+        self._proxy_eof_events: Deque[Tuple[float, str, str]] = deque(maxlen=256)
+        self._proxy_eof_dedup: "OrderedDict[Tuple[str, str, int], float]" = OrderedDict()
+
+    @staticmethod
+    def _classify_proxy_bucket(src_base: str, body_low: str) -> str:
+        if (
+            "streamgeneratecontent" in body_low
+            or "generatecontent" in body_low
+            or "stream reading error" in body_low
+            or src_base in ("run.go", "retry.go")
+        ):
+            return "stream"
+        if "fetchuserinfo" in body_low or src_base == "cache.go":
+            return "userinfo"
+        if "play.googleapis.com" in body_low:
+            return "playlog"
+        if "recordtrajectoryanalytics" in body_low or src_base == "telemetry.go" or "clearcut" in body_low:
+            return "telemetry"
+        if (
+            "listexperiments" in body_low
+            or "fetchconfig" in body_low
+            or "loadcodeassist" in body_low
+            or "fetchavailablemodels" in body_low
+        ):
+            return "experiments"
+        return "other_google"
+
+    def _record_proxy_eof_if_matched(
+        self,
+        ts: float,
+        goroutine_id: str,
+        src_base: str,
+        body: str,
+        body_low: str,
+    ) -> None:
+        if not (
+            "googleapis.com" in body_low
+            or "stream reading error" in body_low
+            or "streamgeneratecontent" in body_low
+            or "fetchuserinfo" in body_low
+        ):
+            return
+        if _PROXY_EOF_RE.search(body) is None:
+            return
+        bucket = self._classify_proxy_bucket(src_base, body_low)
+        gid_tag = goroutine_id or src_base
+        # Collapse singleflight fanout storms (e.g. cache.go:189 emitting 17 fetchUserInfo EOFs in the same millisecond)
+        if bucket == "stream":
+            dedup_key = ("stream", gid_tag, int(ts))
+        else:
+            dedup_key = (bucket, "", int(ts // 2))
+        if dedup_key in self._proxy_eof_dedup:
+            return
+        self._proxy_eof_dedup[dedup_key] = ts
+        self._proxy_eof_dedup.move_to_end(dedup_key)
+        while len(self._proxy_eof_dedup) > 128:
+            self._proxy_eof_dedup.popitem(last=False)
+        self._proxy_eof_events.append((ts, bucket, gid_tag))
 
     @staticmethod
     def _source_base_name(source: str) -> str:
@@ -1036,6 +1208,8 @@ class LanguageServerLogTailer:
             self._block_emitted_cats.clear()
             self._skip_continuation_lines = 0
             self._skip_brace_depth = 0
+            self._proxy_eof_events.clear()
+            self._proxy_eof_dedup.clear()
 
         if size == self._offset and self._initialized:
             return
@@ -1080,7 +1254,9 @@ class LanguageServerLogTailer:
         if not line:
             return None
         low_full = line.lower()
-        if "127.0.0.1" in low_full or "localhost" in low_full or "tls handshake error" in low_full:
+        if "tls handshake error" in low_full:
+            return None
+        if ("127.0.0.1" in low_full or "localhost" in low_full) and "googleapis.com" not in low_full:
             return None
 
         ts, severity_ch, goroutine_id, source, body = self._split_header_meta(line, fallback_ts, is_cold_start=is_cold_start)
@@ -1110,6 +1286,22 @@ class LanguageServerLogTailer:
         src_low = source.lower()
         src_base = self._source_base_name(source)
         body_low = body.lower()
+        # Capture cross-endpoint proxy disconnect bursts BEFORE non-inference early returns
+        # (with O(1) keyword short-circuit and strict ResponseID exclusion).
+        if (
+            effective_ts > 0.0
+            and src_base not in _PROXY_IGNORED_SOURCES
+            and "responseid:" not in body_low
+            and "context canceled" not in body_low
+            and "shutting down" not in body_low
+            and (
+                "eof" in body_low
+                or "forcibly closed" in body_low
+                or "connection reset" in body_low
+                or "broken pipe" in body_low
+            )
+        ):
+            self._record_proxy_eof_if_matched(effective_ts, goroutine_id, src_base, body, body_low)
         is_ignored_source = any(ign in src_low or ign in body_low[:80] for ign in IGNORED_LOG_SOURCES)
         is_non_inference_rpc = any(marker in body_low for marker in NON_INFERENCE_RPC_MARKERS)
         is_non_inference_403_poll = (
@@ -1151,6 +1343,7 @@ class LanguageServerLogTailer:
 
         category: Optional[str] = None
         label = ""
+        parsed_dur_sec: Optional[float] = None
         m_to = STREAM_TIMEOUT_RE.search(body)
         if TOS_403_RE.search(body):
             category = "403"
@@ -1164,6 +1357,7 @@ class LanguageServerLogTailer:
                 category = None
             else:
                 category = "timeout"
+                parsed_dur_sec = dur_sec
                 norm_dur = re.sub(r"^(\d+h)?(\d+m)0s$", lambda mm: (mm.group(1) or "") + mm.group(2), raw_dur) if raw_dur else ""
                 if norm_dur.endswith("0m") and "h" in norm_dur:
                     norm_dur = norm_dur[:-2]
@@ -1234,7 +1428,13 @@ class LanguageServerLogTailer:
             clean_detail = clean_detail[:93] + "..."
         summary = f"[{hm}] {label}"
         event_key = f"log:{category}:{int(effective_ts)}:{hash(clean_detail) & 0xFFFF:04x}"
-        return LogEvent(timestamp=effective_ts, category=category, summary=summary, event_key=event_key)
+        return LogEvent(
+            timestamp=effective_ts,
+            category=category,
+            summary=summary,
+            event_key=event_key,
+            duration_sec=parsed_dur_sec,
+        )
 
     @staticmethod
     def _split_header_meta(line: str, fallback_ts: float, is_cold_start: bool = False) -> Tuple[Optional[float], str, str, str, str]:
@@ -1278,6 +1478,7 @@ class LanguageServerLogTailer:
         account_filter_fn: Optional[Callable[[float], bool]] = None,
         range_start_ts: Optional[float] = None,
         range_end_ts: Optional[float] = None,
+        max_notable: Optional[int] = 3,
     ) -> Tuple[Dict[str, int], Dict[str, int], List[LogEvent]]:
         win_end = range_end_ts if range_end_ts is not None else now_ts
         default_start = win_end - max(1, window_min) * 60
@@ -1300,7 +1501,67 @@ class LanguageServerLogTailer:
                 if ev.category in ("503", "timeout", "403"):
                     in_window_notable.append(ev)
 
-        return recent, today, in_window_notable[-3:]
+        if max_notable is not None:
+            return recent, today, (in_window_notable[-max_notable:] if max_notable > 0 else [])
+        return recent, today, in_window_notable
+
+    def get_proxy_outage_info(
+        self,
+        now_ts: float,
+        window_min: int,
+        account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
+    ) -> Tuple[int, float, float, int]:
+        """Detect a 60s cross-endpoint / multi-stream proxy disconnect burst within the active account & window.
+
+        Returns ``(burst_event_count, outage_start_ts, outage_end_ts, distinct_buckets)`` for the latest burst,
+        or ``(0, 0.0, 0.0, 0)`` if no genuine proxy outage occurred.
+        """
+        win_end = range_end_ts if range_end_ts is not None else now_ts
+        default_start = win_end - max(1, window_min) * 60
+        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
+        evs: List[Tuple[float, str, str]] = []
+        for ts, bucket, gid in self._proxy_eof_events:
+            if account_filter_fn is not None and not account_filter_fn(ts):
+                continue
+            if cutoff <= ts <= win_end + 2.0:
+                evs.append((ts, bucket, gid))
+        if len(evs) < 3:
+            return 0, 0.0, 0.0, 0
+        evs.sort(key=lambda x: x[0])
+
+        best_end_ts = 0.0
+        best_start_ts = 0.0
+        best_count = 0
+        best_buckets = 0
+        left = 0
+        for right in range(len(evs)):
+            r_ts = evs[right][0]
+            while left < right and (r_ts - evs[left][0]) > 60.0:
+                left += 1
+            cnt = right - left + 1
+            if cnt < 3:
+                continue
+            win_slice = evs[left : right + 1]
+            buckets = {b for _, b, _ in win_slice}
+            stream_gids = {g for _, b, g in win_slice if b == "stream"}
+            if len(buckets) >= 2 or len(stream_gids) >= 3:
+                # Track the latest burst window; if extending the same 60s burst, accumulate max coverage
+                if r_ts >= best_end_ts:
+                    if best_end_ts > 0.0 and (r_ts - best_end_ts) <= 60.0:
+                        best_end_ts = r_ts
+                        best_count = max(best_count, cnt)
+                        best_buckets = max(best_buckets, len(buckets))
+                    else:
+                        best_start_ts = evs[left][0]
+                        best_end_ts = r_ts
+                        best_count = cnt
+                        best_buckets = len(buckets)
+        if best_count < 3:
+            return 0, 0.0, 0.0, 0
+        return best_count, best_start_ts, best_end_ts, best_buckets
 
     def get_machine_today_counts(self, now_ts: float) -> Dict[str, int]:
         today_start = datetime.datetime.fromtimestamp(now_ts).replace(
@@ -1392,7 +1653,11 @@ class AntigravityMonitorEngine:
         self.summaries_db_path: Path = Path(summaries_db_path) if summaries_db_path is not None else (self.conversations_dir.parent / "conversation_summaries.db")
         self._lock = threading.RLock()
         self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]]" = OrderedDict()
-        self._transcript_error_ts: "OrderedDict[str, List[Tuple[float, str]]]" = OrderedDict()
+        self._transcript_error_ts: "OrderedDict[str, List[Tuple[float, str, int, int, int]]]" = OrderedDict()
+        self._transcript_tail_meta: "OrderedDict[str, Tuple[List[Tuple[float, int, int, int]], int, int, int]]" = OrderedDict()
+        self._hist_daily_profiles_cache_key: Tuple[str, int] = ("", -1)
+        self._hist_daily_profiles_cache_ts: float = 0.0
+        self._hist_daily_profiles_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
         self._full_align_cache: "OrderedDict[Tuple[str, Tuple[int, int], int, int], List[Optional[Any]]]" = OrderedDict()
         self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
@@ -1496,6 +1761,7 @@ class AntigravityMonitorEngine:
                 for cid in res.removed_cids:
                     self._transcript_cache.pop(cid, None)
                     self._transcript_error_ts.pop(cid, None)
+                    self._transcript_tail_meta.pop(cid, None)
                 if update_summary:
                     hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
                     tag = "手动清理" if trigger == "manual" else "自动让位"
@@ -1891,10 +2157,12 @@ class AntigravityMonitorEngine:
     ) -> None:
         snap: Optional[ConversationDbSnapshot] = self._db_reader.read(c.conversation_id)
         if not snap:
+            c.large_ctx_ttft_allowance_sec = compute_large_ctx_ttft_allowance(c.context_tokens, c.max_context_tokens)
             return
         if snap.is_subagent_hint and not self._transcript_cache.get(c.conversation_id, (None, [], False, False))[2]:
             c.is_subagent = True
         c.max_context_tokens = snap.max_context_tokens
+        c.large_ctx_ttft_allowance_sec = compute_large_ctx_ttft_allowance(c.context_tokens, c.max_context_tokens)
 
         tail_gens = [g for g in snap.recent if g.total_in > 0 or g.output_tokens > 0]
         is_tail_truncated = bool(
@@ -2460,9 +2728,21 @@ class AntigravityMonitorEngine:
                 account_filter_fn=acct_filter_fn,
                 range_start_ts=live_win_start,
                 range_end_ts=now,
+                max_notable=None,
             )
             live_active = [c for c in top_convs if c.latest_timestamp >= live_win_start]
             has_live_acct_activity = bool(live_active) or (live_log["503"] + live_log["timeout"] + live_log["403"] > 0)
+            if (not has_live_acct_activity) and self._account_cache.online and (not is_custom_account_view):
+                # Do not fall back to stale historical T0 when the user returns after >30m and hits an immediate proxy outage
+                probe_cnt, _probe_s, probe_e, _probe_b = self._log_tailer.get_proxy_outage_info(
+                    now,
+                    self.config["log_sliding_window_min"],
+                    account_filter_fn=acct_filter_fn,
+                    range_start_ts=live_win_start,
+                    range_end_ts=now,
+                )
+                if probe_cnt > 0 and probe_e > 0.0 and (now - probe_e) <= 900.0:
+                    has_live_acct_activity = True
 
             if has_live_acct_activity:
                 # Recompute miss counters strictly inside current live session floor so yesterday's misses never leak into today's live T1!
@@ -2473,14 +2753,6 @@ class AntigravityMonitorEngine:
                 notable_events = live_notable
                 eval_cutoff_ts = live_eval_floor
                 eval_end_ts = now
-                last_t2_error_ts = self._log_tailer.get_latest_error_ts(
-                    now,
-                    self.config["log_sliding_window_min"],
-                    categories=("503", "timeout"),
-                    account_filter_fn=acct_filter_fn,
-                    range_start_ts=live_win_start,
-                    range_end_ts=now,
-                )
                 # Guard against 1-step pure expected_cold (0 cacheable verification) washing away an account's prior historical T1/T2!
                 live_cacheable = sum(c.cacheable_in_recent10 for c in live_active)
                 if live_cacheable == 0 and (live_log["503"] + live_log["timeout"] + live_log["403"] == 0):
@@ -2503,13 +2775,19 @@ class AntigravityMonitorEngine:
                     p_anchor = max(prior_steps_ts, prior_err_ts)
                     if p_anchor > 0.0:
                         p_win_s = p_anchor - win_sec
-                        p_log, _, _ = self._log_tailer.get_counts(
+                        p_log, _, p_notable_raw = self._log_tailer.get_counts(
                             now,
                             self.config["log_sliding_window_min"],
                             account_filter_fn=acct_filter_fn,
                             range_start_ts=p_win_s,
                             range_end_ts=p_anchor,
+                            max_notable=None,
                         )
+                        p_notable_ann = self._annotate_log_events_with_conversations(p_notable_raw, top_convs)
+                        p_heavy_to = sum(
+                            1 for ev in p_notable_ann if ev.category == "timeout" and ev.is_heavy_media_timeout
+                        )
+                        p_server_to = max(0, p_log["timeout"] - p_heavy_to)
                         p_consec = 0
                         for c in top_convs:
                             p_st = [s for s in c._scoped_steps_all if p_win_s <= s.timestamp <= p_anchor + 2.0]
@@ -2522,7 +2800,7 @@ class AntigravityMonitorEngine:
                             p_consec = max(p_consec, cm)
                         if p_log["403"] > 0:
                             prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），首步冷启尚未验真"
-                        elif (p_log["timeout"] + p_log["503"]) >= 2:
+                        elif (p_server_to + p_log["503"]) >= 2:
                             prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
                         elif p_consec >= 2:
                             prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
@@ -2550,14 +2828,7 @@ class AntigravityMonitorEngine:
                         account_filter_fn=acct_filter_fn,
                         range_start_ts=eval_cutoff_ts,
                         range_end_ts=eval_end_ts,
-                    )
-                    last_t2_error_ts = self._log_tailer.get_latest_error_ts(
-                        now,
-                        self.config["log_sliding_window_min"],
-                        categories=("503", "timeout"),
-                        account_filter_fn=acct_filter_fn,
-                        range_start_ts=eval_cutoff_ts,
-                        range_end_ts=eval_end_ts,
+                        max_notable=None,
                     )
                     historical_tag = f"历史参考 · {format_relative_age(now - anchor_ts)}"
                 else:
@@ -2578,6 +2849,7 @@ class AntigravityMonitorEngine:
                 account_filter_fn=acct_filter_fn,
                 range_start_ts=eval_cutoff_ts,
                 range_end_ts=eval_end_ts,
+                max_notable=None,
             )
             last_t2_error_ts = self._log_tailer.get_latest_error_ts(
                 now,
@@ -2656,9 +2928,30 @@ class AntigravityMonitorEngine:
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
-        notable_events = self._annotate_log_events_with_conversations(notable_events, top_convs)
-        latest_timeout_ev = next((ev for ev in reversed(notable_events) if ev.category == "timeout"), None)
-        latest_timeout_summary = latest_timeout_ev.summary if latest_timeout_ev is not None else ""
+        annotated_notable = self._annotate_log_events_with_conversations(notable_events, top_convs)
+        heavy_media_timeout_count = sum(
+            1 for ev in annotated_notable if ev.category == "timeout" and ev.is_heavy_media_timeout
+        )
+        # Recompute last_t2_error_ts strictly excluding heavy-media upload timeouts so they never reset T2 recovery!
+        last_t2_error_ts = max(
+            (
+                ev.timestamp
+                for ev in annotated_notable
+                if ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout)
+            ),
+            default=0.0,
+        )
+        notable_events = annotated_notable[-3:]
+        latest_server_timeout_ev = next(
+            (ev for ev in reversed(annotated_notable) if ev.category == "timeout" and not ev.is_heavy_media_timeout),
+            None,
+        )
+        latest_heavy_timeout_ev = next(
+            (ev for ev in reversed(annotated_notable) if ev.category == "timeout" and ev.is_heavy_media_timeout),
+            None,
+        )
+        latest_timeout_summary = latest_server_timeout_ev.summary if latest_server_timeout_ev is not None else ""
+        latest_heavy_timeout_summary = latest_heavy_timeout_ev.summary if latest_heavy_timeout_ev is not None else ""
 
         slot_inv = self.read_slot_inventory(now_ts=now, include_items=False, force=False)
 
@@ -2668,9 +2961,80 @@ class AntigravityMonitorEngine:
             last_t2_error_ts=last_t2_error_ts,
             use_full_scoped=(hr_key != "30m"),
             enum_map=self._model_enum_map,
+            slow_tps_th=float(self.config["slow_tps_threshold"]),
+            slow_ttft_th=float(self.config["slow_ttft_threshold_sec"]),
         )
 
         eff_online = self._account_cache.online or is_custom_account_view or (hr_key != "30m")
+        is_live_30m = bool(
+            (not is_historical_rating)
+            and (not is_custom_account_view)
+            and hr_key == "30m"
+            and self._account_cache.online
+        )
+
+        # Module 3: Account- & range-isolated proxy outage burst detection (strictly silent on IDLE & historical views)
+        proxy_outage_recent = 0
+        proxy_outage_active = False
+        proxy_outage_note = ""
+        if eff_online:
+            outage_cnt, _outage_s, outage_e, _outage_b = self._log_tailer.get_proxy_outage_info(
+                now,
+                self.config["log_sliding_window_min"],
+                account_filter_fn=acct_filter_fn,
+                range_start_ts=eval_cutoff_ts,
+                range_end_ts=eval_end_ts,
+            )
+            if outage_cnt > 0 and outage_e > 0.0:
+                hm_outage = datetime.datetime.fromtimestamp(outage_e).strftime("%H:%M")
+                if is_live_30m:
+                    age_since_outage = now - outage_e
+                    if age_since_outage <= 15.0 * 60.0:
+                        post_outage_steps = sum(
+                            1
+                            for c in recent_active
+                            for s in c._scoped_steps_all
+                            if s.timestamp > outage_e + 1.0
+                        )
+                        if age_since_outage >= 300.0 and post_outage_steps >= 6:
+                            proxy_outage_active = False
+                            proxy_outage_recent = 0
+                            proxy_outage_note = f"前序代理断流 ({hm_outage} {outage_cnt}次跨接口断连) 已平复"
+                        else:
+                            proxy_outage_active = True
+                            proxy_outage_recent = outage_cnt
+                            proxy_outage_note = f"代理线路疑似断流 ({hm_outage} 60s内 {outage_cnt}次跨接口断连，非服务端限流)"
+                else:
+                    # Historical views NEVER escalate WARN for transient proxy blips; keep note read-only
+                    proxy_outage_recent = outage_cnt
+                    proxy_outage_note = f"{hm_outage} 曾发生 {outage_cnt} 次跨接口代理断连"
+
+        # Module 5: Per-account adaptive daily step protection limits (strictly from completed prior days)
+        today_str = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        base_steps_warn = int(self.config["daily_steps_warn"])
+        base_steps_alert = int(self.config["daily_steps_alert"])
+        eff_steps_warn = base_steps_warn
+        eff_steps_alert = base_steps_alert
+        steps_limit_mode = "default"
+        steps_limit_note = "初始建议值"
+        acct_hist_safe_peak = 0
+        if resolved_account:
+            hist_days = self._get_account_completed_daily_history(
+                account_label=resolved_account,
+                now=now,
+                today_start=today_start,
+                today_str=today_str,
+                timeline=timeline,
+                fallback_label=cur_acct_label,
+            )
+            (
+                eff_steps_warn,
+                eff_steps_alert,
+                steps_limit_mode,
+                steps_limit_note,
+                acct_hist_safe_peak,
+            ) = compute_adaptive_daily_steps_limits(base_steps_warn, base_steps_alert, hist_days)
+
         level, grade, headline, sub_headline, t2_recovery_note = self._evaluate_health(
             active_model=active_model,
             recent_log=recent_log,
@@ -2694,7 +3058,28 @@ class AntigravityMonitorEngine:
             history_range_label=hr_label,
             prior_hist_warning=prior_hist_warning,
             latest_timeout_summary=latest_timeout_summary,
+            heavy_media_timeout_count=heavy_media_timeout_count,
+            latest_heavy_timeout_summary=latest_heavy_timeout_summary,
+            proxy_outage_active=proxy_outage_active,
+            proxy_outage_note=proxy_outage_note,
+            daily_steps_warn_override=eff_steps_warn,
+            daily_steps_alert_override=eff_steps_alert,
         )
+
+        # Ensure IDLE offline state never leaks transient proxy outage fields
+        if grade == "IDLE":
+            proxy_outage_recent = 0
+            proxy_outage_note = ""
+
+        # Throttled privacy-safe persistence of today's verified healthy / degraded step capacity (never in read_only!)
+        if is_live_30m and resolved_account and today_steps > 0 and (not self.read_only):
+            self._ledger.record_daily_step_profile(
+                short_label=resolved_account,
+                date_str=today_str,
+                today_steps=today_steps,
+                is_healthy=(grade == "T0"),
+                is_degraded=(grade in ("T1", "T2", "T3")),
+            )
 
         # Offline + custom/history lookup yielding no records -> offline_unknown (exit 2) rather than normal (exit 0)
         if grade == "WAIT" and not self._account_cache.online:
@@ -2703,13 +3088,13 @@ class AntigravityMonitorEngine:
             pressure = compute_pressure(
                 grade=grade,
                 today_steps=today_steps,
-                daily_steps_warn=self.config["daily_steps_warn"],
-                daily_steps_alert=self.config["daily_steps_alert"],
+                daily_steps_warn=eff_steps_warn,
+                daily_steps_alert=eff_steps_alert,
             )
 
         alerts = self._collect_new_alerts(
             grade=grade,
-            notable_events=notable_events,
+            notable_events=annotated_notable,
             recent_active=recent_active,
             max_consec_miss=max_consec_miss,
             today_steps=today_steps,
@@ -2718,6 +3103,7 @@ class AntigravityMonitorEngine:
             severe_frequent_miss_conv=severe_frequent_miss_conv,
             slot_inventory=slot_inv,
             slots_only=bool(is_custom_account_view or hr_key != "30m" or is_historical_rating),
+            daily_steps_alert_override=eff_steps_alert,
         )
 
         primary_ttft_avg = eval_primary.ttft_avg_sec if eval_primary else None
@@ -2741,8 +3127,8 @@ class AntigravityMonitorEngine:
             min_freshness_ctx=min_fresh_ctx,
             min_freshness_invalid_reason=min_fresh_invalid,
             today_steps=today_steps,
-            daily_steps_warn=self.config["daily_steps_warn"],
-            daily_steps_alert=self.config["daily_steps_alert"],
+            daily_steps_warn=eff_steps_warn,
+            daily_steps_alert=eff_steps_alert,
             active_conversations=top_convs,
             large_freshness_list=large_freshness[:12],
             recent_503=recent_log["503"],
@@ -2800,7 +3186,236 @@ class AntigravityMonitorEngine:
             is_host_idle_offline=bool((not self._account_cache.online) and ((now - latest_host_transcript_ts) >= 15.0)),
             primary_hit_reason=primary_hit_reason,
             carryover_conversations=carryover_convs,
+            heavy_media_timeout_recent=heavy_media_timeout_count,
+            proxy_outage_recent=proxy_outage_recent,
+            proxy_outage_note=proxy_outage_note,
+            daily_steps_limit_mode=steps_limit_mode,
+            daily_steps_limit_note=steps_limit_note,
+            daily_steps_base_alert=base_steps_alert,
+            account_hist_safe_peak=acct_hist_safe_peak,
         )
+
+    @staticmethod
+    def _extract_head_before_blobs(line: str, max_len: int = 512) -> str:
+        """Return only the leading metadata prefix strictly before content/thinking/tool_calls/media blobs."""
+        limit = min(len(line), max_len)
+        head = line[:limit]
+        cut = len(head)
+        for marker in ('"content"', '"thinking"', '"tool_calls"', '"media"'):
+            pos = head.find(marker)
+            if pos != -1 and pos < cut:
+                cut = pos
+        return head[:cut]
+
+    def _get_cached_history_daily_profiles(
+        self,
+        now: float,
+        today_start: float,
+        today_str: str,
+        timeline: List[Tuple[float, str]],
+        fallback_label: str = "",
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Low-frequency (10m TTL) read-only scan of completed prior-day steps per account across recent transcripts."""
+        last_tl = timeline[-1] if timeline else None
+        cache_key = (today_str, len(timeline), last_tl, (fallback_label or "").lower())
+        if (
+            self._hist_daily_profiles_cache_key == cache_key
+            and 0.0 <= (now - self._hist_daily_profiles_cache_ts) < 600.0
+        ):
+            return self._hist_daily_profiles_cache
+
+        profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if not self.brain_dir.is_dir():
+            self._hist_daily_profiles_cache_key = cache_key
+            self._hist_daily_profiles_cache_ts = now
+            self._hist_daily_profiles_cache = profiles
+            return profiles
+
+        hist_cutoff = today_start - 14 * 86400.0
+        hist_timeline = self._ledger.get_timeline(hist_cutoff)
+        if not hist_timeline:
+            hist_timeline = timeline
+        tl_times = [t for t, _ in hist_timeline]
+        hist_switches = self._ledger.get_switch_timestamps(hist_cutoff)
+        idle_sec = int(self.config.get("idle_rewarm_sec", 180))
+        min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
+
+        # Gather bounded set of transcripts modified within 14d (capped at 120 most recent; cached for 10m TTL)
+        cands: List[Tuple[float, str, Path]] = []
+        try:
+            with os.scandir(self.brain_dir) as it:
+                for entry in it:
+                    if not entry.is_dir():
+                        continue
+                    tp_str = os.path.join(entry.path, ".system_generated", "logs", "transcript.jsonl")
+                    try:
+                        st = os.stat(tp_str)
+                    except OSError:
+                        continue
+                    if st.st_mtime >= hist_cutoff:
+                        cands.append((st.st_mtime, entry.name, Path(tp_str)))
+        except OSError:
+            cands = []
+        cands.sort(key=lambda x: x[0], reverse=True)
+
+        day_events: Dict[Tuple[str, str], List[Tuple[float, bool]]] = {}
+        for _mtime, cid, tp in cands[:120]:
+            cached = self._transcript_cache.get(cid)
+            raw_steps: List[Dict[str, Any]]
+            if cached is not None:
+                raw_steps = cached[1]
+            else:
+                # Header-only scalar extraction strictly before content/thinking/tool_calls (with json.loads fallback + CHECKPOINT tracking)
+                raw_steps = []
+                pending_cp = False
+                try:
+                    with tp.open("r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if '"CHECKPOINT"' in line and '"PLANNER_RESPONSE"' not in line:
+                                head_cp = self._extract_head_before_blobs(line, 256)
+                                if '"CHECKPOINT"' in head_cp:
+                                    pending_cp = True
+                                continue
+                            if '"PLANNER_RESPONSE"' not in line or '"input_tokens"' not in line:
+                                continue
+                            head = self._extract_head_before_blobs(line, 512)
+                            m_in = _FAST_IN_TOK_RE.search(head)
+                            m_ts = _FAST_CREATED_AT_RE.search(head)
+                            is_pr_head = ('"type":"PLANNER_RESPONSE"' in head) or ('"type": "PLANNER_RESPONSE"' in head)
+                            if is_pr_head and m_in and m_ts:
+                                ts_v = parse_iso_timestamp(m_ts.group(1))
+                                if ts_v is None or ts_v < hist_cutoff:
+                                    pending_cp = False
+                                    continue
+                                m_cr = _FAST_CR_TOK_RE.search(head)
+                                m_out = _FAST_OUT_TOK_RE.search(head)
+                                m_si = _FAST_STEP_IDX_RE.search(head)
+                                m_mod = _FAST_MODEL_RE.search(head)
+                                raw_steps.append(
+                                    {
+                                        "step_index": int(m_si.group(1)) if m_si else len(raw_steps),
+                                        "timestamp": ts_v,
+                                        "model": m_mod.group(1) if m_mod else "",
+                                        "input_tokens": int(m_in.group(1)),
+                                        "cache_read_tokens": int(m_cr.group(1)) if m_cr else 0,
+                                        "output_tokens": int(m_out.group(1)) if m_out else 0,
+                                        "after_checkpoint": pending_cp,
+                                        "after_revert": False,
+                                    }
+                                )
+                                pending_cp = False
+                            else:
+                                try:
+                                    obj = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
+                                    continue
+                                ts_v = parse_iso_timestamp(str(obj.get("created_at", "") or ""))
+                                if ts_v is None or ts_v < hist_cutoff:
+                                    pending_cp = False
+                                    continue
+                                raw_steps.append(
+                                    {
+                                        "step_index": obj.get("step_index", len(raw_steps)),
+                                        "timestamp": ts_v,
+                                        "model": obj.get("model", ""),
+                                        "input_tokens": int(obj.get("input_tokens", 0) or 0),
+                                        "cache_read_tokens": int(obj.get("cache_read_tokens", 0) or 0),
+                                        "output_tokens": int(obj.get("output_tokens", 0) or 0),
+                                        "after_checkpoint": pending_cp,
+                                        "after_revert": False,
+                                    }
+                                )
+                                pending_cp = False
+                except OSError:
+                    continue
+            if not raw_steps:
+                continue
+            has_prior = any(hist_cutoff <= float(r.get("timestamp", 0.0) or 0.0) < today_start for r in raw_steps)
+            if not has_prior:
+                continue
+            steps = classify_steps(
+                raw_steps,
+                idle_rewarm_sec=idle_sec,
+                min_cacheable_tokens=min_cache_tok,
+                account_switches=hist_switches,
+            )
+            consec = 0
+            for st_rec in steps:
+                if st_rec.classification == "abnormal_miss":
+                    consec += 1
+                else:
+                    consec = 0
+                if not (hist_cutoff <= st_rec.timestamp < today_start):
+                    continue
+                acct = self._ledger.attribute_timestamp(
+                    st_rec.timestamp,
+                    hist_timeline,
+                    fallback_label=fallback_label,
+                    _times_cache=tl_times,
+                )
+                if not acct:
+                    continue
+                d_str = datetime.datetime.fromtimestamp(st_rec.timestamp).strftime("%Y-%m-%d")
+                if d_str >= today_str:
+                    continue
+                day_events.setdefault((acct.lower(), d_str), []).append((st_rec.timestamp, consec >= 2))
+
+        for (acct_low, d_str), ev_list in day_events.items():
+            ev_list.sort(key=lambda x: x[0])
+            total_s = len(ev_list)
+            deg_at: Optional[int] = None
+            for step_ord, (_ts, is_t1) in enumerate(ev_list, 1):
+                if is_t1:
+                    deg_at = step_ord
+                    break
+            profiles.setdefault(acct_low, {})[d_str] = {
+                "safe_steps": total_s if deg_at is None else max(0, deg_at - 1),
+                "max_steps": total_s,
+                "degraded_at": deg_at,
+            }
+
+        self._hist_daily_profiles_cache_key = cache_key
+        self._hist_daily_profiles_cache_ts = now
+        self._hist_daily_profiles_cache = profiles
+        return profiles
+
+    def _get_account_completed_daily_history(
+        self,
+        account_label: str,
+        now: float,
+        today_start: float,
+        today_str: str,
+        timeline: List[Tuple[float, str]],
+        fallback_label: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Merge persisted ledger daily profiles with cached historical transcript profiles (strictly < today)."""
+        acct_low = (account_label or "").strip().lower()
+        if not acct_low:
+            return []
+        ledger_days = self._ledger.get_account_daily_profiles(account_label)
+        hist_map = self._get_cached_history_daily_profiles(
+            now, today_start, today_str, timeline, fallback_label=fallback_label
+        )
+        scan_days = hist_map.get(acct_low, {})
+        all_dates = sorted(d for d in (set(ledger_days.keys()) | set(scan_days.keys())) if d < today_str)
+        merged: List[Dict[str, Any]] = []
+        for d_str in all_dates:
+            l_rec = ledger_days.get(d_str)
+            s_rec = scan_days.get(d_str)
+            deg_vals = [
+                int(r["degraded_at"])
+                for r in (l_rec, s_rec)
+                if r is not None and r.get("degraded_at") is not None
+            ]
+            deg_at = min(deg_vals) if deg_vals else None
+            safe_vals = [int(r.get("safe_steps", 0) or 0) for r in (l_rec, s_rec) if r is not None]
+            safe_s = max(safe_vals) if safe_vals else 0
+            if deg_at is not None:
+                safe_s = min(safe_s, max(0, deg_at - 1))
+            merged.append({"date": d_str, "safe_steps": safe_s, "degraded_at": deg_at})
+        return merged
 
     def _is_cached_subagent(self, cid: str, conv_map: Dict[str, ConversationSummary]) -> bool:
         conv_obj = conv_map.get(cid)
@@ -2815,13 +3430,26 @@ class AntigravityMonitorEngine:
                 return True
         return self._check_subagent_hint_cached(cid)
 
+    @staticmethod
+    def _format_timeout_dur_short(dur_sec: Optional[float]) -> str:
+        if dur_sec is None or dur_sec <= 0:
+            return ""
+        total = int(round(dur_sec))
+        if total >= 3600 and total % 3600 == 0:
+            return f"{total // 3600}h"
+        if total >= 60 and total % 60 == 0:
+            return f"{total // 60}m"
+        if total >= 60:
+            return f"{total // 60}m{total % 60}s"
+        return f"{dur_sec:.0f}s"
+
     def _annotate_log_events_with_conversations(
         self,
         events: List[LogEvent],
         known_convs: List[ConversationSummary],
     ) -> List[LogEvent]:
-        """Match language_server.log error timestamps against per-conversation ERROR_MESSAGE timestamps (±6s)."""
-        if not events or not self._transcript_error_ts:
+        """Match language_server.log error timestamps against point-in-time ERROR_MESSAGE (±6s) and USER_INPUT snapshots."""
+        if not events:
             return events
         conv_map = {c.conversation_id: c for c in known_convs}
         out: List[LogEvent] = []
@@ -2830,18 +3458,33 @@ class AntigravityMonitorEngine:
                 out.append(ev)
                 continue
             best_cid = ""
+            best_snap_mc = 0
+            best_snap_mb = 0
+            best_snap_ctx = 0
             best_key: Optional[Tuple[int, int, float]] = None
+
+            # Stage 1: Exact point-in-time ERROR_MESSAGE match (±6s)
             for cid, err_entries in self._transcript_error_ts.items():
                 if not err_entries:
                     continue
                 is_sub = 1 if self._is_cached_subagent(cid, conv_map) else 0
-                for ets, etxt in err_entries:
+                for entry in err_entries:
+                    ets = float(entry[0])
+                    etxt = str(entry[1])
+                    s_mc = int(entry[2]) if len(entry) >= 5 else 0
+                    s_mb = int(entry[3]) if len(entry) >= 5 else 0
+                    s_ctx = int(entry[4]) if len(entry) >= 5 else 0
                     diff = abs(ets - ev.timestamp)
                     if diff > 6.0:
                         continue
-                    # Prefer content-relevant ERROR_MESSAGE matches over unrelated tool errors in the same second
+                    # Prefer explicit timeout text (0), then empty content (1, Antigravity timeout norm), then unrelated text (2)
                     if ev.category == "timeout":
-                        rel_rank = 0 if ("timeout" in etxt or "deadline" in etxt or "timed out" in etxt) else 1
+                        if "timeout" in etxt or "deadline" in etxt or "timed out" in etxt:
+                            rel_rank = 0
+                        elif not etxt.strip():
+                            rel_rank = 1
+                        else:
+                            rel_rank = 2
                     elif ev.category == "503":
                         rel_rank = 0 if ("503" in etxt or "capacity" in etxt or "unavailable" in etxt or "exhausted" in etxt) else 1
                     else:
@@ -2850,12 +3493,64 @@ class AntigravityMonitorEngine:
                     if best_key is None or cand_key < best_key:
                         best_key = cand_key
                         best_cid = cid
+                        best_snap_mc = s_mc
+                        best_snap_mb = s_mb
+                        best_snap_ctx = s_ctx
+
+            # Stage 2: Fallback USER_INPUT / /compact snapshot match (ev.timestamp - dur_sec ±20s) for long >=60s timeouts.
+            # Also allow Stage 2 to override an unrelated non-timeout Stage 1 error (rel_rank == 2).
+            if (
+                (not best_cid or (best_key is not None and best_key[0] >= 2))
+                and ev.category == "timeout"
+                and ev.duration_sec is not None
+                and ev.duration_sec >= 60.0
+                and self._transcript_tail_meta
+            ):
+                est_start = ev.timestamp - float(ev.duration_sec)
+                best_u_key: Optional[Tuple[int, float]] = None
+                for cid, tmeta in self._transcript_tail_meta.items():
+                    u_snaps = tmeta[0]
+                    if not u_snaps:
+                        continue
+                    is_sub = 1 if self._is_cached_subagent(cid, conv_map) else 0
+                    for u_ts, u_mc, u_mb, u_ctx in u_snaps:
+                        diff = abs(est_start - u_ts)
+                        if diff > 20.0:
+                            continue
+                        cand_u = (is_sub, diff)
+                        if best_u_key is None or cand_u < best_u_key:
+                            best_u_key = cand_u
+                            best_cid = cid
+                            best_snap_mc = int(u_mc)
+                            best_snap_mb = int(u_mb)
+                            best_snap_ctx = int(u_ctx)
+
             if best_cid:
                 conv_obj = conv_map.get(best_cid)
                 title = conv_obj.title if conv_obj is not None else self._resolve_conv_title(best_cid)
                 title_part = f" {truncate_display_width(title, 22)}" if title else ""
                 tag = f"{best_cid[:6]}{title_part}"
-                new_summary = ev.summary if tag in ev.summary else f"{ev.summary} · {tag}"
+
+                # Heavy-media upload timeout attribution strictly uses point-in-time snapshot (immune to later /compact!)
+                is_heavy_media_to = False
+                if ev.category == "timeout":
+                    if (
+                        best_snap_mb >= 5 * 1024 * 1024
+                        or best_snap_mc >= 10
+                        or (best_snap_ctx >= 400_000 and best_snap_mb >= 2 * 1024 * 1024)
+                    ):
+                        is_heavy_media_to = True
+
+                if is_heavy_media_to:
+                    hm_match = re.match(r"^(\[\d{2}:\d{2}:\d{2}\])\s*", ev.summary or "")
+                    hm_prefix = f"{hm_match.group(1)} " if hm_match else ""
+                    dur_short = self._format_timeout_dur_short(ev.duration_sec)
+                    dur_part = f" ({dur_short})" if dur_short else ""
+                    media_part = f" [图{best_snap_mc}({format_media_size(best_snap_mb)})]"
+                    new_summary = f"{hm_prefix}多图上传超时{dur_part} · {tag}{media_part}"
+                else:
+                    new_summary = ev.summary if tag in ev.summary else f"{ev.summary} · {tag}"
+
                 out.append(
                     LogEvent(
                         timestamp=ev.timestamp,
@@ -2863,6 +3558,11 @@ class AntigravityMonitorEngine:
                         summary=new_summary,
                         event_key=ev.event_key,
                         model=ev.model,
+                        duration_sec=ev.duration_sec,
+                        is_heavy_media_timeout=is_heavy_media_to,
+                        media_count=best_snap_mc,
+                        media_bytes=best_snap_mb,
+                        culprit_cid=best_cid,
                     )
                 )
             else:
@@ -2876,9 +3576,12 @@ class AntigravityMonitorEngine:
         last_t2_error_ts: float = 0.0,
         use_full_scoped: bool = False,
         enum_map: Optional[Dict[str, str]] = None,
+        slow_tps_th: float = 40.0,
+        slow_ttft_th: float = 45.0,
     ) -> List[ModelPerfStats]:
         """Aggregate per-model TTFT, TPS, cache hits, and post-503 recovery evidence."""
         buckets: Dict[str, Dict[str, Any]] = {}
+        full_speed_tps_floor = max(80.0, float(slow_tps_th) * 2.0)
         for c in recent_active:
             if use_full_scoped and c._scoped_steps_all:
                 steps = c._scoped_steps_all
@@ -2895,6 +3598,7 @@ class AntigravityMonitorEngine:
             t_off = len(steps) - len(ttfts)
             p_off = len(steps) - len(tpss)
             s_off = len(steps) - len(strms)
+            max_ctx_cap = int(c.max_context_tokens or 0) or 512_000
             for idx, st in enumerate(steps):
                 if st.timestamp < cutoff_ts:
                     continue
@@ -2916,7 +3620,10 @@ class AntigravityMonitorEngine:
                         "post_latest_ts": 0.0,
                         "post_latest_ttft": None,
                         "main_post_steps": 0,
-                        "main_post_pairs": [],  # (timestamp, ttft_sec)
+                        "main_post_pairs": [],       # (timestamp, raw_ttft_sec)
+                        "main_adj_post_pairs": [],   # (timestamp, calibrated_ttft_sec)
+                        "main_media_exempt": 0,
+                        "main_large_ctx_cal": False,
                     },
                 )
                 b["steps"] += 1
@@ -2951,7 +3658,44 @@ class AntigravityMonitorEngine:
                     if not c.is_subagent:
                         b["main_post_steps"] += 1
                         if t_val is not None:
-                            b["main_post_pairs"].append((st.timestamp, float(t_val)))
+                            raw_t = float(t_val)
+                            # True low-TPS throttling is NEVER exempted by large-context or media allowance!
+                            is_low_tps = bool(
+                                st.output_tokens >= 500
+                                and (s_val is None or s_val >= 1.5)
+                                and p_val is not None
+                                and float(p_val) < float(slow_tps_th)
+                            )
+                            ctx_allow = 0.0 if is_low_tps else compute_large_ctx_ttft_allowance(st.total_tokens, max_ctx_cap)
+                            # Module 2: Strict heavy-media sustained full-speed upload exemption
+                            is_heavy_media = bool(
+                                st.active_media_count >= 3 or st.active_media_bytes >= 1 * 1024 * 1024
+                            )
+                            is_sustained_full_speed = bool(
+                                st.output_tokens >= 500
+                                and s_val is not None
+                                and float(s_val) >= 1.5
+                                and p_val is not None
+                                and float(p_val) >= full_speed_tps_floor
+                            )
+                            media_mb = max(0.0, float(st.active_media_bytes)) / (1024.0 * 1024.0)
+                            media_cap = min(
+                                300.0,
+                                float(slow_ttft_th) + float(st.active_media_count) * 5.0 + media_mb * 15.0 + ctx_allow,
+                            )
+                            if (
+                                is_heavy_media
+                                and is_sustained_full_speed
+                                and raw_t >= float(slow_ttft_th)
+                                and raw_t < media_cap
+                            ):
+                                b["main_media_exempt"] += 1
+                            else:
+                                adj_t = max(0.0, raw_t - ctx_allow)
+                                if ctx_allow >= 5.0:
+                                    b["main_large_ctx_cal"] = True
+                                b["main_post_pairs"].append((st.timestamp, raw_t))
+                                b["main_adj_post_pairs"].append((st.timestamp, adj_t))
 
         out: List[ModelPerfStats] = []
         for mname, b in buckets.items():
@@ -2978,6 +3722,16 @@ class AntigravityMonitorEngine:
             m_latest = mvals[-1] if mvals else None
             m_rec2_max = max(mvals[-2:]) if len(mvals) >= 2 else m_latest
 
+            apairs = sorted(b["main_adj_post_pairs"], key=lambda x: x[0])
+            avals = [v for _, v in apairs]
+            a_median: Optional[float] = None
+            if avals:
+                sa = sorted(avals)
+                ma = len(sa) // 2
+                a_median = sa[ma] if (len(sa) % 2 == 1) else ((sa[ma - 1] + sa[ma]) / 2.0)
+            a_latest = avals[-1] if avals else None
+            a_rec2_max = max(avals[-2:]) if len(avals) >= 2 else a_latest
+
             out.append(
                 ModelPerfStats(
                     model=mname,
@@ -2997,6 +3751,12 @@ class AntigravityMonitorEngine:
                     main_ttft_after_last_t2_median=m_median,
                     main_ttft_after_last_t2_latest=m_latest,
                     main_ttft_after_last_t2_recent2_max=m_rec2_max,
+                    main_adj_ttft_after_last_t2_median=a_median,
+                    main_adj_ttft_after_last_t2_latest=a_latest,
+                    main_adj_ttft_after_last_t2_recent2_max=a_rec2_max,
+                    main_media_exempt_post_steps=int(b["main_media_exempt"]),
+                    main_unexempt_ttft_steps_after_last_t2=len(mvals),
+                    main_large_ctx_calibrated=bool(b["main_large_ctx_cal"]),
                 )
             )
         out.sort(key=lambda m: m.latest_timestamp, reverse=True)
@@ -3089,11 +3849,19 @@ class AntigravityMonitorEngine:
         history_range_label: str = "近 30 分钟",
         prior_hist_warning: str = "",
         latest_timeout_summary: str = "",
+        heavy_media_timeout_count: int = 0,
+        latest_heavy_timeout_summary: str = "",
+        proxy_outage_active: bool = False,
+        proxy_outage_note: str = "",
+        daily_steps_warn_override: Optional[int] = None,
+        daily_steps_alert_override: Optional[int] = None,
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
         hist_prefix = f"[{historical_tag}] " if (is_historical and historical_tag) else ""
         hist_head_tag = " (历史)" if is_historical else ""
+        eff_steps_warn = int(daily_steps_warn_override) if daily_steps_warn_override is not None else int(self.config["daily_steps_warn"])
+        eff_steps_alert = int(daily_steps_alert_override) if daily_steps_alert_override is not None else int(self.config["daily_steps_alert"])
 
         # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
         # stay quietly in standby instead of alerting on stale pre-shutdown log disconnects.
@@ -3103,6 +3871,8 @@ class AntigravityMonitorEngine:
         # Only evaluate live language_server.log T2/T3 alerts while online or inspecting history.
         eff_403 = recent_log["403"] if is_online else 0
         eff_timeout = recent_log["timeout"] if is_online else 0
+        eff_heavy_timeout = min(eff_timeout, max(0, int(heavy_media_timeout_count))) if is_online else 0
+        server_timeout_count = max(0, eff_timeout - eff_heavy_timeout)
         eff_503 = recent_log["503"] if is_online else 0
 
         if eff_403 > 0:
@@ -3115,42 +3885,59 @@ class AntigravityMonitorEngine:
             )
 
         # Dynamic T2 evaluation:
-        # - Single isolated stream timeout (or single 503) warns in orange (WARN) instead of hard-alarming T2.
-        # - (eff_503 + eff_timeout) >= 2 enters T2 evaluation using MAIN-conversation post-error median TTFT:
+        # - Heavy-media upload timeouts are excluded from server_timeout_count so large image uploads never false-alarm red T2.
+        # - Single isolated server timeout (or single 503) warns in orange (WARN) instead of hard-alarming T2.
+        # - (eff_503 + server_timeout_count) >= 2 enters T2 evaluation using calibrated MAIN-conversation post-error TTFT:
         #   1. Subagents & lightweight immune models (Hydrogen/Flash) NEVER whitewash flagship (Neon/Carbon) T2!
-        #   2. If the active primary model itself shows post-error degradation, no other model can override it.
-        #   3. When primary has >=4 main post-steps and median < 30s, tolerate a single multimodal TTFT spike (<150s)
-        #      unless the latest two steps are both >=60s (prevents WARN <-> T2 flapping).
-        #   4. Full green T0 recovery requires actual measured TTFT samples on the active model (never via another model).
+        #   2. True low-TPS steps NEVER receive large-context or media allowance.
+        #   3. Heavy-media sustained full-speed steps are exempted from degrading recovery (can soften T2 -> WARN, never directly green T0).
+        #   4. Full green T0 recovery requires >= 2 unexempted measured TTFT steps on the active model.
         t2_active = False
         t2_recovering_warn = ""
         t2_recovered_info = ""
-        if (eff_timeout + eff_503) >= 2:
+        if (server_timeout_count + eff_503) >= 2:
             stats_list = model_stats or []
             active_is_light = _is_light_immune_model(active_model)
 
-            def _eff_steps(ms: ModelPerfStats) -> int:
-                return ms.main_steps_after_last_t2 if ms.main_steps_after_last_t2 > 0 else (ms.steps_after_last_t2 if ms.main_ttft_after_last_t2_median is None and not any(m.main_steps_after_last_t2 > 0 for m in stats_list) else 0)
-
             def _eff_rep_ttft(ms: ModelPerfStats) -> Optional[float]:
+                """Always display the true unadjusted raw median TTFT (never fabricate calibrated numbers)."""
                 if ms.main_steps_after_last_t2 > 0:
                     return ms.main_ttft_after_last_t2_median
                 return ms.ttft_after_last_t2_median if ms.ttft_after_last_t2_median is not None else ms.ttft_after_last_t2_avg
 
-            def _eff_latest_ttft(ms: ModelPerfStats) -> Optional[float]:
-                return ms.main_ttft_after_last_t2_latest if ms.main_steps_after_last_t2 > 0 else ms.ttft_after_last_t2_latest
+            def _eval_rep_ttft(ms: ModelPerfStats) -> Optional[float]:
+                if ms.main_adj_ttft_after_last_t2_median is not None:
+                    return ms.main_adj_ttft_after_last_t2_median
+                return ms.main_ttft_after_last_t2_median
+
+            def _eval_latest_ttft(ms: ModelPerfStats) -> Optional[float]:
+                if ms.main_adj_ttft_after_last_t2_latest is not None:
+                    return ms.main_adj_ttft_after_last_t2_latest
+                return ms.main_ttft_after_last_t2_latest
+
+            def _eval_rec2_ttft(ms: ModelPerfStats) -> Optional[float]:
+                if ms.main_adj_ttft_after_last_t2_recent2_max is not None:
+                    return ms.main_adj_ttft_after_last_t2_recent2_max
+                return ms.main_ttft_after_last_t2_recent2_max
+
+            def _unexempt_ttft_steps(ms: ModelPerfStats) -> int:
+                if ms.main_unexempt_ttft_steps_after_last_t2 > 0:
+                    return ms.main_unexempt_ttft_steps_after_last_t2
+                # Backward-compatible fallback for manually constructed ModelPerfStats in legacy callers/tests
+                if ms.main_media_exempt_post_steps == 0 and ms.main_ttft_after_last_t2_median is not None:
+                    return ms.main_steps_after_last_t2
+                return 0
 
             def _is_degraded(ms: ModelPerfStats) -> bool:
                 steps_n = ms.main_steps_after_last_t2
                 if steps_n <= 0:
                     return False
-                rep = ms.main_ttft_after_last_t2_median
-                lat = ms.main_ttft_after_last_t2_latest
-                rec2 = ms.main_ttft_after_last_t2_recent2_max
+                rep = _eval_rep_ttft(ms)
+                lat = _eval_latest_ttft(ms)
+                rec2 = _eval_rec2_ttft(ms)
                 if rep is not None and rep >= 45.0:
                     return True
-                if steps_n >= 4 and rep is not None and rep < 30.0:
-                    # Tolerate single multimodal spike; only degraded if extreme (>=150s) or consecutive slow
+                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < 30.0:
                     if lat is not None and lat >= 150.0:
                         return True
                     return False
@@ -3160,14 +3947,13 @@ class AntigravityMonitorEngine:
                 steps_n = ms.main_steps_after_last_t2
                 if steps_n < 2:
                     return False
-                rep = ms.main_ttft_after_last_t2_median
-                lat = ms.main_ttft_after_last_t2_latest
+                rep = _eval_rep_ttft(ms)
+                lat = _eval_latest_ttft(ms)
                 if rep is None and not allow_no_ttft:
                     return False
                 if rep is not None and rep >= 45.0:
                     return False
-                if steps_n >= 4 and rep is not None and rep < 30.0:
-                    # Single multimodal spike tolerance: allow up to 150s if previous step was fast
+                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < 30.0:
                     if lat is not None and lat >= 150.0:
                         return False
                     return True
@@ -3181,22 +3967,27 @@ class AntigravityMonitorEngine:
             err_parts = []
             if eff_503 > 0:
                 err_parts.append(f"{eff_503} 次 503")
-            if eff_timeout > 0:
-                err_parts.append(f"{eff_timeout} 次流超时")
+            if server_timeout_count > 0:
+                err_parts.append(f"{server_timeout_count} 次流超时")
             err_desc = " / ".join(err_parts) if err_parts else "限流事件"
 
             if primary_ms is not None and _is_healthy_main_recovery(primary_ms, allow_no_ttft=False):
                 rep = _eff_rep_ttft(primary_ms)
-                ttft_desc = f"，TTFT 中位 {rep:.1f}s" if rep is not None else ""
+                cal_tag = "(大上下文校准)" if primary_ms.main_large_ctx_calibrated else ""
+                ttft_desc = f"，TTFT 中位 {rep:.1f}s{cal_tag}" if rep is not None else ""
                 p_steps = primary_ms.main_steps_after_last_t2
-                if p_steps >= 6 and elapsed_since_err >= 600.0:
+                unexempt_n = _unexempt_ttft_steps(primary_ms)
+                if p_steps >= 6 and elapsed_since_err >= 600.0 and unexempt_n >= 2:
                     t2_recovered_info = f"前序 {err_desc} 已平复（{primary_ms.model} 事后连跑 {p_steps} 步正常{ttft_desc}）"
                 else:
                     t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步正常{ttft_desc}"
             elif primary_ms is not None and _is_healthy_main_recovery(primary_ms, allow_no_ttft=True):
-                # Main steps succeeded without SQLite TTFT yet -> allow downgrade to WARN, never green T0
+                # Main steps succeeded via heavy-media full-speed steps or without SQLite TTFT yet -> WARN only, never green T0
                 p_steps = primary_ms.main_steps_after_last_t2
-                t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步（待 TTFT 采样验真）"
+                if primary_ms.main_media_exempt_post_steps >= 2:
+                    t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步多图满速正常（待常规步验真）"
+                else:
+                    t2_recovering_warn = f"前序 {err_desc}，{primary_ms.model} 事后已连跑 {p_steps} 步（待 TTFT 采样验真）"
             elif not primary_degraded:
                 # Only allow a non-lightweight main-conversation peer model to soften T2 -> WARN (never to green T0!)
                 peer_candidates = [
@@ -3208,7 +3999,8 @@ class AntigravityMonitorEngine:
                 if peer_candidates:
                     best_peer = max(peer_candidates, key=lambda m: (m.main_steps_after_last_t2, m.latest_timestamp))
                     rep = _eff_rep_ttft(best_peer)
-                    ttft_desc = f"，TTFT 中位 {rep:.1f}s" if rep is not None else ""
+                    cal_tag = "(大上下文校准)" if best_peer.main_large_ctx_calibrated else ""
+                    ttft_desc = f"，TTFT 中位 {rep:.1f}s{cal_tag}" if rep is not None else ""
                     t2_recovering_warn = (
                         f"前序 {err_desc}，另一主模型 {best_peer.model} 已连跑 {best_peer.main_steps_after_last_t2} 步可用{ttft_desc}"
                     )
@@ -3225,7 +4017,7 @@ class AntigravityMonitorEngine:
                 "red",
                 "T2",
                 f"T2 限流黑洞{hist_head_tag} · {active_model}",
-                f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {eff_timeout} 次流超时，事后未恢复稳定响应{extra}",
+                f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {server_timeout_count} 次流超时，事后未恢复稳定响应{extra}",
                 "",
             )
         if max_consec_miss >= 2:
@@ -3248,10 +4040,10 @@ class AntigravityMonitorEngine:
         # Daily step thresholds are independent volume reminders and MUST NOT override
         # the real health grade (T0/WARN/T1/T2/T3) derived from actual cache, TTFT & logs.
         step_note = ""
-        if today_steps >= self.config["daily_steps_alert"]:
-            step_note = f" · 提醒：今日步数 {today_steps}/{self.config['daily_steps_alert']} 已超保护红线"
-        elif today_steps >= self.config["daily_steps_warn"]:
-            step_note = f" · 提醒：今日步数 {today_steps}/{self.config['daily_steps_alert']} 接近保护线"
+        if today_steps >= eff_steps_alert:
+            step_note = f" · 提醒：今日步数 {today_steps}/{eff_steps_alert} 已超保护红线"
+        elif today_steps >= eff_steps_warn:
+            step_note = f" · 提醒：今日步数 {today_steps}/{eff_steps_alert} 接近保护线"
 
         if (
             prior_hist_warning
@@ -3259,7 +4051,9 @@ class AntigravityMonitorEngine:
             or any_single_miss
             or unstable_recovery_conv is not None
             or eff_503 == 1
-            or eff_timeout == 1
+            or server_timeout_count == 1
+            or eff_heavy_timeout >= 1
+            or (proxy_outage_active and bool(proxy_outage_note))
             or any_slow
         ):
             reasons = []
@@ -3267,6 +4061,15 @@ class AntigravityMonitorEngine:
                 reasons.append(prior_hist_warning)
             if t2_recovering_warn:
                 reasons.append(t2_recovering_warn)
+            if proxy_outage_active and proxy_outage_note:
+                reasons.append(proxy_outage_note)
+            if eff_heavy_timeout >= 1:
+                if latest_heavy_timeout_summary:
+                    short_h = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", latest_heavy_timeout_summary)
+                    cnt_s = f" ({eff_heavy_timeout}次)" if eff_heavy_timeout > 1 else ""
+                    reasons.append(f"{short_h}{cnt_s}，建议压图或/compact")
+                else:
+                    reasons.append(f"多图大包上传超时 ({eff_heavy_timeout}次)，建议压图或/compact")
             if any_single_miss:
                 reasons.append("单步异常归零")
             elif unstable_recovery_conv is not None:
@@ -3275,7 +4078,7 @@ class AntigravityMonitorEngine:
                 reasons.append("疑似暗限速")
             if eff_503 == 1 and not t2_recovering_warn:
                 reasons.append("偶发 1 次 503")
-            if eff_timeout == 1 and not t2_recovering_warn:
+            if server_timeout_count == 1 and not t2_recovering_warn:
                 reasons.append(f"偶发流超时: {latest_timeout_summary}" if latest_timeout_summary else "偶发 1 次流超时")
             return ("orange", "WARN", f"留意预警{hist_head_tag} · {active_model}", f"{hist_prefix}" + " / ".join(reasons) + step_note, t2_recovering_warn)
 
@@ -3302,7 +4105,9 @@ class AntigravityMonitorEngine:
             return ("green", "T0", f"T0 健康{hist_head_tag} · {active_model}", f"{hist_prefix}{t2_recovered_info}{step_note}", t2_recovered_info)
 
         hist_503 = today_log["503"]
-        if hist_503 > 0 and eff_503 == 0:
+        if (not is_historical) and proxy_outage_note and (not proxy_outage_active):
+            sub = f"{hist_prefix}{proxy_outage_note}{step_note}"
+        elif hist_503 > 0 and eff_503 == 0:
             sub = f"{hist_prefix}{scope_win_txt}无新异常（该号今日历史 {hist_503} 条 503 已衰减）{step_note}"
         else:
             sub = f"{hist_prefix}{scope_win_txt}缓存与底层日志均健康{step_note}"
@@ -3320,7 +4125,9 @@ class AntigravityMonitorEngine:
         severe_frequent_miss_conv: Optional[ConversationSummary] = None,
         slot_inventory: Optional[SlotInventorySnapshot] = None,
         slots_only: bool = False,
+        daily_steps_alert_override: Optional[int] = None,
     ) -> List[Tuple[str, str, str]]:
+        eff_steps_alert = int(daily_steps_alert_override) if daily_steps_alert_override is not None else int(self.config["daily_steps_alert"])
         candidates: List[Tuple[str, str, str]] = []
         if slot_inventory is not None and slot_inventory.summary_db_ok:
             if slot_inventory.main_at_risk:
@@ -3348,7 +4155,7 @@ class AntigravityMonitorEngine:
                         candidates.append((ev.event_key, "Antigravity 封禁告警 (T3)", ev.summary))
             elif grade == "T2":
                 for ev in notable_events:
-                    if ev.category in ("503", "timeout"):
+                    if ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout):
                         candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
             elif grade == "T1":
                 # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
@@ -3365,13 +4172,13 @@ class AntigravityMonitorEngine:
                     candidates.append(
                         (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
                     )
-            elif today_steps >= self.config["daily_steps_alert"]:
+            elif today_steps >= eff_steps_alert:
                 day = datetime.date.today().isoformat()
                 candidates.append(
                     (
-                        f"steps:{day}:{steps_scope_label}:{self.config['daily_steps_alert']}",
+                        f"steps:{day}:{steps_scope_label}:{eff_steps_alert}",
                         f"Antigravity 今日步数红线 ({steps_scope_label})",
-                        f"{steps_scope_label} 今日已达 {today_steps} 步，注意控频护号",
+                        f"{steps_scope_label} 今日已达 {today_steps}/{eff_steps_alert} 步，注意控频护号",
                     )
                 )
 
@@ -3487,6 +4294,7 @@ class AntigravityMonitorEngine:
         except OSError:
             self._transcript_cache.pop(conv_id, None)
             self._transcript_error_ts.pop(conv_id, None)
+            self._transcript_tail_meta.pop(conv_id, None)
             return [], False, False
 
         stamp = (st.st_mtime_ns, st.st_size)
@@ -3495,21 +4303,27 @@ class AntigravityMonitorEngine:
             self._transcript_cache.move_to_end(conv_id)
             if conv_id in self._transcript_error_ts:
                 self._transcript_error_ts.move_to_end(conv_id)
+            if conv_id in self._transcript_tail_meta:
+                self._transcript_tail_meta.move_to_end(conv_id)
             return cached[1], cached[2], cached[3]
 
         parsed: List[Dict[str, Any]] = []
-        error_ts_list: List[Tuple[float, str]] = []
+        error_ts_list: List[Tuple[float, str, int, int, int]] = []
+        user_input_snaps: List[Tuple[float, int, int, int]] = []
         has_user_explicit = False
         has_subagent_marker = False
         pending_checkpoint = False
         pending_revert = False
         seen_planner_idx: Optional[int] = None
         max_step_ts: float = 0.0
+        last_known_ctx: int = 0
         # Active multimodal attachments since last CHECKPOINT: list of (step_index, uri, size_bytes)
         active_media: List[Tuple[int, str, int]] = []
         active_media_keys: set[Tuple[int, str]] = set()
+        active_media_bytes_total: int = 0
 
         def _append_media_items(m_step_idx: int, media_list: Any) -> None:
+            nonlocal active_media_bytes_total
             if not isinstance(media_list, list):
                 return
             for m_item in media_list:
@@ -3524,6 +4338,7 @@ class AntigravityMonitorEngine:
                 active_media_keys.add(mkey)
                 sz = self._get_local_media_size_cached(uri)
                 active_media.append((m_step_idx, uri, sz))
+                active_media_bytes_total += sz
 
         try:
             with tp.open("r", encoding="utf-8", errors="replace") as fh:
@@ -3541,7 +4356,8 @@ class AntigravityMonitorEngine:
                                 ets = parse_iso_timestamp(str(err_obj.get("created_at", "") or ""))
                                 if ets is not None:
                                     ec = str(err_obj.get("content", "") or "")[:160].lower()
-                                    error_ts_list.append((ets, ec))
+                                    # Point-in-time snapshot so later /compact NEVER erases historical heavy-media attribution
+                                    error_ts_list.append((ets, ec, len(active_media), active_media_bytes_total, last_known_ctx))
                                 continue
                         except json.JSONDecodeError:
                             pass
@@ -3552,6 +4368,8 @@ class AntigravityMonitorEngine:
                                 pending_checkpoint = True
                                 active_media.clear()
                                 active_media_keys.clear()
+                                active_media_bytes_total = 0
+                                last_known_ctx = 0
                                 continue
                         except json.JSONDecodeError:
                             pass
@@ -3579,17 +4397,27 @@ class AntigravityMonitorEngine:
                                 # Prune media from discarded branch BEFORE adding this new USER_INPUT's attachments
                                 active_media = [m for m in active_media if m[0] < u_si]
                                 active_media_keys = {(m[0], m[1]) for m in active_media}
-                            if u_obj.get("media"):
-                                is_ooo_user_media = (
-                                    isinstance(u_si, int)
-                                    and seen_planner_idx is not None
-                                    and u_si < seen_planner_idx
-                                    and u_ts is not None
-                                    and max_step_ts > 0.0
-                                    and u_ts < max_step_ts - 5.0
-                                )
-                                if not is_ooo_user_media:
-                                    _append_media_items(int(u_si) if isinstance(u_si, int) else (seen_planner_idx or 0), u_obj.get("media"))
+                                active_media_bytes_total = sum(m[2] for m in active_media)
+                                # Roll back last_known_ctx to the most recent surviving step before u_si
+                                prev_ctx = 0
+                                for prev_r in reversed(parsed):
+                                    p_si = prev_r.get("step_index")
+                                    if isinstance(p_si, int) and p_si < u_si:
+                                        prev_ctx = int(prev_r.get("input_tokens", 0) or 0) + int(prev_r.get("cache_read_tokens", 0) or 0)
+                                        break
+                                last_known_ctx = prev_ctx
+                            is_ooo_user_entry = (
+                                isinstance(u_si, int)
+                                and seen_planner_idx is not None
+                                and u_si < seen_planner_idx
+                                and u_ts is not None
+                                and max_step_ts > 0.0
+                                and u_ts < max_step_ts - 5.0
+                            )
+                            if u_obj.get("media") and not is_ooo_user_entry:
+                                _append_media_items(int(u_si) if isinstance(u_si, int) else (seen_planner_idx or 0), u_obj.get("media"))
+                            if u_ts is not None and not is_ooo_user_entry:
+                                user_input_snaps.append((u_ts, len(active_media), active_media_bytes_total, last_known_ctx))
                             continue
                     if '"PLANNER_RESPONSE"' not in line:
                         # Lightweight multimodal attachment scan on non-PLANNER lines (e.g. GENERIC read_file images/audio/video)
@@ -3640,24 +4468,28 @@ class AntigravityMonitorEngine:
                                 max_step_ts = ts
                             active_media = [m for m in active_media if m[0] < raw_si]
                             active_media_keys = {(m[0], m[1]) for m in active_media}
+                            active_media_bytes_total = sum(m[2] for m in active_media)
                         elif seen_planner_idx is None or (raw_si > seen_planner_idx and ts >= max_step_ts - 60.0):
                             seen_planner_idx = raw_si
                             if ts > max_step_ts:
                                 max_step_ts = ts
                     elif ts > max_step_ts:
                         max_step_ts = ts
+                    inp_tok = int(obj.get("input_tokens", 0) or 0)
+                    cr_tok = int(obj.get("cache_read_tokens", 0) or 0)
+                    last_known_ctx = inp_tok + cr_tok
                     parsed.append(
                         {
                             "step_index": raw_si if raw_si is not None else len(parsed),
                             "timestamp": ts,
                             "model": obj.get("model", ""),
-                            "input_tokens": obj.get("input_tokens", 0),
-                            "cache_read_tokens": obj.get("cache_read_tokens", 0),
+                            "input_tokens": inp_tok,
+                            "cache_read_tokens": cr_tok,
                             "output_tokens": obj.get("output_tokens", 0),
                             "after_checkpoint": pending_checkpoint,
                             "after_revert": is_rev,
                             "active_media_count": len(active_media),
-                            "active_media_bytes": sum(m[2] for m in active_media),
+                            "active_media_bytes": active_media_bytes_total,
                         }
                     )
                     pending_checkpoint = False
@@ -3668,15 +4500,42 @@ class AntigravityMonitorEngine:
         self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
         self._transcript_cache.move_to_end(conv_id)
         while len(self._transcript_cache) > 384:
-            evicted_cid, _ = self._transcript_cache.popitem(last=False)
+            # Evict strictly by oldest file mtime_ns (prevents descending-order scan LRU inversion from dropping the hottest conv!)
+            evicted_cid = min(
+                self._transcript_cache.keys(),
+                key=lambda k: self._transcript_cache[k][0][0],
+            )
+            self._transcript_cache.pop(evicted_cid, None)
             self._transcript_error_ts.pop(evicted_cid, None)
+            self._transcript_tail_meta.pop(evicted_cid, None)
         if error_ts_list:
             self._transcript_error_ts[conv_id] = error_ts_list[-16:]
             self._transcript_error_ts.move_to_end(conv_id)
             while len(self._transcript_error_ts) > 384:
-                self._transcript_error_ts.popitem(last=False)
+                # Evict by oldest latest error timestamp rather than insertion order (prevents descending-scan LRU inversion)
+                oldest_ecid = min(
+                    self._transcript_error_ts.keys(),
+                    key=lambda k: self._transcript_error_ts[k][-1][0] if self._transcript_error_ts[k] else 0.0,
+                )
+                self._transcript_error_ts.pop(oldest_ecid, None)
         else:
             self._transcript_error_ts.pop(conv_id, None)
+        if user_input_snaps or active_media:
+            self._transcript_tail_meta[conv_id] = (
+                user_input_snaps[-16:],
+                len(active_media),
+                active_media_bytes_total,
+                last_known_ctx,
+            )
+            self._transcript_tail_meta.move_to_end(conv_id)
+            while len(self._transcript_tail_meta) > 384:
+                oldest_tcid = min(
+                    self._transcript_tail_meta.keys(),
+                    key=lambda k: self._transcript_tail_meta[k][0][-1][0] if self._transcript_tail_meta[k][0] else 0.0,
+                )
+                self._transcript_tail_meta.pop(oldest_tcid, None)
+        else:
+            self._transcript_tail_meta.pop(conv_id, None)
         return parsed, has_user_explicit, has_subagent_marker
 
     def _resolve_conversation_transcript(self, query: str) -> Optional[Tuple[str, Path]]:
@@ -4356,6 +5215,7 @@ def _serialize_conversation_summary(c: ConversationSummary, include_steps: bool 
         "active_media_bytes": c.active_media_bytes,
         "media_ttft_exempted": c.media_ttft_exempted,
         "is_carryover_preview": c.is_carryover_preview,
+        "large_ctx_ttft_allowance_sec": round(c.large_ctx_ttft_allowance_sec, 1),
         "ttft_sec": round(c.ttft_sec, 2) if c.ttft_sec is not None else None,
         "ttft_avg_sec": round(c.ttft_avg_sec, 2) if c.ttft_avg_sec is not None else None,
         "ttft_max_sec": round(c.ttft_max_sec, 2) if c.ttft_max_sec is not None else None,
@@ -4475,6 +5335,10 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "total_subagent_today_steps": snap.total_subagent_today_steps,
             "daily_steps_warn": snap.daily_steps_warn,
             "daily_steps_alert": snap.daily_steps_alert,
+            "daily_steps_base_alert": snap.daily_steps_base_alert,
+            "daily_steps_limit_mode": snap.daily_steps_limit_mode,
+            "daily_steps_limit_note": snap.daily_steps_limit_note,
+            "account_hist_safe_peak": snap.account_hist_safe_peak,
             "remaining_to_warn": max(0, snap.daily_steps_warn - snap.today_steps),
             "remaining_to_alert": max(0, snap.daily_steps_alert - snap.today_steps),
             "usage_pct": round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100.0, 1),
@@ -4508,8 +5372,11 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "window_min": snap.sliding_window_min,
             "503": snap.recent_503,
             "timeout": snap.recent_timeout,
+            "heavy_media_timeout": snap.heavy_media_timeout_recent,
             "403": snap.recent_403,
             "retry": snap.recent_retry,
+            "proxy_outage": snap.proxy_outage_recent,
+            "proxy_outage_note": snap.proxy_outage_note,
             "t2_recovery_note": snap.t2_recovery_note,
         },
         "errors_today": {
@@ -4627,6 +5494,11 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
         lines.append(
             f"多模态载荷: 当前 {cur_m_s} / 峰值 {peak_m_s}（多图每轮随请求重传会拉高 TTFT 上传耗时，引擎已自动豁免暗限速误判）"
         )
+    large_ctx_allow = compute_large_ctx_ttft_allowance(report.latest_context_tokens, report.max_context_tokens)
+    if large_ctx_allow >= 10.0:
+        lines.append(
+            f"大上下文校准: 当前 {format_tokens(report.latest_context_tokens)} 逼近压缩窗（判定自动校准 TTFT 基线 +{large_ctx_allow:.0f}s，真实数值如实保留）"
+        )
     lines.append("最近 12 步明细（新 → 旧）:")
     for pt in reversed(report.points[-12:]):
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
@@ -4671,7 +5543,9 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         ttft_str += f" (近10步均 {snap.primary_ttft_avg:.1f}s / 峰 {snap.primary_ttft_max:.1f}s)"
     acc_5h = f"{snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "—"
     acc_wk = f"{snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "—"
-    steps_str = f"{snap.steps_scope_label} {snap.today_steps}/{snap.daily_steps_alert}"
+    limit_note = getattr(snap, "daily_steps_limit_note", "")
+    limit_badge = f" [自适应·{limit_note}]" if (getattr(snap, "daily_steps_limit_mode", "default") != "default" and limit_note) else (" [自适应]" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else "")
+    steps_str = f"{snap.steps_scope_label} {snap.today_steps}/{snap.daily_steps_alert}{limit_badge}"
     steps_str += f" (主 {snap.main_today_steps} / 子 {snap.subagent_today_steps} | 近1h {snap.last_1h_steps}"
     if snap.peak_hour_steps_today > 0 and snap.peak_hour_label:
         steps_str += f" | 峰值 {snap.peak_hour_steps_today}@{snap.peak_hour_label}"
@@ -4710,6 +5584,10 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
             f"底层日志 ({snap.log_scope_label} · {snap.history_range_label} / 今日): 503={snap.recent_503}/{snap.today_503} | 流超时={snap.recent_timeout}/{snap.today_timeout} | 403={snap.recent_403}/{snap.today_403} | 代理重试={snap.recent_retry}/{snap.today_retry}",
         ]
     )
+    if getattr(snap, "heavy_media_timeout_recent", 0) > 0:
+        lines.append(f"多图超时: 近窗 {snap.heavy_media_timeout_recent} 次流超时归因为多图大包上传超时（已免误判红灯 T2）")
+    if getattr(snap, "proxy_outage_note", ""):
+        lines.append(f"代理状态: {snap.proxy_outage_note}")
     if snap.slot_inventory is not None:
         si = snap.slot_inventory
         slot_line = (

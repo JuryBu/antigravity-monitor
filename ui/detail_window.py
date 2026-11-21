@@ -11,6 +11,7 @@ from core.log_monitor import (
     ConversationDetailPoint,
     ConversationDetailReport,
     MonitorSnapshot,
+    compute_large_ctx_ttft_allowance,
     format_countdown,
     format_delta_tokens,
     format_detail_text_report,
@@ -631,21 +632,23 @@ class ConversationDetailWindow:
         # Recompute all 4 KPI cards strictly for the active window ('60' vs 'all')
         wstats = summarize_detail_points(pts)
         self._current_wstats = wstats
+        large_ctx_allow = compute_large_ctx_ttft_allowance(rep.latest_context_tokens, rep.max_context_tokens)
+        cal_title_tag = f" (+{large_ctx_allow:.0f}s校)" if large_ctx_allow >= 10.0 else ""
         is_sliced_60 = self._window_mode == "60" and len(rep.points) > 60
         if is_sliced_60:
             self._kpi_cards[0]["title"].configure(text="请求体规模 (近60步)")
             self._kpi_cards[1]["title"].configure(text="近 60 步缓存命中")
-            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT (近60步)")
+            self._kpi_cards[2]["title"].configure(text=f"首字延迟 TTFT (近60步){cal_title_tag}")
             self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜 (近60步)")
         elif self._window_mode == "60":
             self._kpi_cards[0]["title"].configure(text="请求体规模 / 变化")
             self._kpi_cards[1]["title"].configure(text=f"近 60 步命中 (全{len(rep.points)}步)")
-            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT")
+            self._kpi_cards[2]["title"].configure(text=f"首字延迟 TTFT{cal_title_tag}")
             self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜")
         else:
             self._kpi_cards[0]["title"].configure(text="请求体规模 / 变化")
             self._kpi_cards[1]["title"].configure(text="全程缓存有效命中")
-            self._kpi_cards[2]["title"].configure(text="首字延迟 TTFT (全程)")
+            self._kpi_cards[2]["title"].configure(text=f"首字延迟 TTFT (全程){cal_title_tag}")
             self._kpi_cards[3]["title"].configure(text="生成吞吐 / 保鲜 (全程)")
 
         # KPI 1: Context size & delta (window-scoped peak, compaction count & revert count)

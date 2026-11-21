@@ -53,8 +53,8 @@ python -B main.py --json --readonly --conversation-id <id>
 
 | 退出码 | 对应 `pressure` | 含义与判定条件 |
 |---|---|---|
-| `0` | `normal` | 健康正常或在线新号待采样：`grade` 为 `T0` 或在线无异常 `WAIT`，且当前口径今日步数低于黄线预警值（默认 `960`） |
-| `1` | `warn` / `red` / `degraded` | 需降频或存在异常：触及今日步数黄线（`warn`，默认 `>= 960`）、触及今日步数红线（`red`，默认 `>= 1200`）、单步异常掉缓存/疑似暗限速/偶发 1 次 503（`WARN`），或连续/频繁掉缓存与限流封禁（`T1` / `T2` / `T3`，`degraded`） |
+| `0` | `normal` | 健康正常或在线新号待采样：`grade` 为 `T0` 或在线无异常 `WAIT`，且当前口径今日步数低于参考黄线（初始默认 `960`，可随账号历史实绩自适应调整） |
+| `1` | `warn` / `red` / `degraded` | 需留意或存在异常：触及今日步数参考黄线（`warn`）或参考红线（`red`，**仅作容量参考提醒，不等于账号实际降权；自动化策略应以持续性的 `grade`/`cache`/`perf`/`account` 实际状态为准，不凭瞬时波动或纯步数硬停**）、单步异常掉缓存/疑似暗限速/偶发 1 次 503/重图上传超时/代理断流（`WARN`），或持续掉缓存与服务端限流封禁（`T1` / `T2` / `T3`，`degraded`） |
 | `2` | `offline_unknown` | 离线、证据不足或参数/采集失败：`grade == "IDLE"`（客户端未在线且无近 2 分钟实时轨迹）、离线指定无记录账号，或命令行参数错误、运行期读取异常（此时 `--json` 仍保证输出合法 JSON，含 `"ok": false` 与 `"error"`） |
 
 ---
@@ -99,7 +99,8 @@ python -B main.py --json --readonly --conversation-id <id>
 | `account_today_steps` / `total_today_steps` | 当前账号今日步数 / 全机今日总步数 |
 | `main_today_steps` / `subagent_today_steps` | 当前口径下的**主对话步数**与**子代理步数**（服务端按整账号累计，`today_steps = main + subagent`） |
 | `total_main_today_steps` / `total_subagent_today_steps` | 全机口径的主对话步数与子代理步数 |
-| `daily_steps_warn` / `daily_steps_alert` | 黄线 / 红线阈值（默认 `960` / `1200`） |
+| `daily_steps_warn` / `daily_steps_alert` | 当前生效的黄线 / 红线阈值（初始建议默认 `960` / `1200`，按该账号严格早于今日的历史实绩自动平滑上调或保守收紧） |
+| `daily_steps_base_alert` / `daily_steps_limit_mode` / `daily_steps_limit_note` / `account_hist_safe_peak` | 可选自适应保护线元信息：配置初始基准红线、`default \| adaptive_up \| adaptive_down` 模式、人类可读调整依据与历史单日纯健康峰值 |
 | `remaining_to_warn` / `remaining_to_alert` | 距黄线 / 红线的剩余步数（最低 `0`） |
 | `usage_pct` | 相对红线阈值的百分比 |
 | `last_1h_steps` | 当前口径近 60 分钟步数 |
@@ -109,7 +110,7 @@ python -B main.py --json --readonly --conversation-id <id>
 
 - **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `abnormal_zero`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
 - **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`；已排除极短输出 `<0.15s` 假 TPS 与高 TPS / 多模态原图上传耗时误判）。
-- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，并按 `±6s` 反查出事对话短 ID 与标题）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数（附 `scope_label`；`errors_30m` 附 `window_min` 与 `t2_recovery_note` 事后恢复说明；`errors_today` 另附 `machine_*` 全机今日累计）；单次流超时或单次 503 报 `WARN`，累计 `>= 2` 次（`503 + timeout >= 2`）才升红 `T2`，且仅当主对话同档/主力模型事后连续稳定响应（中位 TTFT `< 45s`，排除子代理与轻量免疫模型洗白）时才稳定降级观察防反复横跳。
+- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，按 `ERROR_MESSAGE ±6s` 与 `USER_INPUT` 瞬时快照两阶段反查出事对话并自动分流重图大包上传超时 `heavy_media_timeout` 免误升 T2）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数，以及 `errors_30m` 可选字段 `heavy_media_timeout`、`proxy_outage`、`proxy_outage_note`（跨接口 60s 爆发代理断流计数与说明，离线/历史视图不误升 `WARN`）、`window_min` 与 `t2_recovery_note`（`errors_today` 另附 `machine_*` 全机今日累计）；仅非重图服务端 `503 + timeout >= 2` 才升级红 `T2`，事后按主对话模型结合大上下文（`>=300K`）弹性校准与重图满速豁免评估恢复，严格保留真实 TTFT 展示且需 `>=2` 步常规步才回绿 `T0`。
 - **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
 - **`models_recent`**：数组，按当前账号观测范围内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg`、`steps_after_last_t2`（最近一次 503/超时后的成功步数）与 `ttft_after_last_t2_median`（事后中位 TTFT，防多模态单步长尾误判）。
 - **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常或 `slots.main_at_risk == true` 时保证包含对应高危告警条目。
@@ -118,7 +119,7 @@ python -B main.py --json --readonly --conversation-id <id>
 ### 4. `counts`、`active_conversations`、`carryover_conversations` 与 `target_conversation`
 
 - **`counts`**：`active_main`、`active_subagent`、`active_total`。
-- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`title`（对话标题，依次三源解析：`annotations/*.pbtxt` 本地元数据 → 在线本地 Hub `GetAllCascadeTrajectories` → 离线 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`latest_cache_reason`、`active_media_count`、`active_media_bytes`、`media_ttft_exempted`、`is_carryover_preview`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
+- **`active_conversations`**：最多 24 条最近活跃会话（**内置主对话槽位保护：最多保护 12 条活跃主对话，大批并发子代理不会把主对话挤出活跃观测或掩盖主对话 T1 掉缓存**），每条包含 `conversation_id`、`short_id`、`title`（对话标题，依次三源解析：`annotations/*.pbtxt` 本地元数据 → 在线本地 Hub `GetAllCascadeTrajectories` → 离线 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`latest_cache_reason`、`active_media_count`、`active_media_bytes`、`media_ttft_exempted`、`is_carryover_preview`、`large_ctx_ttft_allowance_sec`（`>=300K` 逼近压缩窗 TTFT 校准余量秒数，`<300K` 为 `0.0`）、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
 - **`carryover_conversations`**：可选只读过渡列表（默认实时自动跟随视角下，最多 2 条近 10 分钟活跃但当前账号尚无新步的主对话入口，`is_carryover_preview: true`），严格与 `active_conversations` 及健康评级隔离，仅用于提示同窗口换号待首步及快速进入跨号长线详情。
 - **`target_conversation`**：仅当传入 `--conversation-id` 时填充；除上述字段外，还包含 `recent_steps`（近 10 步逐拍 `total_tokens`、`context_delta`、`hit_rate`、`classification`、`reason`、`is_account_switch`、`active_media_count`、`active_media_bytes`）。同时顶层附 `target_conversation_query` 与 `target_conversation_found`。
 

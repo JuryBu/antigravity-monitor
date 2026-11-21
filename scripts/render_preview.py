@@ -248,10 +248,10 @@ def _build_demo_detail_report() -> ConversationDetailReport:
         (6, "Carbon High", 192400, 24200, 0.0, "expected_cold", "model_switch", 22.5, 148.0, 6.0, False, False, False, 3, 4_850_000),
         (7, "Carbon High", 228900, 36500, 98.4, "hit", "cached", 16.4, 156.0, 4.8, False, False, False, 3, 4_850_000),
         (8, "Carbon High", 264100, 35200, 0.0, "expected_cold", "account_switch", 24.1, 151.0, 4.2, False, False, True, 3, 4_850_000),
-        (9, "Carbon High", 295600, 31500, 99.1, "hit", "cached", 14.2, 165.0, 5.1, False, False, False, 3, 4_850_000),
-        (10, "Carbon High", 118400, -177200, 0.0, "expected_cold", "compact_reset", 18.0, 171.0, 3.8, False, True, False, 0, 0),
-        (11, "Carbon High", 152000, 33600, 98.7, "hit", "cached", 12.1, 174.0, 4.1, False, False, False, 1, 2_100_000),
-        (12, "Neon XHigh", 184600, 32600, 99.2, "hit", "cached", 48.2, 168.0, 5.6, False, False, False, 4, 6_400_000),
+        (9, "Carbon High", 385600, 31500, 99.1, "hit", "cached", 14.2, 165.0, 5.1, False, False, False, 3, 4_850_000),
+        (10, "Carbon High", 218400, -167200, 0.0, "expected_cold", "compact_reset", 18.0, 171.0, 3.8, False, True, False, 0, 0),
+        (11, "Carbon High", 342000, 123600, 98.7, "hit", "cached", 19.1, 174.0, 4.1, False, False, False, 1, 2_100_000),
+        (12, "Neon XHigh", 473800, 131800, 99.2, "hit", "cached", 48.2, 168.0, 5.6, False, False, False, 4, 6_400_000),
     ]
     for idx, (sidx, mod, tot, dlt, hr, cls, rsn, ttft, tps, strm, rev, cmp_, acc_sw, mc, mb) in enumerate(specs):
         cached = int(tot * (hr / 100.0))
@@ -279,15 +279,15 @@ def _build_demo_detail_report() -> ConversationDetailReport:
             )
         )
     return ConversationDetailReport(
-        conversation_id="demo-detail-v72-0000-000000000001",
+        conversation_id="demo-detail-v721-0000-000000000001",
         short_id="demo72",
         is_subagent=False,
         model="Neon XHigh",
         model_raw="gemini-4-neon-xhigh",
         total_steps=len(pts),
         today_steps=len(pts),
-        peak_context_tokens=295600,
-        latest_context_tokens=184600,
+        peak_context_tokens=473800,
+        latest_context_tokens=473800,
         latest_context_delta=32600,
         max_context_tokens=512000,
         compact_count=1,
@@ -305,8 +305,104 @@ def _build_demo_detail_report() -> ConversationDetailReport:
         freshness_invalid_reason="",
         freshness_window_sec=210,
         points=pts,
-        title="v7.2 跨号与多图长线演示",
+        title="v7.2.1 跨号多图与大窗校准演示",
         revert_count=0,
+    )
+
+
+def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
+    now = time.time()
+    ok_steps = [
+        StepRecord(i, now - (10 - i) * 25, "gemini-4-neon-xhigh", 2400, 471400, 620, 473800, 99.5, "hit", "cached")
+        for i in range(1, 11)
+    ]
+    c_big = ConversationSummary(
+        conversation_id="demo7210-0000-0000-0000-000000000001",
+        short_id="demo71",
+        model="Neon XHigh",
+        model_raw="gemini-4-neon-xhigh",
+        context_tokens=473800,
+        max_context_tokens=512000,
+        latest_hit_rate=99.5,
+        latest_cached_in=471400,
+        latest_uncached_in=2400,
+        latest_timestamp=now - 12,
+        recent_steps=ok_steps,
+        consec_miss=0,
+        consec_miss_start_step=0,
+        single_miss=False,
+        wasted_cold_tokens=0,
+        freshness_remaining_sec=192,
+        freshness_invalid_reason="",
+        ttft_sec=56.2,
+        streaming_sec=4.5,
+        tps=198.0,
+        shard_tag="dm71",
+        speed_status="ok",
+        recent_ttfts=[32.0, 38.5, 42.1, 49.0, 56.2],
+        recent_tps_list=[205.0, 196.0, 202.0, 194.0, 198.0],
+        ttft_avg_sec=43.6,
+        ttft_max_sec=56.2,
+        large_ctx_ttft_allowance_sec=28.9,
+        title="超大上下文与并发告警演示",
+    )
+    return MonitorSnapshot(
+        generated_at=now,
+        level="orange",
+        grade="WARN",
+        headline="留意预警 · Neon XHigh",
+        sub_headline="代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流) / 多图上传超时 (10m) · demo71 [图13(26.2M)] (2次)，建议压图或/compact",
+        active_model="Neon XHigh",
+        primary_hit_rate=99.5,
+        primary_hit_classification="hit",
+        primary_tps=198.0,
+        primary_ttft=56.2,
+        primary_speed_status="ok",
+        min_freshness_sec=192,
+        min_freshness_conv="demo71",
+        min_freshness_ctx=473800,
+        min_freshness_invalid_reason="",
+        today_steps=1180,
+        daily_steps_warn=1280,
+        daily_steps_alert=1600,
+        active_conversations=[c_big],
+        large_freshness_list=[c_big],
+        recent_503=0,
+        today_503=0,
+        recent_timeout=2,
+        today_timeout=2,
+        recent_403=0,
+        today_403=0,
+        recent_retry=3,
+        today_retry=3,
+        recent_events=[],
+        wasted_cold_tokens_total=0,
+        max_consec_miss=0,
+        account=AccountQuotaInfo(
+            email_masked="de***o@example.com",
+            short_label="de***o",
+            tier="demo-tier",
+            five_hour_pct=82.0,
+            weekly_pct=71.0,
+            online=True,
+            observed_at=now,
+        ),
+        sliding_window_min=30,
+        freshness_window_sec=210,
+        primary_ttft_avg=43.6,
+        primary_ttft_max=56.2,
+        primary_recent_ttfts=[32.0, 38.5, 42.1, 49.0, 56.2],
+        account_today_steps=1180,
+        total_today_steps=1240,
+        steps_scope_label="de***o",
+        resolved_account="de***o",
+        heavy_media_timeout_recent=2,
+        proxy_outage_recent=12,
+        proxy_outage_note="代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流)",
+        daily_steps_limit_mode="adaptive_up",
+        daily_steps_limit_note="按历史安全峰值 1400 步自适应上调",
+        daily_steps_base_alert=1200,
+        account_hist_safe_peak=1400,
     )
 
 
@@ -348,23 +444,30 @@ def main() -> int:
             app.render_snapshot(live_snap)
             _capture_widget(app.root, out_dir / "shot_4_live_expanded_obsidian.png")
 
-            # 6. Auto-update prompt banner simulation (Scheme B Midnight Blue)
+            # 6. Auto-update prompt banner simulation (Scheme B Midnight Blue - notify mode preview)
             from core.updater import UpdateCheckResult
             app.set_theme("midnight_blue")
+            app.config["update_mode"] = "notify"
             app.render_snapshot(live_snap)
             app._on_update_check_result(
                 UpdateCheckResult(
                     checked_at=time.time(),
-                    local_version="7.2.0",
+                    local_version="7.2.1",
                     remote_version="7.3.0",
                     has_update=True,
-                    summary="修复 403 误报、换号冷启提示与多图免误判",
+                    summary="多图超时免误判 T2、代理断流识别与自适应保护线",
                     released_at="2026-11-22",
                     install_mode="zip",
                     is_manual=True,
                 )
             )
             _capture_widget(app.root, out_dir / "shot_6_update_banner_midnight.png")
+
+            # 8. v7.2.1 concurrent heavy-media timeout + proxy outage WARN + adaptive steps preview
+            app._hide_update_banner()
+            warn_v721 = _build_demo_v721_warn_snapshot()
+            app.render_snapshot(warn_v721)
+            _capture_widget(app.root, out_dir / "shot_8_v721_warn_adaptive_midnight.png")
 
             # 7. Detail window simulation (multimodal payload + account-switch line + 1109x722 lock)
             demo_rep = _build_demo_detail_report()
@@ -396,7 +499,7 @@ def main() -> int:
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=24), (x_base + 14, 108))
         strip.alpha_composite(build_tray_icon(base_png, level=lvl, size=16), (x_base + 50, 112))
     strip.save(out_dir / "shot_5_tray_three_states.png", "PNG")
-    print(f"Captured 7 verification images in {out_dir}")
+    print(f"Captured 8 verification images in {out_dir}")
     return 0
 
 

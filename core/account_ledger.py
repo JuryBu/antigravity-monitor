@@ -12,8 +12,9 @@ import datetime
 import json
 import os
 import re
+import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 COCKPIT_SWITCH_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+INFO\s+\[Antigravity[^\]]*\]\s+写入系统凭据:\s*(\S+)",
@@ -80,45 +81,223 @@ class AccountSwitchLedger:
         self.cockpit_logs_dir: Optional[Path] = Path(cockpit_logs_dir) if cockpit_logs_dir is not None else None
         self.read_only: bool = bool(read_only)
         self._own_events: List[Tuple[float, str]] = []
+        self._daily_step_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._cockpit_cache: Dict[str, Tuple[Tuple[int, int], List[Tuple[float, str]]]] = {}
         self._load_own()
+
+    @staticmethod
+    def _parse_nonneg_int(raw: Any, default: int = 0) -> Optional[int]:
+        if raw is None or isinstance(raw, bool):
+            return None if raw is None else default
+        try:
+            val = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return max(0, val)
 
     def _load_own(self) -> None:
         if self.ledger_path is None or not self.ledger_path.is_file():
             return
         try:
             data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
             return
         events: List[Tuple[float, str]] = []
-        for item in data.get("events") or []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                ts = float(item["ts"])
-                lbl = _mask_short(str(item.get("label", "")))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if ts > 0 and lbl and not _is_invalid_label(lbl):
-                events.append((ts, lbl))
+        raw_events = data.get("events")
+        if isinstance(raw_events, list):
+            for item in raw_events:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    raw_ts = item["ts"]
+                    if isinstance(raw_ts, bool):
+                        continue
+                    ts = float(raw_ts)
+                    lbl = _mask_short(str(item.get("label", "")))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                if ts > 0 and lbl and not _is_invalid_label(lbl):
+                    events.append((ts, lbl))
         events.sort(key=lambda x: x[0])
         self._own_events = events[-120:]
+
+        profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        canon_by_low: Dict[str, str] = {}
+        raw_profiles = data.get("daily_step_profiles")
+        if isinstance(raw_profiles, dict):
+            for raw_acct, days_map in raw_profiles.items():
+                lbl = _mask_short(str(raw_acct))
+                if not lbl or _is_invalid_label(lbl) or not isinstance(days_map, dict):
+                    continue
+                low = lbl.lower()
+                canon_lbl = canon_by_low.setdefault(low, lbl)
+                target_days = profiles.setdefault(canon_lbl, {})
+                for day_k, rec in days_map.items():
+                    if not isinstance(day_k, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", day_k):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    raw_safe = rec.get("safe_steps", 0)
+                    raw_max = rec.get("max_steps", raw_safe)
+                    raw_deg = rec.get("degraded_at")
+                    if isinstance(raw_safe, bool) or isinstance(raw_max, bool) or isinstance(raw_deg, bool):
+                        continue
+                    safe_s = self._parse_nonneg_int(raw_safe, 0)
+                    max_s = self._parse_nonneg_int(raw_max, 0)
+                    if safe_s is None or max_s is None:
+                        continue
+                    max_s = max(safe_s, max_s)
+                    deg_at: Optional[int] = None
+                    if raw_deg is not None:
+                        parsed_deg = self._parse_nonneg_int(raw_deg, 0)
+                        if parsed_deg is None or parsed_deg <= 0:
+                            continue
+                        deg_at = parsed_deg
+                        safe_s = min(safe_s, max(0, deg_at - 1))
+                    prev = target_days.get(day_k)
+                    if prev is None:
+                        target_days[day_k] = {"safe_steps": safe_s, "max_steps": max_s, "degraded_at": deg_at}
+                    else:
+                        merged_deg = (
+                            min(prev["degraded_at"], deg_at)
+                            if (prev["degraded_at"] is not None and deg_at is not None)
+                            else (prev["degraded_at"] if prev["degraded_at"] is not None else deg_at)
+                        )
+                        merged_safe = max(prev["safe_steps"], safe_s)
+                        if merged_deg is not None:
+                            merged_safe = min(merged_safe, max(0, merged_deg - 1))
+                        target_days[day_k] = {
+                            "safe_steps": merged_safe,
+                            "max_steps": max(prev["max_steps"], max_s, merged_safe),
+                            "degraded_at": merged_deg,
+                        }
+        # Trim each account to latest 30 dates and keep top 32 most recently active accounts
+        trimmed: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        active_accts = [
+            (max(dmap.keys()), lbl)
+            for lbl, dmap in profiles.items()
+            if dmap
+        ]
+        active_accts.sort(key=lambda x: x[0])
+        for _last_day, lbl in active_accts[-32:]:
+            dmap = profiles[lbl]
+            trimmed[lbl] = {dk: dmap[dk] for dk in sorted(dmap.keys())[-30:]}
+        self._daily_step_profiles = trimmed
 
     def _save_own(self) -> None:
         if self.read_only or self.ledger_path is None:
             return
+        tmp: Optional[Path] = None
         try:
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(
-                {"version": 1, "events": [{"ts": round(ts, 3), "label": lbl} for ts, lbl in self._own_events[-120:]]},
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n"
-            tmp = self.ledger_path.with_name(f"{self.ledger_path.name}.tmp.{os.getpid()}")
+            out_obj: Dict[str, Any] = {
+                "version": 1,
+                "events": [{"ts": round(ts, 3), "label": lbl} for ts, lbl in self._own_events[-120:]],
+            }
+            if self._daily_step_profiles:
+                active_accts = [
+                    (max(dmap.keys()), lbl)
+                    for lbl, dmap in self._daily_step_profiles.items()
+                    if dmap
+                ]
+                active_accts.sort(key=lambda x: x[0])
+                trimmed_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for _last_day, lbl in active_accts[-32:]:
+                    dmap = self._daily_step_profiles[lbl]
+                    keep_days = sorted(dmap.keys())[-30:]
+                    trimmed_profiles[lbl] = {dk: dmap[dk] for dk in keep_days}
+                out_obj["daily_step_profiles"] = trimmed_profiles
+            payload = json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
+            tmp = self.ledger_path.with_name(f"{self.ledger_path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
             tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, self.ledger_path)
+            tmp = None
         except OSError:
-            pass
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def get_account_daily_profiles(self, short_label: str) -> Dict[str, Dict[str, Any]]:
+        """Return a shallow copy of stored per-day step stats for a masked account label."""
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return {}
+        target_low = lbl.lower()
+        for k, dmap in self._daily_step_profiles.items():
+            if k.lower() == target_low:
+                return {dk: dict(dv) for dk, dv in dmap.items()}
+        return {}
+
+    def record_daily_step_profile(
+        self,
+        short_label: str,
+        date_str: str,
+        today_steps: int,
+        is_healthy: bool,
+        is_degraded: bool,
+    ) -> None:
+        """Throttled privacy-safe persistence of per-account daily safe step capacity & degradation points."""
+        if self.read_only or today_steps <= 0:
+            return
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str or ""):
+            return
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return
+        # Reuse existing canonical casing if already present
+        canon_key = next((k for k in self._daily_step_profiles if k.lower() == lbl.lower()), lbl)
+        dmap = self._daily_step_profiles.setdefault(canon_key, {})
+        prev = dmap.get(date_str)
+        prev_safe = int(prev.get("safe_steps", 0)) if prev else 0
+        prev_max = int(prev.get("max_steps", 0)) if prev else 0
+        prev_deg = prev.get("degraded_at") if prev else None
+
+        new_max = max(prev_max, int(today_steps))
+        new_deg = prev_deg
+        if is_degraded:
+            new_deg = min(prev_deg, int(today_steps)) if prev_deg is not None else int(today_steps)
+        # Only advance safe_steps while healthy AND strictly before any degradation on this day
+        new_safe = prev_safe
+        if new_deg is not None:
+            new_safe = min(new_safe, max(0, new_deg - 1))
+        elif is_healthy:
+            new_safe = max(prev_safe, int(today_steps))
+
+        dirty = False
+        if prev is None:
+            if new_safe >= 50 or new_deg is not None or new_max >= 50:
+                dirty = True
+        else:
+            if new_deg != prev_deg:
+                dirty = True
+            elif (new_safe - prev_safe) >= 25 or (new_max - prev_max) >= 50:
+                dirty = True
+        if not dirty:
+            return
+
+        dmap[date_str] = {
+            "safe_steps": new_safe,
+            "max_steps": new_max,
+            "degraded_at": new_deg,
+        }
+        if len(dmap) > 30:
+            for old_k in sorted(dmap.keys())[:-30]:
+                dmap.pop(old_k, None)
+        # Evict least recently active accounts (never evicting active main accounts by FIFO insertion order)
+        while len(self._daily_step_profiles) > 32:
+            evict_candidates = [k for k in self._daily_step_profiles if k != canon_key]
+            if not evict_candidates:
+                break
+            oldest_acct = min(
+                evict_candidates,
+                key=lambda k: max(self._daily_step_profiles[k].keys()) if self._daily_step_profiles[k] else "",
+            )
+            self._daily_step_profiles.pop(oldest_acct, None)
+        self._save_own()
 
     def observe_online(
         self,

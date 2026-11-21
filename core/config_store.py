@@ -36,6 +36,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "slot_clean_mode": "recycle",
     "slot_archive_dir": "",
     "update_check_enabled": True,
+    "update_mode": "download",
     "auto_update_restart": False,
     "update_check_interval_min": 30,
     "update_ignored_version": "",
@@ -44,6 +45,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 VALID_THEMES = ("midnight_blue", "obsidian_dark")
 VALID_CONV_FILTERS = ("main", "subagent", "all")
 VALID_SLOT_CLEAN_MODES = ("recycle", "archive", "delete")
+VALID_UPDATE_MODES = ("download", "auto_restart", "notify")
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -106,7 +108,16 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
     cfg["slot_archive_dir"] = str(arch_dir).strip() if isinstance(arch_dir, str) else ""
 
     cfg["update_check_enabled"] = bool(raw.get("update_check_enabled", True))
-    cfg["auto_update_restart"] = bool(raw.get("auto_update_restart", False)) and cfg["update_check_enabled"]
+    raw_upd_mode = raw.get("update_mode")
+    if isinstance(raw_upd_mode, str) and raw_upd_mode in VALID_UPDATE_MODES:
+        cfg["update_mode"] = raw_upd_mode
+        cfg["auto_update_restart"] = (raw_upd_mode == "auto_restart") and cfg["update_check_enabled"]
+    else:
+        legacy_auto = bool(raw.get("auto_update_restart", False))
+        cfg["update_mode"] = "auto_restart" if legacy_auto else "download"
+        cfg["auto_update_restart"] = legacy_auto and cfg["update_check_enabled"]
+    if not cfg["update_check_enabled"] and cfg["update_mode"] == "auto_restart":
+        cfg["auto_update_restart"] = False
     cfg["update_check_interval_min"] = _clamp_int(raw.get("update_check_interval_min"), 30, 10, 1440)
     ign_ver = raw.get("update_ignored_version")
     cfg["update_ignored_version"] = str(ign_ver).strip()[:32] if isinstance(ign_ver, str) else ""

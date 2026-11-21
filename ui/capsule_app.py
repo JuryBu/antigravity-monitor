@@ -21,6 +21,7 @@ from core.log_monitor import (
     HISTORY_RANGE_SPECS,
     AntigravityMonitorEngine,
     MonitorSnapshot,
+    compute_adaptive_daily_steps_limits,
     format_countdown,
     format_delta_tokens,
     format_media_size,
@@ -33,7 +34,7 @@ from core.log_monitor import (
 from core.slot_manager import SlotCleanupResult, SlotInventorySnapshot, format_bytes_human
 from core.startup_manager import is_startup_enabled, set_startup_enabled
 from core.updater import UpdateApplyResult, UpdateCheckResult, UpdateManager
-from core.version import APP_VERSION, read_local_version_info
+from core.version import APP_VERSION, is_newer_version, read_local_version_info
 from ui.detail_window import ConversationDetailWindow
 from ui.slots_window import ConversationSlotsWindow
 from ui.themes import THEMES, get_theme
@@ -146,6 +147,7 @@ class AntigravityCapsuleApp:
         self._start_minimized_override = start_minimized_override
         self._updater: Optional[UpdateManager] = update_manager
         self._local_version: str = str(read_local_version_info(self.app_root).get("version") or APP_VERSION)
+        self._running_version: str = self._local_version
 
         self._expanded: bool = False
         self._visible: bool = True
@@ -198,6 +200,7 @@ class AntigravityCapsuleApp:
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
         self._var_auto_clean = tk.BooleanVar(value=bool(self.config.get("slot_auto_clean_enabled", True)))
         self._var_update_check = tk.BooleanVar(value=bool(self.config.get("update_check_enabled", True)))
+        self._var_update_mode = tk.StringVar(value=self._current_update_mode())
         self._var_auto_update = tk.BooleanVar(value=bool(self.config.get("auto_update_restart", False)))
 
         self._tooltip_win: Optional[tk.Toplevel] = None
@@ -208,6 +211,7 @@ class AntigravityCapsuleApp:
         self._pinned_conv_id: Optional[str] = None
         self._fresh_hover_text: str = ""
         self._speed_hover_text: str = ""
+        self._steps_hover_text: str = ""
         self._slots_hover_text: str = ""
         self._detail_win: Optional[ConversationDetailWindow] = None
         self._slots_win: Optional[ConversationSlotsWindow] = None
@@ -218,7 +222,10 @@ class AntigravityCapsuleApp:
         self._ctx_update_menu_idx: Optional[int] = None
         self._latest_update: Optional[UpdateCheckResult] = None
         self._update_busy: bool = False
+        self._downloaded_ready_version: str = ""
         self._notified_update_version: str = ""
+        self._notified_update_error_key: str = ""
+        self._consecutive_update_check_errors: int = 0
         self._update_banner_visible: bool = False
         self._update_banner_is_error: bool = False
         self._temp_banner_until: float = 0.0
@@ -384,6 +391,9 @@ class AntigravityCapsuleApp:
         self._steps_canvas = tk.Canvas(self._card_head, height=7, highlightthickness=0, bd=0)
         self._steps_canvas.pack(fill="x")
         self._steps_canvas.bind("<Configure>", lambda _e: self._draw_steps_progress(self._last_steps_pct, self._last_steps_color))
+        for stw in (self._lbl_steps_title, self._lbl_steps_val, self._steps_canvas):
+            stw.bind("<Enter>", self._show_steps_tooltip)
+            stw.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         head_row_slots = tk.Frame(self._card_head)
         head_row_slots.pack(fill="x", pady=(6, 3))
@@ -488,18 +498,18 @@ class AntigravityCapsuleApp:
             cursor="hand2",
         )
         self._btn_update_now.pack(side="left", padx=(0, 4))
-        self._btn_update_now.bind("<Button-1>", lambda _e: self.trigger_apply_update())
+        self._btn_update_now.bind("<Button-1>", lambda _e: self._on_btn_update_now_click())
 
         self._btn_update_auto = tk.Label(
             self._update_banner_btns,
-            text="自动更新:关",
+            text="后台下载",
             font=(UI_FONT, 8),
             padx=6,
             pady=1,
             cursor="hand2",
         )
         self._btn_update_auto.pack(side="left", padx=(0, 4))
-        self._btn_update_auto.bind("<Button-1>", lambda _e: self.toggle_auto_update_restart())
+        self._btn_update_auto.bind("<Button-1>", lambda _e: self.cycle_update_mode())
 
         self._btn_update_dismiss = tk.Label(
             self._update_banner_btns,
@@ -756,7 +766,26 @@ class AntigravityCapsuleApp:
         self._ctx_menu.add_checkbutton(label="启用异常通知", variable=self._var_notifications, command=self.toggle_notifications)
         self._ctx_menu.add_checkbutton(label="自动清理老旧子代理", variable=self._var_auto_clean, command=self.toggle_auto_clean_slots)
         self._ctx_menu.add_checkbutton(label="后台检查更新提示", variable=self._var_update_check, command=self.toggle_update_check_enabled)
-        self._ctx_menu.add_checkbutton(label="发现更新时自动更新重启", variable=self._var_auto_update, command=self.toggle_auto_update_restart)
+        self._ctx_update_mode_menu = tk.Menu(self._ctx_menu, tearoff=False)
+        self._ctx_update_mode_menu.add_radiobutton(
+            label="后台下载（下次启动自动生效）",
+            variable=self._var_update_mode,
+            value="download",
+            command=lambda: self.set_update_mode("download"),
+        )
+        self._ctx_update_mode_menu.add_radiobutton(
+            label="自动下载并立即重启",
+            variable=self._var_update_mode,
+            value="auto_restart",
+            command=lambda: self.set_update_mode("auto_restart"),
+        )
+        self._ctx_update_mode_menu.add_radiobutton(
+            label="仅提示（手动点击更新）",
+            variable=self._var_update_mode,
+            value="notify",
+            command=lambda: self.set_update_mode("notify"),
+        )
+        self._ctx_menu.add_cascade(label="更新方式", menu=self._ctx_update_mode_menu)
         self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="查看本机 500 槽位详情", command=self.open_slots_window)
         self._ctx_menu.add_command(label=self._format_clean_menu_label(), command=self.trigger_manual_subagent_cleanup)
@@ -975,6 +1004,7 @@ class AntigravityCapsuleApp:
         self._var_notifications.set(bool(self.config["notifications_enabled"]))
         self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
         self._var_update_check.set(bool(self.config.get("update_check_enabled", True)))
+        self._var_update_mode.set(self._current_update_mode())
         self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
         if self._ctx_clean_menu_idx is not None:
             try:
@@ -1444,22 +1474,30 @@ class AntigravityCapsuleApp:
         self._temp_banner_until = time.monotonic() + max(1.0, float(duration_sec))
         self._lbl_banner.configure(text=text)
 
+    def _current_update_mode(self) -> str:
+        raw = str(self.config.get("update_mode") or "").strip()
+        if raw in ("download", "auto_restart", "notify"):
+            return raw
+        return "auto_restart" if bool(self.config.get("auto_update_restart", False)) else "download"
+
     def _active_update_candidate(self) -> Optional[UpdateCheckResult]:
         upd = self._latest_update
         if upd is None or not upd.has_update or not upd.remote_version:
             return None
         ignored = str(self.config.get("update_ignored_version") or "").strip()
-        if ignored and ignored == upd.remote_version and not bool(self.config.get("auto_update_restart", False)):
+        if ignored and ignored == upd.remote_version and self._current_update_mode() != "auto_restart":
             return None
         return upd
 
     def _format_update_menu_label(self) -> str:
         if self._update_busy:
             return "正在更新中…"
+        if self._downloaded_ready_version:
+            return f"立即重启应用 v{self._downloaded_ready_version}"
         upd = self._active_update_candidate()
         if upd is not None:
             return f"更新至 v{upd.remote_version} 并重启"
-        return f"立即检查更新 (v{self._local_version})"
+        return f"立即检查更新 (v{self._running_version})"
 
     def _apply_update_banner_theme(self, is_error: Optional[bool] = None) -> None:
         if is_error is not None:
@@ -1482,22 +1520,34 @@ class AntigravityCapsuleApp:
 
     def _sync_update_auto_button(self) -> None:
         t = self.theme
-        enabled = bool(self.config.get("auto_update_restart", False))
-        if enabled:
-            self._btn_update_auto.configure(text="自动更新:开", bg=t["green_bg"], fg=t["green"])
+        mode = self._current_update_mode()
+        if mode == "auto_restart":
+            self._btn_update_auto.configure(text="自动重启", bg=t["green_bg"], fg=t["green"])
+        elif mode == "download":
+            self._btn_update_auto.configure(text="后台下载", bg=t["btn_hover"], fg=t["cyan"])
         else:
-            self._btn_update_auto.configure(text="自动更新:关", bg=t["btn_bg"], fg=t["text_secondary"])
+            self._btn_update_auto.configure(text="仅提示", bg=t["btn_bg"], fg=t["text_secondary"])
 
     def _on_bar_update_click(self) -> None:
         self.show_window()
         if not self._expanded:
             self.set_expanded(True)
 
+    def _on_btn_update_now_click(self) -> None:
+        if self._update_busy:
+            return
+        if self._downloaded_ready_version:
+            self.restart_app()
+            return
+        self.trigger_apply_update(auto_triggered=False, restart_on_done=True)
+
     def _show_update_banner(self, text: str, is_error: bool = False, badge_ver: str = "") -> None:
         self._lbl_update_banner.configure(text=text)
         self._apply_update_banner_theme(is_error=is_error)
         if self._update_busy:
             self._btn_update_now.configure(text="更新中…")
+        elif self._downloaded_ready_version and not is_error:
+            self._btn_update_now.configure(text="立即重启")
         else:
             self._btn_update_now.configure(text="立即更新重启")
         geometry_changed = False
@@ -1527,6 +1577,43 @@ class AntigravityCapsuleApp:
         if changed and self._visible:
             self._clamp_window_to_screen()
 
+    def _notify_update_error_once(self, dedupe_key: str, title: str, message: str) -> None:
+        if self.tray is None:
+            return
+        if dedupe_key and dedupe_key == self._notified_update_error_key:
+            return
+        self._notified_update_error_key = dedupe_key
+        self.tray.notify(title, message)
+
+    def set_update_mode(self, mode: str) -> None:
+        if mode not in ("download", "auto_restart", "notify"):
+            return
+        self.config["update_mode"] = mode
+        self.config["auto_update_restart"] = (mode == "auto_restart")
+        if mode in ("download", "auto_restart"):
+            self.config["update_check_enabled"] = True
+            self._var_update_check.set(True)
+        self.config = self.config_store.save(self.config)
+        self._var_update_mode.set(self._current_update_mode())
+        self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
+        self._sync_update_auto_button()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+        if self._downloaded_ready_version and mode == "auto_restart":
+            aid = self.root.after(350, self.restart_app)
+            self._after_ids.append(aid)
+            return
+        upd = self._active_update_candidate()
+        if mode in ("download", "auto_restart") and upd is not None and not self._update_busy:
+            self._ensure_updater().clear_failed_auto_version(upd.remote_version)
+            self.trigger_apply_update(auto_triggered=True, restart_on_done=(mode == "auto_restart"))
+
+    def cycle_update_mode(self) -> None:
+        order = ("download", "auto_restart", "notify")
+        cur = self._current_update_mode()
+        nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "download"
+        self.set_update_mode(nxt)
+
     def toggle_update_check_enabled(self) -> None:
         new_val = not bool(self.config.get("update_check_enabled", True))
         self.config["update_check_enabled"] = new_val
@@ -1536,6 +1623,7 @@ class AntigravityCapsuleApp:
             self._var_auto_update.set(False)
         self.config = self.config_store.save(self.config)
         self._var_update_check.set(new_val)
+        self._var_update_mode.set(self._current_update_mode())
         self._sync_update_auto_button()
         if self.tray is not None:
             self.tray.refresh_menu()
@@ -1544,20 +1632,7 @@ class AntigravityCapsuleApp:
 
     def toggle_auto_update_restart(self) -> None:
         new_val = not bool(self.config.get("auto_update_restart", False))
-        self.config["auto_update_restart"] = new_val
-        if new_val:
-            self.config["update_check_enabled"] = True
-            self._var_update_check.set(True)
-        self.config = self.config_store.save(self.config)
-        self._var_auto_update.set(new_val)
-        self._sync_update_auto_button()
-        if self.tray is not None:
-            self.tray.refresh_menu()
-        # If user turns on auto-update while a new version is already detected, apply right away
-        upd = self._active_update_candidate()
-        if new_val and upd is not None and not self._update_busy:
-            self._ensure_updater().clear_failed_auto_version(upd.remote_version)
-            self.trigger_apply_update(auto_triggered=True)
+        self.set_update_mode("auto_restart" if new_val else "download")
 
     def dismiss_current_update(self) -> None:
         if self._update_busy:
@@ -1575,7 +1650,7 @@ class AntigravityCapsuleApp:
         if self._closing or self._update_busy:
             return
         if is_manual:
-            self._set_temp_banner_notice(f"正在检查 GitHub 更新（当前 v{self._local_version}）…", duration_sec=6.0)
+            self._set_temp_banner_notice(f"正在检查 GitHub 更新（当前 v{self._running_version}）…", duration_sec=6.0)
         updater = self._ensure_updater()
         updater.trigger_async_check(
             on_result=lambda res: self.dispatch_to_ui(lambda r=res: self._on_update_check_result(r)),
@@ -1583,31 +1658,43 @@ class AntigravityCapsuleApp:
         )
 
     def check_or_apply_update(self) -> None:
+        if self._downloaded_ready_version and not self._update_busy:
+            self.restart_app()
+            return
         upd = self._active_update_candidate()
         if upd is not None and not self._update_busy:
-            self.trigger_apply_update(auto_triggered=False)
+            self.trigger_apply_update(auto_triggered=False, restart_on_done=True)
         else:
             self.check_for_updates_now(is_manual=True)
 
-    def trigger_apply_update(self, auto_triggered: bool = False) -> None:
+    def trigger_apply_update(self, auto_triggered: bool = False, restart_on_done: Optional[bool] = None) -> None:
         if self._closing or self._update_busy:
             return
         updater = self._ensure_updater()
         upd = self._active_update_candidate()
         target_ver = upd.remote_version if upd is not None else ""
+        if restart_on_done is None:
+            restart_on_done = (not auto_triggered) or (self._current_update_mode() == "auto_restart")
         self._update_busy = True
         ver_txt = f"v{target_ver}" if target_ver else "最新版"
-        prefix = "已开启自动更新，正在拉取" if auto_triggered else "正在下载并更新至"
-        self._show_update_banner(f"{prefix} {ver_txt}，完成后将自动重启…", is_error=False, badge_ver=target_ver)
+        if restart_on_done:
+            prefix = "已开启自动重启，正在拉取" if auto_triggered else "正在下载并更新至"
+            tail = "，完成后将自动重启…"
+        else:
+            prefix = "正在后台静默下载"
+            tail = "（下次启动生效）…"
+        self._show_update_banner(f"{prefix} {ver_txt}{tail}", is_error=False, badge_ver=target_ver)
         if self.tray is not None:
             self.tray.refresh_menu()
-            if auto_triggered and bool(self.config.get("notifications_enabled", True)):
+            if auto_triggered and restart_on_done and bool(self.config.get("notifications_enabled", True)):
                 self.tray.notify("反重力监控 · 自动更新", f"检测到 {ver_txt}，正在后台自动更新并重启…")
 
         updater.trigger_async_apply(
             expected_remote_version=target_ver,
-            on_done=lambda res, tv=target_ver: self.dispatch_to_ui(
-                lambda r=res, a=auto_triggered, exp=tv: self._on_update_apply_done(r, a, expected_version=exp)
+            on_done=lambda res, tv=target_ver, r_done=bool(restart_on_done): self.dispatch_to_ui(
+                lambda r=res, a=auto_triggered, exp=tv, rd=r_done: self._on_update_apply_done(
+                    r, a, expected_version=exp, restart_on_done=rd
+                )
             ),
         )
 
@@ -1616,55 +1703,85 @@ class AntigravityCapsuleApp:
             return
         self._local_version = res.local_version or self._local_version
         if res.error:
+            self._consecutive_update_check_errors += 1
             if res.is_manual:
                 self._set_temp_banner_notice(f"更新检查暂不可用：{res.error}", duration_sec=8.0)
-                if self.tray is not None and (not self._visible or not self._expanded):
-                    self.tray.notify("反重力监控 · 更新检查失败", res.error[:180])
+                self._notify_update_error_once(f"chk:manual:{res.error[:64]}", "反重力监控 · 更新检查失败", res.error[:180])
+            elif self._consecutive_update_check_errors >= 3:
+                self._notify_update_error_once(
+                    f"chk:bg:{res.error[:64]}",
+                    "反重力监控 · 后台检查更新异常",
+                    f"连续 {self._consecutive_update_check_errors} 次检查更新失败：{res.error[:140]}",
+                )
             return
 
+        self._consecutive_update_check_errors = 0
         if not res.has_update:
             self._latest_update = res
-            self._hide_update_banner()
-            if res.is_manual:
-                msg = f"✓ 当前已是最新版本 v{res.local_version}（{res.install_mode} 模式）"
-                self._set_temp_banner_notice(msg, duration_sec=6.0)
-                if self.tray is not None and (not self._visible or not self._expanded):
-                    self.tray.notify("反重力监控 · 已是最新", msg)
+            if self._downloaded_ready_version and is_newer_version(self._downloaded_ready_version, self._running_version):
+                self._show_update_banner(
+                    f"✓ 已后台下载 v{self._downloaded_ready_version}（下次启动自动生效）",
+                    is_error=False,
+                    badge_ver=self._downloaded_ready_version,
+                )
+            else:
+                self._hide_update_banner()
+                if res.is_manual:
+                    msg = f"✓ 当前已是最新版本 v{self._running_version}（{res.install_mode} 模式）"
+                    self._set_temp_banner_notice(msg, duration_sec=6.0)
+                    if self.tray is not None and (not self._visible or not self._expanded):
+                        self.tray.notify("反重力监控 · 已是最新", msg)
             if self.tray is not None:
                 self.tray.refresh_menu()
             return
 
+        mode = self._current_update_mode()
         ignored = str(self.config.get("update_ignored_version") or "").strip()
-        if (not res.is_manual) and ignored and ignored == res.remote_version and not bool(self.config.get("auto_update_restart", False)):
+        if (not res.is_manual) and ignored and ignored == res.remote_version and mode != "auto_restart":
             self._latest_update = None
             return
 
         self._latest_update = res
+        if self._downloaded_ready_version == res.remote_version:
+            self._show_update_banner(
+                f"✓ 已后台下载 v{res.remote_version}（下次启动自动生效）",
+                is_error=False,
+                badge_ver=res.remote_version,
+            )
+            return
+
         summary_tail = f" · {truncate_display_width(res.summary, 42)}" if res.summary else ""
-        banner_txt = f"发现新版本 v{res.remote_version}（当前 v{res.local_version}）{summary_tail}"
+        banner_txt = f"发现新版本 v{res.remote_version}（当前 v{self._running_version}）{summary_tail}"
         self._show_update_banner(banner_txt, is_error=False, badge_ver=res.remote_version)
 
         if self.tray is not None:
             self.tray.refresh_menu()
             if self._notified_update_version != res.remote_version:
                 self._notified_update_version = res.remote_version
-                if bool(self.config.get("notifications_enabled", True)) and not bool(self.config.get("auto_update_restart", False)):
+                if mode == "notify" and bool(self.config.get("notifications_enabled", True)):
                     self.tray.notify(
                         f"反重力监控 · 新版本 v{res.remote_version}",
-                        f"当前 v{res.local_version}{summary_tail}，点开悬浮窗可一键更新重启",
+                        f"当前 v{self._running_version}{summary_tail}，点开悬浮窗可一键更新重启",
                     )
 
-        # Auto update & restart when user explicitly enabled the switch (with failed-version loop guard)
-        if bool(self.config.get("auto_update_restart", False)) and not self._update_busy:
+        # Default "download" silently prepares the update for next launch; "auto_restart" also restarts automatically
+        if mode in ("download", "auto_restart") and not self._update_busy:
             updater = self._ensure_updater()
             if not updater.has_failed_auto_version(res.remote_version):
-                self.trigger_apply_update(auto_triggered=True)
+                self.trigger_apply_update(auto_triggered=True, restart_on_done=(mode == "auto_restart"))
 
-    def _on_update_apply_done(self, res: UpdateApplyResult, auto_triggered: bool, expected_version: str = "") -> None:
+    def _on_update_apply_done(
+        self,
+        res: UpdateApplyResult,
+        auto_triggered: bool,
+        expected_version: str = "",
+        restart_on_done: bool = True,
+    ) -> None:
         if self._closing:
             return
         self._update_busy = False
         if res.ok and res.needs_restart:
+            self._notified_update_error_key = ""
             if self.config.get("update_ignored_version"):
                 self.config["update_ignored_version"] = ""
                 self.config = self.config_store.save(self.config)
@@ -1674,17 +1791,32 @@ class AntigravityCapsuleApp:
                 self._show_update_banner(warn_msg, is_error=True, badge_ver=res.to_version)
                 if self.tray is not None:
                     self.tray.refresh_menu()
-                    self.tray.notify("反重力监控 · 需补装依赖", warn_msg)
+                self._notify_update_error_once(f"req:{res.to_version}:{miss_txt}", "反重力监控 · 更新需补装依赖", warn_msg)
                 return
-            self._show_update_banner(
-                f"✓ 已更新至 v{res.to_version}，正在安全重启监控…",
-                is_error=False,
-                badge_ver=res.to_version,
-            )
-            if self.tray is not None:
-                self.tray.refresh_menu()
-            aid = self.root.after(350, self.restart_app)
-            self._after_ids.append(aid)
+            self._downloaded_ready_version = res.to_version
+            if restart_on_done:
+                self._show_update_banner(
+                    f"✓ 已更新至 v{res.to_version}，正在安全重启监控…",
+                    is_error=False,
+                    badge_ver=res.to_version,
+                )
+                if self.tray is not None:
+                    self.tray.refresh_menu()
+                aid = self.root.after(350, self.restart_app)
+                self._after_ids.append(aid)
+            else:
+                self._show_update_banner(
+                    f"✓ 已后台下载 v{res.to_version}（下次启动自动生效）",
+                    is_error=False,
+                    badge_ver=res.to_version,
+                )
+                if self.tray is not None:
+                    self.tray.refresh_menu()
+                    if bool(self.config.get("notifications_enabled", True)):
+                        self.tray.notify(
+                            f"反重力监控 · v{res.to_version} 已就绪",
+                            f"已在后台更新至 v{res.to_version}，下次启动自动生效（也可点悬浮窗立即重启）",
+                        )
             return
 
         if res.ok and not res.needs_restart:
@@ -1698,7 +1830,7 @@ class AntigravityCapsuleApp:
                     self.tray.notify("反重力监控 · 已是最新", msg)
             return
 
-        # Failure path: distinguish permanent blockers (dirty tree/fork) vs transient network blips
+        # Failure path: distinguish permanent blockers (dirty tree/fork) vs transient network blips, ALWAYS alert user clearly!
         updater = self._ensure_updater()
         for ver_key in {v for v in (expected_version, res.to_version) if v}:
             if res.dirty_blocked:
@@ -1706,11 +1838,15 @@ class AntigravityCapsuleApp:
             elif auto_triggered:
                 updater.mark_auto_version_failed(ver_key, permanent=False)
         err_short = truncate_display_width(res.error or "更新失败，请稍后重试", 54)
-        self._show_update_banner(f"更新未完成：{err_short}", is_error=True, badge_ver=res.to_version or expected_version)
+        self._show_update_banner(f"更新异常：{err_short}", is_error=True, badge_ver=res.to_version or expected_version)
         if self.tray is not None:
             self.tray.refresh_menu()
-            if not self._visible or not self._expanded or auto_triggered:
-                self.tray.notify("反重力监控 · 更新未完成", res.error[:180] if res.error else "更新失败，请稍后重试")
+        err_body = res.error[:180] if res.error else "更新失败，请稍后重试"
+        self._notify_update_error_once(
+            f"apply:{res.to_version or expected_version}:{err_body[:64]}",
+            "反重力监控 · 更新异常提醒",
+            err_body,
+        )
 
     def restart_app(self) -> None:
         cb = self._on_restart
@@ -1966,12 +2102,13 @@ class AntigravityCapsuleApp:
             self._lbl_scope_hint.configure(text="自动跟随当前", fg=t["text_muted"])
 
         pct = min(100, int(round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100)))
+        adapt_tag = " · 自适应" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else ""
         if snap.history_range in ("6h", "7d"):
             self._lbl_steps_title.configure(
-                text=f"今日保护线 ({snap.steps_scope_label}) · {snap.history_range_label} {snap.range_steps} 步"
+                text=f"今日保护线 ({snap.steps_scope_label}{adapt_tag}) · {snap.history_range_label} {snap.range_steps} 步"
             )
         else:
-            self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label})")
+            self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label}{adapt_tag})")
         if snap.total_today_steps > snap.today_steps:
             steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {snap.total_today_steps}"
         else:
@@ -1980,6 +2117,7 @@ class AntigravityCapsuleApp:
         self._last_steps_pct = pct
         self._last_steps_color = step_bar_color
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
+        self._steps_hover_text = self._build_steps_tooltip_text(snap)
 
         # Module 1B: Local 500-slot conversation pool guard
         self._sync_slots_auto_button()
@@ -2118,9 +2256,24 @@ class AntigravityCapsuleApp:
                 text=f"底层日志监控（{snap.log_scope_label} · {win_title} / 今日）"
             )
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
-            self._update_log_cell("timeout", snap.recent_timeout, snap.today_timeout, warn_on_recent=1, red_on_recent=2)
+            server_timeout_recent = max(0, snap.recent_timeout - getattr(snap, "heavy_media_timeout_recent", 0))
+            self._update_log_cell(
+                "timeout",
+                snap.recent_timeout,
+                snap.today_timeout,
+                warn_on_recent=1,
+                red_on_recent=2,
+                red_metric_override=server_timeout_recent,
+            )
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
-            self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999)
+            self._update_log_cell(
+                "retry",
+                snap.recent_retry,
+                snap.today_retry,
+                warn_on_recent=5,
+                red_on_recent=9999,
+                force_warn=bool(getattr(snap, "proxy_outage_recent", 0) > 0 and not snap.is_historical_rating),
+            )
         else:
             self._lbl_logs_title.configure(text="底层日志监控（客户端未运行 · 已暂停实时告警）")
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2, offline_muted=True)
@@ -2139,10 +2292,24 @@ class AntigravityCapsuleApp:
                 text=f"近 10 步异常归零已多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token，建议核查账号",
             )
         elif logs_live and snap.grade in ("T2", "T3") and snap.recent_events:
-            ev_txt = "\n".join(e.summary for e in snap.recent_events[-2:])
+            if snap.grade == "T3":
+                key_evs = [e for e in snap.recent_events if e.category == "403"] or snap.recent_events
+            else:
+                key_evs = [
+                    e
+                    for e in snap.recent_events
+                    if e.category == "503" or (e.category == "timeout" and not getattr(e, "is_heavy_media_timeout", False))
+                ] or snap.recent_events
+            ev_txt = "\n".join(e.summary for e in key_evs[-2:])
             self._banner_frame.configure(bg=t["red_bg"], highlightbackground=t["red"])
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
-        elif logs_live and snap.grade == "WARN" and (snap.t2_recovery_note or snap.recent_timeout > 0 or snap.recent_503 > 0):
+        elif logs_live and snap.grade == "WARN" and (
+            snap.t2_recovery_note
+            or snap.recent_timeout > 0
+            or snap.recent_503 > 0
+            or getattr(snap, "proxy_outage_recent", 0) > 0
+            or getattr(snap, "heavy_media_timeout_recent", 0) > 0
+        ):
             self._banner_frame.configure(bg=t["orange_bg"], highlightbackground=t["orange"])
             self._lbl_banner.configure(bg=t["orange_bg"], fg=t["orange"], text=snap.sub_headline)
         else:
@@ -2163,6 +2330,8 @@ class AntigravityCapsuleApp:
         warn_on_recent: int,
         red_on_recent: int,
         offline_muted: bool = False,
+        force_warn: bool = False,
+        red_metric_override: Optional[int] = None,
     ) -> None:
         t = self.theme
         cell = self._log_cells[key]
@@ -2170,9 +2339,10 @@ class AntigravityCapsuleApp:
             cell["val"].configure(text=f"— / {today}", fg=t["text_muted"])
             return
         txt = f"{recent} / {today}"
-        if recent >= red_on_recent:
+        red_val = recent if red_metric_override is None else red_metric_override
+        if red_val >= red_on_recent:
             fg = t["red"]
-        elif recent >= warn_on_recent:
+        elif force_warn or recent >= warn_on_recent:
             fg = t["orange"]
         else:
             fg = t["green"] if key != "retry" else t["text_primary"]
@@ -2199,6 +2369,54 @@ class AntigravityCapsuleApp:
         fill_w = int(round(w * max(0, min(100, pct)) / 100.0))
         if fill_w > 0:
             c.create_rectangle(0, 1, fill_w, h - 1, fill=fill_color, outline="")
+
+    def _build_steps_tooltip_text(self, snap: MonitorSnapshot) -> str:
+        mode = getattr(snap, "daily_steps_limit_mode", "default")
+        note = getattr(snap, "daily_steps_limit_note", "") or "初始建议值"
+        base_alert = int(getattr(snap, "daily_steps_base_alert", 1200) or 1200)
+        hist_peak = int(getattr(snap, "account_hist_safe_peak", 0) or 0)
+        lines = [
+            f"今日请求步数保护线 ({snap.steps_scope_label}):",
+            f"  当前进度: {snap.today_steps} / {snap.daily_steps_alert} 步（黄线 {snap.daily_steps_warn} / 红线 {snap.daily_steps_alert} · 初始基准 {base_alert}）",
+            f"  调整依据: {note}" + (f"（历史纯健康单日峰值 {hist_peak} 步）" if hist_peak > 0 else ""),
+            f"  今日拆解: 主对话 {snap.main_today_steps} 步 / 子代理 {snap.subagent_today_steps} 步 │ 近 1h {snap.last_1h_steps} 步",
+        ]
+        if snap.peak_hour_steps_today > 0 and snap.peak_hour_label:
+            lines.append(f"  峰值时段: {snap.peak_hour_label} ({snap.peak_hour_steps_today} 步)")
+        if snap.total_today_steps > snap.today_steps:
+            lines.append(f"  全机累计: {snap.total_today_steps} 步（主 {snap.total_main_today_steps} / 子 {snap.total_subagent_today_steps}）")
+        today_str = datetime.datetime.fromtimestamp(snap.generated_at).strftime("%Y-%m-%d")
+        today_deg = None
+        if snap.resolved_account:
+            acct_profs = self.engine._ledger.get_account_daily_profiles(snap.resolved_account)
+            today_rec = acct_profs.get(today_str)
+            if today_rec is not None:
+                today_deg = today_rec.get("degraded_at")
+        if (
+            snap.history_range == "30m"
+            and not snap.is_historical_rating
+            and not snap.is_custom_account_view
+            and snap.grade == "T0"
+            and mode != "adaptive_down"
+            and today_deg is None
+            and snap.resolved_account
+            and snap.today_steps > max(base_alert, snap.daily_steps_alert)
+        ):
+            _, next_alert, _, _, _ = compute_adaptive_daily_steps_limits(
+                int(self.config.get("daily_steps_warn", 960)),
+                base_alert,
+                [{"date": "2026-01-01", "safe_steps": snap.today_steps, "degraded_at": None}],
+            )
+            if next_alert > snap.daily_steps_alert:
+                lines.append(f"  次日预告: 今日已健康跑至 {snap.today_steps} 步，次日起将自动上调该号红线至 {next_alert} 步")
+        elif mode == "default":
+            lines.append("  说明: 仅依据已结历史自然日实绩动态调整，当日超线仍提醒而不实时追高")
+        return "\n".join(lines)
+
+    def _show_steps_tooltip(self, event: tk.Event) -> None:
+        if self._closing or not self._steps_hover_text:
+            return
+        self._show_text_tooltip(self._steps_hover_text, event)
 
     def _build_slots_tooltip_text(self, inv: SlotInventorySnapshot) -> str:
         auto_s = "开启（离线空闲 / 高水位自动让位）" if self.config.get("slot_auto_clean_enabled", True) else "已关闭"
@@ -2251,9 +2469,12 @@ class AntigravityCapsuleApp:
             cacheable = ms.hit_count + ms.abnormal_miss_count
             hit_s = f"{(ms.hit_count / cacheable) * 100:4.0f}%" if cacheable > 0 else "  — "
             post_s = f" │ 503后+{ms.steps_after_last_t2}步" if ms.steps_after_last_t2 > 0 else ""
-            lines.append(f"  {ms.model:<12} │ {ms.step_count:>2}步 │ 命中 {hit_s} │ TTFT {ttft_s} │ {tps_s}{post_s}")
+            cal_s = " [大窗校准]" if getattr(ms, "main_large_ctx_calibrated", False) else ""
+            lines.append(f"  {ms.model:<12} │ {ms.step_count:>2}步 │ 命中 {hit_s} │ TTFT {ttft_s} │ {tps_s}{post_s}{cal_s}")
         if snap.t2_recovery_note:
             lines.append(f"恢复判定: {snap.t2_recovery_note}")
+        if getattr(snap, "proxy_outage_note", ""):
+            lines.append(f"代理状态: {snap.proxy_outage_note}")
         return "\n".join(lines)
 
     def _show_speed_tooltip(self, event: tk.Event) -> None:
@@ -2305,6 +2526,9 @@ class AntigravityCapsuleApp:
         if media_cnt > 0:
             exempt_note = "（含多模态上传耗时，已豁免暗限速误判）" if getattr(conv, "media_ttft_exempted", False) else ""
             lines.append(f"多模态载荷: {media_cnt} 项 ({format_media_size(media_bytes)}){exempt_note}")
+        large_ctx_allow = float(getattr(conv, "large_ctx_ttft_allowance_sec", 0.0) or 0.0)
+        if large_ctx_allow >= 10.0:
+            lines.append(f"大上下文校准: 逼近压缩窗（判定自动校准 TTFT 基线 +{large_ctx_allow:.0f}s，真值如实展示）")
         steps = conv.recent_steps[-10:]
         ttfts = conv.recent_ttfts[-len(steps):] if conv.recent_ttfts else []
         tpss = conv.recent_tps_list[-len(steps):] if conv.recent_tps_list else []
@@ -2735,7 +2959,10 @@ class AntigravityCapsuleApp:
                     hit_txt = f"{conv.latest_hit_rate:.1f}%"
                 row_ui["hit"].configure(text=hit_txt, fg=hit_col)
 
-                sp_txt = f"{conv.tps:.0f} t/s" if conv.tps is not None else "—"
+                if conv.tps is not None:
+                    sp_txt = f"{conv.tps / 1000.0:.1f}k/s" if conv.tps >= 1000 else f"{conv.tps:.0f} t/s"
+                else:
+                    sp_txt = "—"
                 sp_col = t["orange"] if conv.speed_status == "slow" else t["cyan"]
                 row_ui["speed"].configure(text=sp_txt, fg=sp_col)
 
@@ -2912,6 +3139,9 @@ class AntigravityCapsuleApp:
                 "toggle_auto_clean": self.toggle_auto_clean_slots,
                 "toggle_update_check": self.toggle_update_check_enabled,
                 "toggle_auto_update": self.toggle_auto_update_restart,
+                "update_mode_download": lambda: self.set_update_mode("download"),
+                "update_mode_auto_restart": lambda: self.set_update_mode("auto_restart"),
+                "update_mode_notify": lambda: self.set_update_mode("notify"),
                 "open_slots": self.open_slots_window,
                 "clean_subagents": self.trigger_manual_subagent_cleanup,
                 "check_or_apply_update": self.check_or_apply_update,
@@ -2929,6 +3159,7 @@ class AntigravityCapsuleApp:
                 "notifications": lambda: self.config["notifications_enabled"],
                 "auto_clean": lambda: self.config.get("slot_auto_clean_enabled", True),
                 "update_check": lambda: self.config.get("update_check_enabled", True),
+                "update_mode": self._current_update_mode,
                 "auto_update": lambda: self.config.get("auto_update_restart", False),
                 "clean_label": self._format_clean_menu_label,
                 "update_label": self._format_update_menu_label,

@@ -1,8 +1,8 @@
 {
-  "version": "7.2.0",
+  "version": "7.2.1",
   "channel": "main",
   "released_at": "2026-11-22",
   "repo": "JuryBu/antigravity-monitor",
   "branch": "main",
-  "summary": "修复 poll.go 云同步 403 误报 T3、同窗口换号/换模冷启提示与过渡入口、极短输出与多图上传免误判暗限速、多模态载荷 MB 标注及老号未知模型解析"
+  "summary": "多图超时免误判 T2、代理全线断流识别、大上下文 TTFT 校准、账号级自适应保护线与默认后台下载更新"
 }
