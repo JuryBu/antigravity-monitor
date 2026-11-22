@@ -1,8 +1,8 @@
 {
-  "version": "7.2.2",
+  "version": "7.2.3",
   "channel": "main",
   "released_at": "2026-11-22",
   "repo": "JuryBu/antigravity-monitor",
   "branch": "main",
-  "summary": "已恢复掉缓存预警自动销账、识别全局改规则冷启与后台子代理单步瞬抖降噪"
+  "summary": "主步数进度条升级动态滚动24小时滑窗、历史自适应升级为小时桶24h沉淀峰值，并将T1连续掉缓存门槛升至3步"
 }

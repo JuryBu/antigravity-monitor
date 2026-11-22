@@ -131,6 +131,147 @@ def compute_large_ctx_ttft_allowance(context_tokens: int, max_context_tokens: in
     return round(min(30.0, max(0.0, val)), 1)
 
 
+T1_CONSEC_MISS_THRESHOLD = 3
+_CONSEC_INVALID_RE = re.compile(r"连掉\s*(\d+)\s*步")
+
+
+def is_severe_freshness_invalid(reason: str, consec_miss: int = 0) -> bool:
+    """Return True only when freshness invalidation reaches T1 severity (consec_miss >= 3)."""
+    if int(consec_miss or 0) > 0:
+        return int(consec_miss) >= T1_CONSEC_MISS_THRESHOLD
+    m = _CONSEC_INVALID_RE.search(reason or "")
+    if m:
+        try:
+            return int(m.group(1)) >= T1_CONSEC_MISS_THRESHOLD
+        except ValueError:
+            return False
+    return False
+
+
+def _pick_preferred_deg_at(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """Pick the most informative degradation step load: prefer smallest high-load (>=400), else smallest cold-start."""
+    vals = [int(v) for v in (a, b) if v is not None and int(v) > 0]
+    if not vals:
+        return None
+    high = [v for v in vals if v >= 400]
+    return min(high) if high else min(vals)
+
+
+def compute_settled_rolling_24h_records(
+    hourly_buckets: Dict[int, Dict[str, Any]],
+    now_ts: float,
+) -> List[Dict[str, Any]]:
+    """Aggregate strictly settled rolling-24h windows into daily-keyed records for adaptive limit calculation.
+
+    Guarantees:
+    - Zero overlap with the live 24h window ``(now_ts - 86400, now_ts]``: every inspected window
+      ends at ``end_h <= floor((now_ts - 86400) / 3600) - 1`` (so ``(end_h + 1) * 3600 <= now_ts - 86400``),
+      eliminating midnight step-cliff jumps and half-hour timezone leakage.
+    - Bounded O(360) horizon (``max_settled_h - 360``) so sparse ancient buckets never cause CPU spikes.
+    - Same-day post-degradation contamination guard (including unsettled later-same-day degradation
+      lookahead so a day that already degraded later never briefly triggers ``adaptive_up``).
+    - Non-empty day guard: a calendar day with 0 own steps never produces a phantom recovery record.
+    """
+    if not hourly_buckets:
+        return []
+    max_settled_h = int(math.floor((float(now_ts) - 86400.0) / 3600.0)) - 1
+    min_horizon_h = max_settled_h - 360
+
+    def _day_of_hour(h_epoch: int) -> str:
+        # Use the closing second of the UTC hour bucket so half-hour timezones never bleed into the next day
+        return datetime.datetime.fromtimestamp((h_epoch + 1) * 3600 - 1).strftime("%Y-%m-%d")
+
+    settled_map: Dict[int, Dict[str, Any]] = {}
+    unsettled_degraded_days: set[str] = set()
+    for raw_h, rec in hourly_buckets.items():
+        try:
+            hk = int(raw_h)
+        except (TypeError, ValueError):
+            continue
+        if hk < min_horizon_h or not isinstance(rec, dict):
+            continue
+        deg_v = bool(rec.get("degraded", False))
+        if hk > max_settled_h:
+            if deg_v:
+                unsettled_degraded_days.add(_day_of_hour(hk))
+            continue
+        steps_v = max(0, int(rec.get("steps", 0) or 0))
+        deg_at_raw = rec.get("degraded_24h_at")
+        deg_at_v = int(deg_at_raw) if (deg_at_raw is not None and not isinstance(deg_at_raw, bool) and int(deg_at_raw) > 0) else None
+        if steps_v == 0 and not deg_v:
+            continue
+        settled_map[hk] = {"steps": steps_v, "degraded": deg_v, "degraded_24h_at": deg_at_v}
+
+    if not settled_map:
+        return []
+
+    day_own_steps: Dict[str, int] = {}
+    day_first_deg_h: Dict[str, int] = {}
+    for hk, rec in settled_map.items():
+        d_str = _day_of_hour(hk)
+        day_own_steps[d_str] = day_own_steps.get(d_str, 0) + rec["steps"]
+        if rec["degraded"]:
+            prev_h = day_first_deg_h.get(d_str)
+            if prev_h is None or hk < prev_h:
+                day_first_deg_h[d_str] = hk
+
+    min_h = min(settled_map.keys())
+    max_h = max(settled_map.keys())
+    scan_end = min(max_h + 23, max_settled_h)
+
+    contaminated_hours: set[int] = set()
+    for h in range(min_h, scan_end + 1):
+        d_str = _day_of_hour(h)
+        first_deg = day_first_deg_h.get(d_str)
+        if first_deg is not None and h >= first_deg:
+            contaminated_hours.add(h)
+
+    by_day: Dict[str, Dict[str, Any]] = {}
+    win_steps = 0
+    bad_in_win = 0
+    for end_h in range(min_h, scan_end + 1):
+        enter_rec = settled_map.get(end_h)
+        if enter_rec is not None:
+            win_steps += enter_rec["steps"]
+        if end_h in contaminated_hours or (enter_rec is not None and enter_rec["degraded"]):
+            bad_in_win += 1
+
+        leave_h = end_h - 24
+        if leave_h >= min_h:
+            leave_rec = settled_map.get(leave_h)
+            if leave_rec is not None:
+                win_steps -= leave_rec["steps"]
+            if leave_h in contaminated_hours or (leave_rec is not None and leave_rec["degraded"]):
+                bad_in_win -= 1
+
+        d_str = _day_of_hour(end_h)
+        # Check degradation BEFORE win_steps <= 0 guard so 0-step degraded buckets with explicit degraded_24h_at are never dropped!
+        if enter_rec is not None and enter_rec["degraded"]:
+            deg_load = enter_rec["degraded_24h_at"] if enter_rec["degraded_24h_at"] is not None else win_steps
+            if deg_load is not None and deg_load > 0:
+                slot = by_day.setdefault(d_str, {"date": d_str, "safe_steps": 0, "degraded_at": None})
+                slot["degraded_at"] = _pick_preferred_deg_at(slot["degraded_at"], deg_load)
+            continue
+
+        if win_steps <= 0:
+            continue
+
+        if bad_in_win == 0 and day_own_steps.get(d_str, 0) > 0 and d_str not in unsettled_degraded_days:
+            slot = by_day.setdefault(d_str, {"date": d_str, "safe_steps": 0, "degraded_at": None})
+            if win_steps > slot["safe_steps"]:
+                slot["safe_steps"] = win_steps
+
+    out: List[Dict[str, Any]] = []
+    for d_str in sorted(by_day.keys()):
+        rec = by_day[d_str]
+        deg_at = rec["degraded_at"]
+        safe_s = int(rec["safe_steps"])
+        if deg_at is not None:
+            safe_s = min(safe_s, max(0, deg_at - 1))
+        out.append({"date": d_str, "safe_steps": safe_s, "degraded_at": deg_at})
+    return out
+
+
 def compute_adaptive_daily_steps_limits(
     base_warn: int,
     base_alert: int,
@@ -658,6 +799,7 @@ class ConversationDetailReport:
     title: str = ""
     revert_count: int = 0
     scope_label: str = ""
+    consec_miss: int = 0
 
 
 @dataclass(frozen=True)
@@ -811,6 +953,16 @@ class MonitorSnapshot:
     daily_steps_limit_note: str = ""
     daily_steps_base_alert: int = 1200
     account_hist_safe_peak: int = 0
+    rolling_24h_steps: Optional[int] = None
+    account_24h_steps: Optional[int] = None
+    total_24h_steps: Optional[int] = None
+    main_24h_steps: int = 0
+    subagent_24h_steps: int = 0
+    total_main_24h_steps: int = 0
+    total_subagent_24h_steps: int = 0
+    peak_hour_steps_24h: int = 0
+    peak_hour_label_24h: str = ""
+    current_24h_has_degradation: bool = False
 
 
 HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
@@ -841,15 +993,17 @@ def compute_pressure(
     today_steps: int,
     daily_steps_warn: int,
     daily_steps_alert: int,
+    rolling_24h_steps: Optional[int] = None,
 ) -> str:
     """Map raw monitor state into a clean 5-tier pressure code for RULES automation."""
     if grade == "IDLE":
         return "offline_unknown"
     if grade in ("T1", "T2", "T3"):
         return "degraded"
-    if today_steps >= daily_steps_alert:
+    eff_steps = int(rolling_24h_steps) if rolling_24h_steps is not None else int(today_steps)
+    if eff_steps >= daily_steps_alert:
         return "red"
-    if grade == "WARN" or today_steps >= daily_steps_warn:
+    if grade == "WARN" or eff_steps >= daily_steps_warn:
         return "warn"
     return "normal"
 
@@ -1719,6 +1873,7 @@ class AntigravityMonitorEngine:
         self._hist_daily_profiles_cache_key: Tuple[Any, ...] = ()
         self._hist_daily_profiles_cache_ts: float = 0.0
         self._hist_daily_profiles_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._hist_hourly_buckets_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
         self._full_align_cache: "OrderedDict[Tuple[str, Tuple[int, int], int, int], List[Optional[Any]]]" = OrderedDict()
         self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
@@ -1758,6 +1913,8 @@ class AntigravityMonitorEngine:
         self._last_quota_family: str = "gemini"
         self._baseline_ready: bool = False
         self._emitted_alert_keys: Deque[str] = deque(maxlen=256)
+        self._steps_alert_state: Dict[str, Tuple[float, bool, int]] = {}
+        self._recorded_deg_anchors: "OrderedDict[Tuple[str, int], Optional[int]]" = OrderedDict()
         self._media_size_cache: "OrderedDict[str, int]" = OrderedDict()
         self._model_enum_map: "OrderedDict[str, str]" = OrderedDict()
 
@@ -2066,6 +2223,12 @@ class AntigravityMonitorEngine:
         c.first_abnormal_step_in_recent10 = st["first_abnormal_step_in_recent10"]
         c.tail_consec_hits_after_abnormal = st["tail_consec_hits_after_abnormal"]
         c.last_abnormal_ts = st["last_abnormal_ts"]
+        if c.freshness_invalid_reason:
+            c.freshness_invalid_reason = (
+                f"无热缓存 (连掉 {c.consec_miss} 步)"
+                if c.consec_miss >= 2
+                else "本步 cr=0 无热缓存"
+            )
 
     @staticmethod
     def _count_steps_in_window(c: ConversationSummary, lo_ts: float, hi_ts: float) -> Tuple[int, int]:
@@ -2762,7 +2925,14 @@ class AntigravityMonitorEngine:
         target_query = (target_conversation_id or "").strip()
         target_query_low = target_query.lower()
 
-        all_recent = self._iter_recent_transcripts(lookback_cutoff, today_start, max_older=max_older_convs)
+        rolling_24h_cutoff = now - 86400.0
+        hot_cutoff = min(today_start, rolling_24h_cutoff) - 60.0
+        all_recent = self._iter_recent_transcripts(
+            lookback_cutoff,
+            today_start,
+            max_older=max_older_convs,
+            hot_cutoff=hot_cutoff,
+        )
         convs_bundle: List[Tuple[ConversationSummary, List[StepRecord], List[int]]] = []
         carryover_candidates: List[Tuple[float, str, List[Dict[str, Any]], bool, bool]] = []
         target_bundle: Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]] = None
@@ -2782,10 +2952,19 @@ class AntigravityMonitorEngine:
         account_today_steps = 0
         account_main_today_steps = 0
         account_subagent_today_steps = 0
+        total_24h_steps = 0
+        total_main_24h_steps = 0
+        total_subagent_24h_steps = 0
+        account_24h_steps = 0
+        account_main_24h_steps = 0
+        account_subagent_24h_steps = 0
         range_steps = 0
         last_1h_steps = 0
         hourly_counts: Dict[int, int] = {}
+        hourly_24h_local_counts: Dict[Tuple[int, int, int, int], int] = {}
+        account_24h_utc_buckets: Dict[int, int] = {}
         one_hour_cutoff = now - 3600.0
+        step_upper_bound = now + 5.0
         eff_range_step_cutoff = range_start_ts if range_start_ts > 0.0 else (now - win_sec)
 
         for idx_conv, (conv_id, tp) in enumerate(all_recent):
@@ -2808,7 +2987,7 @@ class AntigravityMonitorEngine:
 
             for s in raw_steps:
                 sts = float(s.get("timestamp", 0.0) or 0.0)
-                if sts <= 0.0:
+                if sts <= 0.0 or sts > step_upper_bound:
                     continue
                 if sts >= today_start:
                     total_today_steps += 1
@@ -2816,6 +2995,12 @@ class AntigravityMonitorEngine:
                         total_subagent_today_steps += 1
                     else:
                         total_main_today_steps += 1
+                if sts >= rolling_24h_cutoff:
+                    total_24h_steps += 1
+                    if is_sub_conv:
+                        total_subagent_24h_steps += 1
+                    else:
+                        total_main_24h_steps += 1
 
                 in_scope = True if acct_filter_fn is None else acct_filter_fn(sts)
                 if not in_scope:
@@ -2823,6 +3008,8 @@ class AntigravityMonitorEngine:
 
                 if sts >= eff_range_step_cutoff:
                     range_steps += 1
+                if sts >= one_hour_cutoff:
+                    last_1h_steps += 1
                 if sts >= today_start:
                     if resolved_account:
                         account_today_steps += 1
@@ -2830,10 +3017,20 @@ class AntigravityMonitorEngine:
                             account_subagent_today_steps += 1
                         else:
                             account_main_today_steps += 1
-                    if sts >= one_hour_cutoff:
-                        last_1h_steps += 1
                     hr = datetime.datetime.fromtimestamp(sts).hour
                     hourly_counts[hr] = hourly_counts.get(hr, 0) + 1
+                if sts >= rolling_24h_cutoff:
+                    if resolved_account:
+                        account_24h_steps += 1
+                        if is_sub_conv:
+                            account_subagent_24h_steps += 1
+                        else:
+                            account_main_24h_steps += 1
+                        hk_utc = int(sts // 3600)
+                        account_24h_utc_buckets[hk_utc] = account_24h_utc_buckets.get(hk_utc, 0) + 1
+                    dt_s = datetime.datetime.fromtimestamp(sts)
+                    lkey = (dt_s.year, dt_s.month, dt_s.day, dt_s.hour)
+                    hourly_24h_local_counts[lkey] = hourly_24h_local_counts.get(lkey, 0) + 1
 
             matches_target = bool(
                 target_query_low
@@ -2951,18 +3148,33 @@ class AntigravityMonitorEngine:
             today_steps = account_today_steps
             main_today_steps = account_main_today_steps
             subagent_today_steps = account_subagent_today_steps
+            rolling_24h_steps = account_24h_steps
+            main_24h_steps = account_main_24h_steps
+            subagent_24h_steps = account_subagent_24h_steps
         else:
             steps_scope_label = "全机"
             log_scope_label = "全机"
             today_steps = total_today_steps
             main_today_steps = total_main_today_steps
             subagent_today_steps = total_subagent_today_steps
+            rolling_24h_steps = total_24h_steps
+            main_24h_steps = total_main_24h_steps
+            subagent_24h_steps = total_subagent_24h_steps
 
         peak_hour_steps = 0
         peak_hour_label = ""
         if hourly_counts:
             peak_hr, peak_hour_steps = max(hourly_counts.items(), key=lambda kv: (kv[1], kv[0]))
             peak_hour_label = f"{peak_hr:02d}:00-{(peak_hr + 1) % 24:02d}:00"
+
+        peak_hour_steps_24h = 0
+        peak_hour_label_24h = ""
+        if hourly_24h_local_counts:
+            today_date_tup = datetime.datetime.fromtimestamp(now).timetuple()[:3]
+            peak_lk, peak_hour_steps_24h = max(hourly_24h_local_counts.items(), key=lambda kv: (kv[1], kv[0]))
+            p_y, p_m, p_d, p_h = peak_lk
+            span_txt = f"{p_h:02d}:00-{(p_h + 1) % 24:02d}:00"
+            peak_hour_label_24h = f"昨日 {span_txt}" if (p_y, p_m, p_d) < today_date_tup else span_txt
 
         # Large-context freshness applies ONLY to live real-time current-account monitoring (never jump green countdown in historical views)
         if is_custom_account_view or hr_key != "30m":
@@ -3070,6 +3282,7 @@ class AntigravityMonitorEngine:
                         )
                         p_server_to = max(0, p_log["timeout"] - p_heavy_to)
                         p_consec = 0
+                        p_freq_t1 = False
                         for c in top_convs:
                             p_st = [s for s in c._scoped_steps_all if p_win_s <= s.timestamp <= p_anchor + 2.0]
                             cm = 0
@@ -3079,12 +3292,20 @@ class AntigravityMonitorEngine:
                                 else:
                                     break
                             p_consec = max(p_consec, cm)
+                            p_r10 = p_st[-10:]
+                            p_abn = sum(1 for s in p_r10 if s.classification == "abnormal_miss")
+                            p_hit = sum(1 for s in p_r10 if s.classification == "hit")
+                            p_cach = p_abn + p_hit
+                            if p_abn >= 4 and p_cach >= 4 and (p_hit / float(p_cach)) < 0.5:
+                                p_freq_t1 = True
                         if p_log["403"] > 0:
                             prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），首步冷启尚未验真"
                         elif (p_server_to + p_log["503"]) >= 2:
                             prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
-                        elif p_consec >= 2:
+                        elif p_consec >= T1_CONSEC_MISS_THRESHOLD:
                             prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                        elif p_freq_t1:
+                            prior_hist_warning = f"前序历史曾频繁掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
                 if is_custom_account_view:
                     is_historical_rating = True
                     historical_tag = f"历史视角 · {resolved_account or '全机'}"
@@ -3145,6 +3366,10 @@ class AntigravityMonitorEngine:
                 last_t2_error_ts,
             ) or now
             historical_tag = f"{hr_label}汇总"
+
+        # Refresh top-level min_freshness_invalid_reason after _recompute_conv_eval_stats so it always matches consec_miss & grade!
+        if large_freshness:
+            min_fresh_invalid = large_freshness[0].freshness_invalid_reason
 
         eval_mains = [c for c in recent_active if not c.is_subagent]
         eval_primary = eval_mains[0] if eval_mains else (recent_active[0] if recent_active else primary)
@@ -3342,6 +3567,7 @@ class AntigravityMonitorEngine:
             proxy_outage_note=proxy_outage_note,
             daily_steps_warn_override=eff_steps_warn,
             daily_steps_alert_override=eff_steps_alert,
+            rolling_24h_steps=rolling_24h_steps,
         )
 
         # Ensure IDLE offline state never leaks transient proxy outage fields
@@ -3349,15 +3575,85 @@ class AntigravityMonitorEngine:
             proxy_outage_recent = 0
             proxy_outage_note = ""
 
-        # Throttled privacy-safe persistence of today's verified healthy / degraded step capacity (never in read_only!)
-        if is_live_30m and resolved_account and today_steps > 0 and (not self.read_only):
-            self._ledger.record_daily_step_profile(
-                short_label=resolved_account,
-                date_str=today_str,
-                today_steps=today_steps,
-                is_healthy=(grade == "T0"),
-                is_degraded=(grade in ("T1", "T2", "T3")),
-            )
+        # Throttled privacy-safe persistence of verified healthy / degraded step capacity (never in read_only!)
+        if is_live_30m and resolved_account and (not self.read_only):
+            # Resolve true degradation timestamp once for both hourly buckets and daily compatibility profile
+            is_deg_grade = grade in ("T1", "T2", "T3")
+            deg_ts = now
+            if is_deg_grade:
+                if grade == "T1":
+                    t1_ts = max(
+                        (
+                            c.last_abnormal_ts
+                            for c in recent_active
+                            if c.last_abnormal_ts > 0.0
+                            and (c.consec_miss >= T1_CONSEC_MISS_THRESHOLD or c is severe_frequent_miss_conv)
+                        ),
+                        default=0.0,
+                    )
+                    if t1_ts > 0.0:
+                        deg_ts = t1_ts
+                elif grade == "T2" and last_t2_error_ts > 0.0:
+                    deg_ts = last_t2_error_ts
+                elif grade == "T3":
+                    t3_ts = max((ev.timestamp for ev in annotated_notable if ev.category == "403"), default=0.0)
+                    if t3_ts > 0.0:
+                        deg_ts = t3_ts
+
+            if today_steps > 0:
+                # Never attribute a prior-day lingering degradation (e.g. 23:55 T2 persisting at 00:02) to today's daily profile!
+                is_today_degraded = is_deg_grade and (deg_ts >= today_start)
+                self._ledger.record_daily_step_profile(
+                    short_label=resolved_account,
+                    date_str=today_str,
+                    today_steps=today_steps,
+                    is_healthy=(grade == "T0"),
+                    is_degraded=is_today_degraded,
+                )
+            # Skip the partially elapsed left-edge hour bucket so we never truncate a prior full hour
+            left_edge_h = int(rolling_24h_cutoff // 3600)
+            persist_buckets = {hk: cnt for hk, cnt in account_24h_utc_buckets.items() if hk > left_edge_h and cnt > 0}
+            degraded_hours: Optional[Dict[int, Optional[int]]] = None
+            if is_deg_grade:
+                deg_h = int(deg_ts // 3600)
+                anchor_key = (resolved_account.lower(), int(round(deg_ts)))
+                if anchor_key in self._recorded_deg_anchors:
+                    # Reuse frozen initial load for this exact degradation event (prevents write storms & load drift as old steps slide out!)
+                    frozen_at = self._recorded_deg_anchors[anchor_key]
+                    self._recorded_deg_anchors.move_to_end(anchor_key)
+                else:
+                    # Only record live rolling_24h_steps when observed within 120s of the degradation event;
+                    # for stale pre-restart degradations pass None so historical two-pointer scan restores exact load.
+                    if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
+                        frozen_at = int(rolling_24h_steps)
+                    else:
+                        frozen_at = None
+                    self._recorded_deg_anchors[anchor_key] = frozen_at
+                    while len(self._recorded_deg_anchors) > 64:
+                        self._recorded_deg_anchors.popitem(last=False)
+                degraded_hours = {deg_h: frozen_at}
+            if persist_buckets or degraded_hours:
+                self._ledger.record_hourly_step_buckets(
+                    short_label=resolved_account,
+                    hour_counts=persist_buckets,
+                    degraded_hours=degraded_hours,
+                    now_ts=now,
+                )
+
+        # Compute thread-safe current-24h degradation indicator inside engine lock for UI tooltip preview
+        current_24h_has_degradation = grade in ("T1", "T2", "T3")
+        if (not current_24h_has_degradation) and resolved_account:
+            cur_min_h = int(rolling_24h_cutoff // 3600)
+            hb = self._ledger.get_account_hourly_buckets(resolved_account)
+            scan_hb = self._hist_hourly_buckets_cache.get(resolved_account.lower(), {})
+            if any(hk >= cur_min_h and rec.get("degraded") for hk, rec in hb.items()) or any(
+                hk >= cur_min_h and rec.get("degraded") for hk, rec in scan_hb.items()
+            ):
+                current_24h_has_degradation = True
+            else:
+                today_prof = self._ledger.get_account_daily_profiles(resolved_account).get(today_str)
+                if today_prof is not None and today_prof.get("degraded_at") is not None:
+                    current_24h_has_degradation = True
 
         # Offline + custom/history lookup yielding no records -> offline_unknown (exit 2) rather than normal (exit 0)
         if grade == "WAIT" and not self._account_cache.online:
@@ -3368,6 +3664,7 @@ class AntigravityMonitorEngine:
                 today_steps=today_steps,
                 daily_steps_warn=eff_steps_warn,
                 daily_steps_alert=eff_steps_alert,
+                rolling_24h_steps=rolling_24h_steps,
             )
 
         alerts = self._collect_new_alerts(
@@ -3382,6 +3679,8 @@ class AntigravityMonitorEngine:
             slot_inventory=slot_inv,
             slots_only=bool(is_custom_account_view or hr_key != "30m" or is_historical_rating),
             daily_steps_alert_override=eff_steps_alert,
+            rolling_24h_steps=rolling_24h_steps,
+            now_ts=now,
         )
 
         primary_ttft_avg = eval_primary.ttft_avg_sec if eval_primary else None
@@ -3471,6 +3770,16 @@ class AntigravityMonitorEngine:
             daily_steps_limit_note=steps_limit_note,
             daily_steps_base_alert=base_steps_alert,
             account_hist_safe_peak=acct_hist_safe_peak,
+            rolling_24h_steps=rolling_24h_steps,
+            account_24h_steps=account_24h_steps,
+            total_24h_steps=total_24h_steps,
+            main_24h_steps=main_24h_steps,
+            subagent_24h_steps=subagent_24h_steps,
+            total_main_24h_steps=total_main_24h_steps,
+            total_subagent_24h_steps=total_subagent_24h_steps,
+            peak_hour_steps_24h=peak_hour_steps_24h,
+            peak_hour_label_24h=peak_hour_label_24h,
+            current_24h_has_degradation=current_24h_has_degradation,
         )
 
     @staticmethod
@@ -3493,12 +3802,25 @@ class AntigravityMonitorEngine:
         timeline: List[Tuple[float, str]],
         fallback_label: str = "",
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Low-frequency (10m TTL) read-only scan of completed prior-day steps per account across recent transcripts."""
-        hist_cutoff = today_start - 14 * 86400.0
+        """Low-frequency (10m TTL) read-only scan of historical per-account hourly & daily step profiles."""
+        hist_cutoff = min(today_start, now - 86400.0) - 15 * 86400.0
+        settled_end_h = int(math.floor((now - 86400.0) / 3600.0))
+        upper_hist_ts = max(today_start, float(settled_end_h) * 3600.0)
         hist_rules = self._observe_and_get_rule_timestamps(now, since_ts=hist_cutoff)
         hist_rule_sig = tuple(round(t, 1) for t in hist_rules[-64:])
+        idle_sec = int(self.config.get("idle_rewarm_sec", 180))
+        min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
         last_tl = timeline[-1] if timeline else None
-        cache_key = (today_str, len(timeline), last_tl, (fallback_label or "").lower(), hist_rule_sig)
+        cache_key = (
+            today_str,
+            settled_end_h,
+            len(timeline),
+            last_tl,
+            (fallback_label or "").lower(),
+            hist_rule_sig,
+            idle_sec,
+            min_cache_tok,
+        )
         if (
             self._hist_daily_profiles_cache_key == cache_key
             and 0.0 <= (now - self._hist_daily_profiles_cache_ts) < 600.0
@@ -3506,10 +3828,12 @@ class AntigravityMonitorEngine:
             return self._hist_daily_profiles_cache
 
         profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        hist_hourly: Dict[str, Dict[int, Dict[str, Any]]] = {}
         if not self.brain_dir.is_dir():
             self._hist_daily_profiles_cache_key = cache_key
             self._hist_daily_profiles_cache_ts = now
             self._hist_daily_profiles_cache = profiles
+            self._hist_hourly_buckets_cache = hist_hourly
             return profiles
 
         hist_timeline = self._ledger.get_timeline(hist_cutoff)
@@ -3517,10 +3841,8 @@ class AntigravityMonitorEngine:
             hist_timeline = timeline
         tl_times = [t for t, _ in hist_timeline]
         hist_switches = self._ledger.get_switch_timestamps(hist_cutoff)
-        idle_sec = int(self.config.get("idle_rewarm_sec", 180))
-        min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
 
-        # Gather bounded set of transcripts modified within 14d (capped at 120 most recent; cached for 10m TTL)
+        # Gather bounded set of transcripts modified within 15d (skip pure-today cached subagents; 10m TTL)
         cands: List[Tuple[float, str, Path]] = []
         try:
             with os.scandir(self.brain_dir) as it:
@@ -3538,12 +3860,15 @@ class AntigravityMonitorEngine:
             cands = []
         cands.sort(key=lambda x: x[0], reverse=True)
 
-        day_events: Dict[Tuple[str, str], List[Tuple[float, bool]]] = {}
-        for _mtime, cid, tp in cands[:120]:
+        acct_all_events: Dict[str, List[Tuple[float, bool]]] = {}
+        processed_hist_convs = 0
+        for _mtime, cid, tp in cands[:600]:
             cached = self._transcript_cache.get(cid)
             raw_steps: List[Dict[str, Any]]
             if cached is not None:
                 raw_steps = cached[1]
+                if not raw_steps or float(raw_steps[0].get("timestamp", 0.0) or 0.0) >= upper_hist_ts:
+                    continue
             else:
                 # Header-only scalar extraction strictly before content/thinking/tool_calls (with json.loads fallback + CHECKPOINT tracking)
                 raw_steps = []
@@ -3612,9 +3937,12 @@ class AntigravityMonitorEngine:
                     continue
             if not raw_steps:
                 continue
-            has_prior = any(hist_cutoff <= float(r.get("timestamp", 0.0) or 0.0) < today_start for r in raw_steps)
+            has_prior = any(hist_cutoff <= float(r.get("timestamp", 0.0) or 0.0) < upper_hist_ts for r in raw_steps)
             if not has_prior:
                 continue
+            processed_hist_convs += 1
+            if processed_hist_convs > 240:
+                break
             steps = classify_steps(
                 raw_steps,
                 idle_rewarm_sec=idle_sec,
@@ -3623,43 +3951,87 @@ class AntigravityMonitorEngine:
                 rule_change_timestamps=hist_rules,
             )
             consec = 0
+            win10: Deque[str] = deque(maxlen=10)
+            prev_acct_low = ""
             for st_rec in steps:
-                if st_rec.classification == "abnormal_miss":
-                    consec += 1
-                else:
-                    consec = 0
-                if not (hist_cutoff <= st_rec.timestamp < today_start):
-                    continue
                 acct = self._ledger.attribute_timestamp(
                     st_rec.timestamp,
                     hist_timeline,
                     fallback_label=fallback_label,
                     _times_cache=tl_times,
                 )
-                if not acct:
-                    continue
-                d_str = datetime.datetime.fromtimestamp(st_rec.timestamp).strftime("%Y-%m-%d")
-                if d_str >= today_str:
-                    continue
-                day_events.setdefault((acct.lower(), d_str), []).append((st_rec.timestamp, consec >= 2))
+                acct_low = acct.lower() if acct else ""
+                if st_rec.is_account_switch or (acct_low and prev_acct_low and acct_low != prev_acct_low):
+                    consec = 0
+                    win10.clear()
+                if acct_low:
+                    prev_acct_low = acct_low
 
-        for (acct_low, d_str), ev_list in day_events.items():
-            ev_list.sort(key=lambda x: x[0])
-            total_s = len(ev_list)
-            deg_at: Optional[int] = None
-            for step_ord, (_ts, is_t1) in enumerate(ev_list, 1):
+                win10.append(st_rec.classification)
+                is_t1_step = False
+                if st_rec.classification == "abnormal_miss":
+                    consec += 1
+                    if consec >= T1_CONSEC_MISS_THRESHOLD:
+                        is_t1_step = True
+                    else:
+                        abn_10 = sum(1 for c_cls in win10 if c_cls == "abnormal_miss")
+                        hit_10 = sum(1 for c_cls in win10 if c_cls == "hit")
+                        cach_10 = abn_10 + hit_10
+                        if abn_10 >= 4 and cach_10 >= 4 and (hit_10 / float(cach_10)) < 0.5:
+                            is_t1_step = True
+                else:
+                    consec = 0
+
+                if not (hist_cutoff <= st_rec.timestamp < upper_hist_ts):
+                    continue
+                if not acct_low:
+                    continue
+                acct_all_events.setdefault(acct_low, []).append((st_rec.timestamp, is_t1_step))
+
+        for acct_low, ev_all in acct_all_events.items():
+            ev_all.sort(key=lambda x: x[0])
+            hmap: Dict[int, Dict[str, Any]] = {}
+            day_events: Dict[str, List[bool]] = {}
+            left = 0
+            for idx_e, (ts_v, is_t1) in enumerate(ev_all):
+                while left < idx_e and (ts_v - ev_all[left][0]) > 86400.0:
+                    left += 1
+                win_24h_load = idx_e - left + 1
+                hk = int(ts_v // 3600)
+                slot = hmap.get(hk)
+                if slot is None:
+                    slot = {"steps": 0, "degraded": False, "degraded_24h_at": None}
+                    hmap[hk] = slot
+                slot["steps"] += 1
                 if is_t1:
-                    deg_at = step_ord
-                    break
-            profiles.setdefault(acct_low, {})[d_str] = {
-                "safe_steps": total_s if deg_at is None else max(0, deg_at - 1),
-                "max_steps": total_s,
-                "degraded_at": deg_at,
-            }
+                    slot["degraded"] = True
+                    slot["degraded_24h_at"] = _pick_preferred_deg_at(slot["degraded_24h_at"], win_24h_load)
+
+                if ts_v < today_start:
+                    d_str = datetime.datetime.fromtimestamp(ts_v).strftime("%Y-%m-%d")
+                    if d_str < today_str:
+                        day_events.setdefault(d_str, []).append(is_t1)
+
+            if hmap:
+                hist_hourly[acct_low] = hmap
+            for d_str, flags in day_events.items():
+                total_s = len(flags)
+                deg_at: Optional[int] = None
+                for step_ord, is_t1 in enumerate(flags, 1):
+                    if is_t1:
+                        deg_at = _pick_preferred_deg_at(deg_at, step_ord)
+                        if deg_at is not None and deg_at >= 400:
+                            break
+                profiles.setdefault(acct_low, {})[d_str] = {
+                    "safe_steps": total_s if deg_at is None else max(0, deg_at - 1),
+                    "max_steps": total_s,
+                    "degraded_at": deg_at,
+                }
 
         self._hist_daily_profiles_cache_key = cache_key
         self._hist_daily_profiles_cache_ts = now
         self._hist_daily_profiles_cache = profiles
+        self._hist_hourly_buckets_cache = hist_hourly
         return profiles
 
     def _get_account_completed_daily_history(
@@ -3671,27 +4043,63 @@ class AntigravityMonitorEngine:
         timeline: List[Tuple[float, str]],
         fallback_label: str = "",
     ) -> List[Dict[str, Any]]:
-        """Merge persisted ledger daily profiles with cached historical transcript profiles (strictly < today)."""
+        """Merge persisted & scanned hourly buckets into strictly settled rolling-24h peaks + legacy completed daily ledger."""
         acct_low = (account_label or "").strip().lower()
         if not acct_low:
             return []
-        ledger_days = self._ledger.get_account_daily_profiles(account_label)
-        hist_map = self._get_cached_history_daily_profiles(
+        self._get_cached_history_daily_profiles(
             now, today_start, today_str, timeline, fallback_label=fallback_label
         )
-        scan_days = hist_map.get(acct_low, {})
-        all_dates = sorted(d for d in (set(ledger_days.keys()) | set(scan_days.keys())) if d < today_str)
+        # 1. Fuse hourly buckets by hour_epoch BEFORE sliding-window evaluation (preserves cross-midnight windows after cleanup)
+        ledger_hourly = self._ledger.get_account_hourly_buckets(account_label)
+        scan_hourly = self._hist_hourly_buckets_cache.get(acct_low, {})
+        merged_hourly: Dict[int, Dict[str, Any]] = {}
+        for hk in set(ledger_hourly.keys()) | set(scan_hourly.keys()):
+            l_rec = ledger_hourly.get(hk)
+            s_rec = scan_hourly.get(hk)
+            steps_v = max(
+                int(l_rec.get("steps", 0) or 0) if l_rec else 0,
+                int(s_rec.get("steps", 0) or 0) if s_rec else 0,
+            )
+            deg_v = bool((l_rec and l_rec.get("degraded")) or (s_rec and s_rec.get("degraded")))
+            deg_at = _pick_preferred_deg_at(
+                l_rec.get("degraded_24h_at") if l_rec else None,
+                s_rec.get("degraded_24h_at") if s_rec else None,
+            )
+            if steps_v > 0 or deg_v:
+                merged_hourly[hk] = {"steps": steps_v, "degraded": deg_v, "degraded_24h_at": deg_at}
+
+        settled_recs = compute_settled_rolling_24h_records(merged_hourly, now_ts=now)
+        settled_by_day: Dict[str, Dict[str, Any]] = {r["date"]: r for r in settled_recs}
+
+        # 2. Legacy daily_step_profiles fallback ONLY for pre-upgrade dates strictly earlier than
+        #    both yesterday AND this account's earliest hourly bucket date (prevents calendar-day
+        #    profiles written post-upgrade from cross-contaminating rolling-24h settled peaks!).
+        yesterday_str = datetime.datetime.fromtimestamp(today_start - 43200.0).strftime("%Y-%m-%d")
+        first_hourly_day = (
+            datetime.datetime.fromtimestamp((min(merged_hourly.keys()) + 1) * 3600 - 1).strftime("%Y-%m-%d")
+            if merged_hourly
+            else ""
+        )
+        ledger_days = self._ledger.get_account_daily_profiles(account_label)
+        legacy_days = {
+            d: rec
+            for d, rec in ledger_days.items()
+            if d < yesterday_str
+            and d not in settled_by_day
+            and (not first_hourly_day or d < first_hourly_day)
+        }
+
+        all_dates = sorted(set(settled_by_day.keys()) | set(legacy_days.keys()))
         merged: List[Dict[str, Any]] = []
         for d_str in all_dates:
-            l_rec = ledger_days.get(d_str)
-            s_rec = scan_days.get(d_str)
-            deg_vals = [
-                int(r["degraded_at"])
-                for r in (l_rec, s_rec)
-                if r is not None and r.get("degraded_at") is not None
-            ]
-            deg_at = min(deg_vals) if deg_vals else None
-            safe_vals = [int(r.get("safe_steps", 0) or 0) for r in (l_rec, s_rec) if r is not None]
+            r_set = settled_by_day.get(d_str)
+            r_leg = legacy_days.get(d_str)
+            deg_at = _pick_preferred_deg_at(
+                r_set.get("degraded_at") if r_set else None,
+                r_leg.get("degraded_at") if r_leg else None,
+            )
+            safe_vals = [int(r.get("safe_steps", 0) or 0) for r in (r_set, r_leg) if r is not None]
             safe_s = max(safe_vals) if safe_vals else 0
             if deg_at is not None:
                 safe_s = min(safe_s, max(0, deg_at - 1))
@@ -4136,6 +4544,7 @@ class AntigravityMonitorEngine:
         proxy_outage_note: str = "",
         daily_steps_warn_override: Optional[int] = None,
         daily_steps_alert_override: Optional[int] = None,
+        rolling_24h_steps: Optional[int] = None,
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
@@ -4301,7 +4710,7 @@ class AntigravityMonitorEngine:
                 f"{hist_prefix}{scope_win_txt}触发 {eff_503} 次 503 / {server_timeout_count} 次流超时，事后未恢复稳定响应{extra}",
                 "",
             )
-        if max_consec_miss >= 2:
+        if max_consec_miss >= T1_CONSEC_MISS_THRESHOLD:
             return (
                 "red",
                 "T1",
@@ -4318,17 +4727,20 @@ class AntigravityMonitorEngine:
                 f"{hist_prefix}近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
                 t2_recovering_warn or t2_recovered_info,
             )
-        # Daily step thresholds are independent volume reminders and MUST NOT override
+        # Step thresholds are independent volume reminders and MUST NOT override
         # the real health grade (T0/WARN/T1/T2/T3) derived from actual cache, TTFT & logs.
+        eff_step_count = int(rolling_24h_steps) if rolling_24h_steps is not None else int(today_steps)
+        step_window_lbl = "近24h步数" if rolling_24h_steps is not None else "今日步数"
         step_note = ""
-        if today_steps >= eff_steps_alert:
-            step_note = f" · 提醒：今日步数 {today_steps}/{eff_steps_alert} 已超保护红线"
-        elif today_steps >= eff_steps_warn:
-            step_note = f" · 提醒：今日步数 {today_steps}/{eff_steps_alert} 接近保护线"
+        if eff_step_count >= eff_steps_alert:
+            step_note = f" · 提醒：{step_window_lbl} {eff_step_count}/{eff_steps_alert} 已超保护红线"
+        elif eff_step_count >= eff_steps_warn:
+            step_note = f" · 提醒：{step_window_lbl} {eff_step_count}/{eff_steps_alert} 接近保护线"
 
         if (
             prior_hist_warning
             or t2_recovering_warn
+            or max_consec_miss >= 2
             or any_single_miss
             or unstable_recovery_conv is not None
             or eff_503 == 1
@@ -4351,7 +4763,11 @@ class AntigravityMonitorEngine:
                     reasons.append(f"{short_h}{cnt_s}，建议压图或/compact")
                 else:
                     reasons.append(f"多图大包上传超时 ({eff_heavy_timeout}次)，建议压图或/compact")
-            if any_single_miss:
+            if max_consec_miss >= 2:
+                reasons.append(f"连续 {max_consec_miss} 步掉缓存(观察中)")
+                if any_single_miss:
+                    reasons.append("另含单步异常归零")
+            elif any_single_miss:
                 reasons.append("单步异常归零")
             elif unstable_recovery_conv is not None:
                 reasons.append(f"近10步 {unstable_recovery_conv.abnormal_in_recent10} 次掉缓存(观察恢复中)")
@@ -4407,8 +4823,12 @@ class AntigravityMonitorEngine:
         slot_inventory: Optional[SlotInventorySnapshot] = None,
         slots_only: bool = False,
         daily_steps_alert_override: Optional[int] = None,
+        rolling_24h_steps: Optional[int] = None,
+        now_ts: Optional[float] = None,
     ) -> List[Tuple[str, str, str]]:
         eff_steps_alert = int(daily_steps_alert_override) if daily_steps_alert_override is not None else int(self.config["daily_steps_alert"])
+        eff_steps = int(rolling_24h_steps) if rolling_24h_steps is not None else int(today_steps)
+        eff_now = float(now_ts) if now_ts is not None else time.time()
         candidates: List[Tuple[str, str, str]] = []
         if slot_inventory is not None and slot_inventory.summary_db_ok:
             if slot_inventory.main_at_risk:
@@ -4440,7 +4860,7 @@ class AntigravityMonitorEngine:
                         candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
             elif grade == "T1":
                 # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
-                offending = next((c for c in recent_active if c.consec_miss >= 2), None)
+                offending = next((c for c in recent_active if c.consec_miss >= T1_CONSEC_MISS_THRESHOLD), None)
                 if offending is not None:
                     key = f"t1:{offending.conversation_id}:{offending.consec_miss_start_step}"
                     candidates.append(
@@ -4453,15 +4873,30 @@ class AntigravityMonitorEngine:
                     candidates.append(
                         (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
                     )
-            elif today_steps >= eff_steps_alert:
-                day = datetime.date.today().isoformat()
-                candidates.append(
-                    (
-                        f"steps:{day}:{steps_scope_label}:{eff_steps_alert}",
-                        f"Antigravity 今日步数红线 ({steps_scope_label})",
-                        f"{steps_scope_label} 今日已达 {today_steps}/{eff_steps_alert} 步，注意控频护号",
+            else:
+                # Re-arm rolling-24h step alert only after dropping below 90% of limit or after a 6h cooldown (prevents 00:00 duplicate popups)
+                st_key = f"{steps_scope_label}:{eff_steps_alert}"
+                prev_st = self._steps_alert_state.get(st_key)
+                if eff_steps < int(eff_steps_alert * 0.9):
+                    if prev_st is not None and prev_st[1]:
+                        self._steps_alert_state[st_key] = (prev_st[0], False, prev_st[2])
+                elif eff_steps >= eff_steps_alert:
+                    can_emit = (
+                        prev_st is None
+                        or (not prev_st[1])
+                        or (eff_now - prev_st[0]) >= 6.0 * 3600.0
                     )
-                )
+                    if can_emit:
+                        next_seq = (prev_st[2] + 1) if prev_st is not None else 1
+                        self._steps_alert_state[st_key] = (eff_now, True, next_seq)
+                        win_tag = "近24h" if rolling_24h_steps is not None else "今日"
+                        candidates.append(
+                            (
+                                f"steps:{steps_scope_label}:{eff_steps_alert}:{next_seq}",
+                                f"Antigravity {win_tag}步数红线 ({steps_scope_label})",
+                                f"{steps_scope_label} {win_tag}已达 {eff_steps}/{eff_steps_alert} 步，注意控频护号",
+                            )
+                        )
 
         if not self._baseline_ready:
             immediate_critical: List[Tuple[str, str, str]] = []
@@ -4485,9 +4920,11 @@ class AntigravityMonitorEngine:
         lookback_cutoff: float,
         today_start: float,
         max_older: int = 16,
+        hot_cutoff: Optional[float] = None,
     ) -> List[Tuple[str, Path]]:
         if not self.brain_dir.is_dir():
             return []
+        eff_hot_cutoff = min(today_start, float(hot_cutoff)) if hot_cutoff is not None else today_start
         today_items: List[Tuple[float, str, str]] = []
         older_items: List[Tuple[float, str, str]] = []
         join = os.path.join
@@ -4504,7 +4941,7 @@ class AntigravityMonitorEngine:
                         continue
                     if st.st_size <= 0 or st.st_mtime < lookback_cutoff:
                         continue
-                    if st.st_mtime >= today_start:
+                    if st.st_mtime >= eff_hot_cutoff:
                         today_items.append((st.st_mtime, entry.name, tp_str))
                     else:
                         older_items.append((st.st_mtime, entry.name, tp_str))
@@ -4780,7 +5217,7 @@ class AntigravityMonitorEngine:
 
         self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
         self._transcript_cache.move_to_end(conv_id)
-        while len(self._transcript_cache) > 384:
+        while len(self._transcript_cache) > 512:
             # Evict strictly by oldest file mtime_ns (prevents descending-order scan LRU inversion from dropping the hottest conv!)
             evicted_cid = min(
                 self._transcript_cache.keys(),
@@ -4792,7 +5229,7 @@ class AntigravityMonitorEngine:
         if error_ts_list:
             self._transcript_error_ts[conv_id] = error_ts_list[-16:]
             self._transcript_error_ts.move_to_end(conv_id)
-            while len(self._transcript_error_ts) > 384:
+            while len(self._transcript_error_ts) > 512:
                 # Evict by oldest latest error timestamp rather than insertion order (prevents descending-scan LRU inversion)
                 oldest_ecid = min(
                     self._transcript_error_ts.keys(),
@@ -4809,7 +5246,7 @@ class AntigravityMonitorEngine:
                 last_known_ctx,
             )
             self._transcript_tail_meta.move_to_end(conv_id)
-            while len(self._transcript_tail_meta) > 384:
+            while len(self._transcript_tail_meta) > 512:
                 oldest_tcid = min(
                     self._transcript_tail_meta.keys(),
                     key=lambda k: self._transcript_tail_meta[k][0][-1][0] if self._transcript_tail_meta[k][0] else 0.0,
@@ -5074,6 +5511,7 @@ class AntigravityMonitorEngine:
                 title=self._resolve_conv_title(conv_id),
                 revert_count=revert_count,
                 scope_label=scope_label,
+                consec_miss=consec_miss,
             )
 
     def _poll_hub_titles(self, port: int, token: str) -> None:
@@ -5611,33 +6049,58 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "weekly_reset_at": snap.account.weekly_reset_at,
             "pools": pools_out,
         },
-        "steps": {
-            "scope_label": snap.steps_scope_label,
-            "today_steps": snap.today_steps,
-            "account_today_steps": snap.account_today_steps,
-            "total_today_steps": snap.total_today_steps,
-            "main_today_steps": snap.main_today_steps,
-            "subagent_today_steps": snap.subagent_today_steps,
-            "total_main_today_steps": snap.total_main_today_steps,
-            "total_subagent_today_steps": snap.total_subagent_today_steps,
-            "daily_steps_warn": snap.daily_steps_warn,
-            "daily_steps_alert": snap.daily_steps_alert,
-            "daily_steps_base_alert": snap.daily_steps_base_alert,
-            "daily_steps_limit_mode": snap.daily_steps_limit_mode,
-            "daily_steps_limit_note": snap.daily_steps_limit_note,
-            "account_hist_safe_peak": snap.account_hist_safe_peak,
-            "remaining_to_warn": max(0, snap.daily_steps_warn - snap.today_steps),
-            "remaining_to_alert": max(0, snap.daily_steps_alert - snap.today_steps),
-            "usage_pct": round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100.0, 1),
-            "last_1h_steps": snap.last_1h_steps,
-            "peak_hour_steps_today": snap.peak_hour_steps_today,
-            "peak_hour_label": snap.peak_hour_label,
-        },
+        "steps": (
+            lambda _has24, _eff, _acct24, _tot24, _m24, _s24, _tm24, _ts24, _ph24, _pl24: {
+                "scope_label": snap.steps_scope_label,
+                "window_mode": "rolling_24h" if _has24 else "today",
+                "effective_steps": _eff,
+                "rolling_24h_steps": _eff if _has24 else snap.today_steps,
+                "account_24h_steps": _acct24,
+                "total_24h_steps": _tot24,
+                "main_24h_steps": _m24,
+                "subagent_24h_steps": _s24,
+                "total_main_24h_steps": _tm24,
+                "total_subagent_24h_steps": _ts24,
+                "peak_hour_steps_24h": _ph24,
+                "peak_hour_label_24h": _pl24,
+                "today_steps": snap.today_steps,
+                "account_today_steps": snap.account_today_steps,
+                "total_today_steps": snap.total_today_steps,
+                "main_today_steps": snap.main_today_steps,
+                "subagent_today_steps": snap.subagent_today_steps,
+                "total_main_today_steps": snap.total_main_today_steps,
+                "total_subagent_today_steps": snap.total_subagent_today_steps,
+                "daily_steps_warn": snap.daily_steps_warn,
+                "daily_steps_alert": snap.daily_steps_alert,
+                "daily_steps_base_alert": snap.daily_steps_base_alert,
+                "daily_steps_limit_mode": snap.daily_steps_limit_mode,
+                "daily_steps_limit_note": snap.daily_steps_limit_note,
+                "account_hist_safe_peak": snap.account_hist_safe_peak,
+                "remaining_to_warn": max(0, snap.daily_steps_warn - _eff),
+                "remaining_to_alert": max(0, snap.daily_steps_alert - _eff),
+                "usage_pct": round((_eff / max(1, snap.daily_steps_alert)) * 100.0, 1),
+                "last_1h_steps": snap.last_1h_steps,
+                "peak_hour_steps_today": snap.peak_hour_steps_today,
+                "peak_hour_label": snap.peak_hour_label,
+            }
+        )(
+            snap.rolling_24h_steps is not None,
+            snap.rolling_24h_steps if snap.rolling_24h_steps is not None else snap.today_steps,
+            snap.account_24h_steps if snap.account_24h_steps is not None else snap.account_today_steps,
+            snap.total_24h_steps if snap.total_24h_steps is not None else snap.total_today_steps,
+            snap.main_24h_steps if snap.rolling_24h_steps is not None else snap.main_today_steps,
+            snap.subagent_24h_steps if snap.rolling_24h_steps is not None else snap.subagent_today_steps,
+            snap.total_main_24h_steps if snap.rolling_24h_steps is not None else snap.total_main_today_steps,
+            snap.total_subagent_24h_steps if snap.rolling_24h_steps is not None else snap.total_subagent_today_steps,
+            snap.peak_hour_steps_24h if snap.rolling_24h_steps is not None else snap.peak_hour_steps_today,
+            snap.peak_hour_label_24h if snap.rolling_24h_steps is not None else snap.peak_hour_label,
+        ),
         "cache": {
             "primary_hit_rate": round(snap.primary_hit_rate, 2) if snap.primary_hit_rate is not None else None,
             "primary_hit_classification": snap.primary_hit_classification,
             "primary_hit_reason": snap.primary_hit_reason,
             "consec_miss": snap.max_consec_miss,
+            "t1_consec_threshold": T1_CONSEC_MISS_THRESHOLD,
             "max_abnormal_recent10": snap.max_abnormal_recent10,
             "worst_recent10_hit_ratio": round(snap.worst_recent10_hit_ratio, 4) if snap.worst_recent10_hit_ratio is not None else None,
             "wasted_cold_tokens_total": snap.wasted_cold_tokens_total,
@@ -5832,13 +6295,29 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
     acc_wk = f"{snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "—"
     limit_note = getattr(snap, "daily_steps_limit_note", "")
     limit_badge = f" [自适应·{limit_note}]" if (getattr(snap, "daily_steps_limit_mode", "default") != "default" and limit_note) else (" [自适应]" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else "")
-    steps_str = f"{snap.steps_scope_label} {snap.today_steps}/{snap.daily_steps_alert}{limit_badge}"
-    steps_str += f" (主 {snap.main_today_steps} / 子 {snap.subagent_today_steps} | 近1h {snap.last_1h_steps}"
-    if snap.peak_hour_steps_today > 0 and snap.peak_hour_label:
-        steps_str += f" | 峰值 {snap.peak_hour_steps_today}@{snap.peak_hour_label}"
-    steps_str += ")"
-    if snap.total_today_steps > snap.today_steps:
-        steps_str += f" · 全机 {snap.total_today_steps}"
+    has_24h = getattr(snap, "rolling_24h_steps", None) is not None
+    if has_24h:
+        eff_steps = int(snap.rolling_24h_steps or 0)
+        eff_main = int(getattr(snap, "main_24h_steps", 0))
+        eff_sub = int(getattr(snap, "subagent_24h_steps", 0))
+        eff_tot = int(snap.total_24h_steps) if snap.total_24h_steps is not None else int(snap.total_today_steps)
+        eff_pk_steps = int(getattr(snap, "peak_hour_steps_24h", 0))
+        eff_pk_lbl = getattr(snap, "peak_hour_label_24h", "")
+        steps_str = f"近24h {snap.steps_scope_label} {eff_steps}/{snap.daily_steps_alert}{limit_badge}"
+        steps_str += f" (主 {eff_main} / 子 {eff_sub} | 近1h {snap.last_1h_steps}"
+        if eff_pk_steps > 0 and eff_pk_lbl:
+            steps_str += f" | 峰值 {eff_pk_steps}@{eff_pk_lbl}"
+        steps_str += f" | 今日自然日 {snap.today_steps})"
+        if eff_tot > eff_steps:
+            steps_str += f" · 全机 {eff_tot}"
+    else:
+        steps_str = f"{snap.steps_scope_label} {snap.today_steps}/{snap.daily_steps_alert}{limit_badge}"
+        steps_str += f" (主 {snap.main_today_steps} / 子 {snap.subagent_today_steps} | 近1h {snap.last_1h_steps}"
+        if snap.peak_hour_steps_today > 0 and snap.peak_hour_label:
+            steps_str += f" | 峰值 {snap.peak_hour_steps_today}@{snap.peak_hour_label}"
+        steps_str += ")"
+        if snap.total_today_steps > snap.today_steps:
+            steps_str += f" · 全机 {snap.total_today_steps}"
 
     lines = [
         f"Antigravity 实时体检摘要 ({ts_str})",

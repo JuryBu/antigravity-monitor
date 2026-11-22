@@ -19,6 +19,7 @@ from core.log_monitor import (
     CACHE_REASON_CN_MAP,
     COLD_SHORT_BADGE_MAP,
     HISTORY_RANGE_SPECS,
+    T1_CONSEC_MISS_THRESHOLD,
     AntigravityMonitorEngine,
     MonitorSnapshot,
     compute_adaptive_daily_steps_limits,
@@ -29,6 +30,7 @@ from core.log_monitor import (
     format_relative_age,
     format_text_summary,
     format_tokens,
+    is_severe_freshness_invalid,
     truncate_display_width,
 )
 from core.slot_manager import SlotCleanupResult, SlotInventorySnapshot, format_bytes_human
@@ -290,8 +292,10 @@ class AntigravityCapsuleApp:
 
         self._sep4 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep4.pack(side="left")
-        self._lbl_bar_steps = tk.Label(self._bar, text="0/1000", font=(MONO_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_secondary"])
+        self._lbl_bar_steps = tk.Label(self._bar, text="0/1200", font=(MONO_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_secondary"])
         self._lbl_bar_steps.pack(side="left", padx=(0, 6))
+        self._lbl_bar_steps.bind("<Enter>", self._show_steps_tooltip)
+        self._lbl_bar_steps.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep5 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._lbl_bar_slots = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["orange"], cursor="hand2")
@@ -383,9 +387,9 @@ class AntigravityCapsuleApp:
 
         head_row3 = tk.Frame(self._card_head)
         head_row3.pack(fill="x", pady=(2, 3))
-        self._lbl_steps_title = tk.Label(head_row3, text="今日请求步数保护线", font=(UI_FONT, 8))
+        self._lbl_steps_title = tk.Label(head_row3, text="近24h请求步数保护线", font=(UI_FONT, 8))
         self._lbl_steps_title.pack(side="left")
-        self._lbl_steps_val = tk.Label(head_row3, text="0 / 1000 (0%)", font=(MONO_FONT, 8, "bold"))
+        self._lbl_steps_val = tk.Label(head_row3, text="0 / 1200 (0%)", font=(MONO_FONT, 8, "bold"))
         self._lbl_steps_val.pack(side="right")
 
         self._steps_canvas = tk.Canvas(self._card_head, height=7, highlightthickness=0, bd=0)
@@ -974,6 +978,7 @@ class AntigravityCapsuleApp:
         self.root.geometry(f"+{new_x}+{new_y}")
 
     def _on_drag_start(self, event: tk.Event) -> None:
+        self._hide_conv_tooltip()
         self._drag_origin_x = event.x_root
         self._drag_origin_y = event.y_root
         self._win_origin_x = self.root.winfo_x()
@@ -1960,7 +1965,7 @@ class AntigravityCapsuleApp:
 
         # Freshness indicator must never look green when the active large conversation just dropped cache (cr=0)
         if disp_fresh_invalid:
-            is_severe_fresh = disp_fresh_consec >= 2 or ("连掉" in disp_fresh_invalid)
+            is_severe_fresh = is_severe_freshness_invalid(disp_fresh_invalid, disp_fresh_consec)
             fresh_color = t["red"] if is_severe_fresh else t["orange"]
             self._lbl_bar_fresh.configure(text="保鲜 失效", fg=fresh_color)
         else:
@@ -1988,11 +1993,20 @@ class AntigravityCapsuleApp:
                 acc_txt += f"·{range_short}"
         self._lbl_bar_acc.configure(text=acc_txt)
 
-        step_bar_color = compute_steps_color(
-            snap.today_steps, snap.daily_steps_warn, snap.daily_steps_alert, t["green"], t["red"]
+        has_24h = getattr(snap, "rolling_24h_steps", None) is not None
+        eff_steps = int(snap.rolling_24h_steps or 0) if has_24h else int(snap.today_steps)
+        eff_total_steps = (
+            int(snap.total_24h_steps)
+            if (has_24h and getattr(snap, "total_24h_steps", None) is not None)
+            else int(snap.total_today_steps)
         )
-        step_text_color = step_bar_color if snap.today_steps >= snap.daily_steps_warn else t["text_secondary"]
-        self._lbl_bar_steps.configure(text=f"{snap.today_steps}/{snap.daily_steps_alert}", fg=step_text_color)
+        step_bar_color = compute_steps_color(
+            eff_steps, snap.daily_steps_warn, snap.daily_steps_alert, t["green"], t["red"]
+        )
+        step_text_color = step_bar_color if eff_steps >= snap.daily_steps_warn else t["text_secondary"]
+        self._lbl_bar_steps.configure(text=f"{eff_steps}/{snap.daily_steps_alert}", fg=step_text_color)
+        # Keep collapsed-bar steps tooltip fresh even while collapsed
+        self._steps_hover_text = self._build_steps_tooltip_text(snap)
 
         inv = snap.slot_inventory
         bar_slots_was_visible = bool(self._lbl_bar_slots.winfo_manager())
@@ -2043,7 +2057,8 @@ class AntigravityCapsuleApp:
                 hit_s = "—"
             tps_s = f"{snap.primary_tps:.0f}t/s" if snap.primary_tps is not None else "—"
             slot_tip = f" | 槽位 {inv.total_db}/{inv.cap}" if inv is not None else ""
-            tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {snap.today_steps}步{slot_tip}"
+            step_lbl = f"近24h {eff_steps}步" if has_24h else f"{eff_steps}步"
+            tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {step_lbl}{slot_tip}"
             tray_lvl = "red" if (inv is not None and inv.main_at_risk) else (snap.level if snap.level in ("green", "orange", "red") else "green")
             self.tray.update_status(tray_lvl, tip)
 
@@ -2101,23 +2116,23 @@ class AntigravityCapsuleApp:
         else:
             self._lbl_scope_hint.configure(text="自动跟随当前", fg=t["text_muted"])
 
-        pct = min(100, int(round((snap.today_steps / max(1, snap.daily_steps_alert)) * 100)))
+        pct = min(100, int(round((eff_steps / max(1, snap.daily_steps_alert)) * 100)))
         adapt_tag = " · 自适应" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else ""
-        if snap.history_range in ("6h", "7d"):
+        if snap.history_range in ("6h", "today", "7d"):
+            r_tag = range_short or snap.history_range_label
             self._lbl_steps_title.configure(
-                text=f"今日保护线 ({snap.steps_scope_label}{adapt_tag}) · {snap.history_range_label} {snap.range_steps} 步"
+                text=f"近24h保护线 ({snap.steps_scope_label}{adapt_tag}) · {r_tag}{snap.range_steps}步"
             )
         else:
-            self._lbl_steps_title.configure(text=f"今日请求步数保护线 ({snap.steps_scope_label}{adapt_tag})")
-        if snap.total_today_steps > snap.today_steps:
-            steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {snap.total_today_steps}"
+            self._lbl_steps_title.configure(text=f"近24h请求步数保护线 ({snap.steps_scope_label}{adapt_tag})")
+        if eff_total_steps > eff_steps:
+            steps_val_txt = f"{eff_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {eff_total_steps}"
         else:
-            steps_val_txt = f"{snap.today_steps} / {snap.daily_steps_alert} ({pct}%)"
+            steps_val_txt = f"{eff_steps} / {snap.daily_steps_alert} ({pct}%)"
         self._lbl_steps_val.configure(text=steps_val_txt, fg=step_text_color)
         self._last_steps_pct = pct
         self._last_steps_color = step_bar_color
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
-        self._steps_hover_text = self._build_steps_tooltip_text(snap)
 
         # Module 1B: Local 500-slot conversation pool guard
         self._sync_slots_auto_button()
@@ -2227,7 +2242,7 @@ class AntigravityCapsuleApp:
         )
         if disp_fresh_invalid:
             self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}")
-            inv_col = t["red"] if (disp_fresh_consec >= 2 or ("连掉" in disp_fresh_invalid)) else t["orange"]
+            inv_col = t["red"] if is_severe_freshness_invalid(disp_fresh_invalid, disp_fresh_consec) else t["orange"]
             self._lbl_fresh_big.configure(text=disp_fresh_invalid, fg=inv_col)
         elif disp_fresh_sec is not None:
             self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}（{snap.freshness_window_sec}s窗）")
@@ -2284,7 +2299,9 @@ class AntigravityCapsuleApp:
         if time.monotonic() < self._temp_banner_until and self._temp_banner_text:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=self._temp_banner_text)
-        elif snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (snap.max_consec_miss >= 2 or snap.max_abnormal_recent10 >= 4):
+        elif snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (
+            snap.max_consec_miss >= T1_CONSEC_MISS_THRESHOLD or snap.max_abnormal_recent10 >= 4
+        ):
             self._banner_frame.configure(bg=t["alert_banner_bg"], highlightbackground=t["alert_banner_border"])
             self._lbl_banner.configure(
                 bg=t["alert_banner_bg"],
@@ -2305,6 +2322,7 @@ class AntigravityCapsuleApp:
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
         elif logs_live and snap.grade == "WARN" and (
             snap.t2_recovery_note
+            or snap.max_consec_miss >= 2
             or snap.recent_timeout > 0
             or snap.recent_503 > 0
             or getattr(snap, "proxy_outage_recent", 0) > 0
@@ -2375,42 +2393,52 @@ class AntigravityCapsuleApp:
         note = getattr(snap, "daily_steps_limit_note", "") or "初始建议值"
         base_alert = int(getattr(snap, "daily_steps_base_alert", 1200) or 1200)
         hist_peak = int(getattr(snap, "account_hist_safe_peak", 0) or 0)
+        has_24h = getattr(snap, "rolling_24h_steps", None) is not None
+        eff_steps = int(snap.rolling_24h_steps or 0) if has_24h else int(snap.today_steps)
+        eff_main = int(getattr(snap, "main_24h_steps", 0)) if has_24h else int(snap.main_today_steps)
+        eff_sub = int(getattr(snap, "subagent_24h_steps", 0)) if has_24h else int(snap.subagent_today_steps)
+        eff_total = (
+            int(snap.total_24h_steps)
+            if (has_24h and getattr(snap, "total_24h_steps", None) is not None)
+            else int(snap.total_today_steps)
+        )
+        eff_tot_main = int(getattr(snap, "total_main_24h_steps", 0)) if has_24h else int(snap.total_main_today_steps)
+        eff_tot_sub = int(getattr(snap, "total_subagent_24h_steps", 0)) if has_24h else int(snap.total_subagent_today_steps)
+        eff_pk_steps = int(getattr(snap, "peak_hour_steps_24h", 0)) if has_24h else int(snap.peak_hour_steps_today)
+        eff_pk_label = getattr(snap, "peak_hour_label_24h", "") if has_24h else snap.peak_hour_label
         lines = [
-            f"今日请求步数保护线 ({snap.steps_scope_label}):",
-            f"  当前进度: {snap.today_steps} / {snap.daily_steps_alert} 步（黄线 {snap.daily_steps_warn} / 红线 {snap.daily_steps_alert} · 初始基准 {base_alert}）",
-            f"  调整依据: {note}" + (f"（历史纯健康单日峰值 {hist_peak} 步）" if hist_peak > 0 else ""),
-            f"  今日拆解: 主对话 {snap.main_today_steps} 步 / 子代理 {snap.subagent_today_steps} 步 │ 近 1h {snap.last_1h_steps} 步",
+            f"近 24h 请求步数保护线 ({snap.steps_scope_label}):",
+            f"  24h 滑窗: {eff_steps} / {snap.daily_steps_alert} 步（黄线 {snap.daily_steps_warn} / 红线 {snap.daily_steps_alert} · 初始基准 {base_alert}）",
+            f"  调整依据: {note}" + (f"（历史沉淀 24h 纯健康峰值 {hist_peak} 步）" if hist_peak > 0 else ""),
+            f"  近24h拆解: 主对话 {eff_main} 步 / 子代理 {eff_sub} 步 │ 近 1h {snap.last_1h_steps} 步",
         ]
-        if snap.peak_hour_steps_today > 0 and snap.peak_hour_label:
-            lines.append(f"  峰值时段: {snap.peak_hour_label} ({snap.peak_hour_steps_today} 步)")
-        if snap.total_today_steps > snap.today_steps:
-            lines.append(f"  全机累计: {snap.total_today_steps} 步（主 {snap.total_main_today_steps} / 子 {snap.total_subagent_today_steps}）")
-        today_str = datetime.datetime.fromtimestamp(snap.generated_at).strftime("%Y-%m-%d")
-        today_deg = None
-        if snap.resolved_account:
-            acct_profs = self.engine._ledger.get_account_daily_profiles(snap.resolved_account)
-            today_rec = acct_profs.get(today_str)
-            if today_rec is not None:
-                today_deg = today_rec.get("degraded_at")
+        if eff_pk_steps > 0 and eff_pk_label:
+            lines.append(f"  峰值时段: {eff_pk_label} ({eff_pk_steps} 步)")
+        lines.append(
+            f"  今日自然日: {snap.today_steps} 步（主 {snap.main_today_steps} / 子 {snap.subagent_today_steps}，0 点起算对照）"
+        )
+        if eff_total > eff_steps:
+            lines.append(f"  全机近24h: {eff_total} 步（主 {eff_tot_main} / 子 {eff_tot_sub}）")
+        has_cur_deg = bool(getattr(snap, "current_24h_has_degradation", False))
         if (
             snap.history_range == "30m"
             and not snap.is_historical_rating
             and not snap.is_custom_account_view
             and snap.grade == "T0"
             and mode != "adaptive_down"
-            and today_deg is None
+            and not has_cur_deg
             and snap.resolved_account
-            and snap.today_steps > max(base_alert, snap.daily_steps_alert)
+            and eff_steps > max(base_alert, snap.daily_steps_alert)
         ):
             _, next_alert, _, _, _ = compute_adaptive_daily_steps_limits(
                 int(self.config.get("daily_steps_warn", 960)),
                 base_alert,
-                [{"date": "2026-01-01", "safe_steps": snap.today_steps, "degraded_at": None}],
+                [{"date": "2026-01-01", "safe_steps": eff_steps, "degraded_at": None}],
             )
             if next_alert > snap.daily_steps_alert:
-                lines.append(f"  次日预告: 今日已健康跑至 {snap.today_steps} 步，次日起将自动上调该号红线至 {next_alert} 步")
+                lines.append(f"  沉淀预告: 当前 24h 已健康跑至 {eff_steps} 步，待本批步数完整退出 24h 窗后自动上调红线至 {next_alert} 步")
         elif mode == "default":
-            lines.append("  说明: 仅依据已结历史自然日实绩动态调整，当日超线仍提醒而不实时追高")
+            lines.append("  说明: 仅依据已完全退出当前 24h 窗的历史沉淀峰值调整，当前滑窗超线仍提醒而不实时追高")
         return "\n".join(lines)
 
     def _show_steps_tooltip(self, event: tk.Event) -> None:

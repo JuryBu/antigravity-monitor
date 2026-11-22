@@ -540,20 +540,22 @@ class TestLogMonitorLogic(unittest.TestCase):
             qconn.close()
 
             now = time.time()
-            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 40))
-            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 25))
-            t2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 10))
+            t0 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 55))
+            t1 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 40))
+            t2 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 25))
+            t3_init = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 10))
             rows = [
                 {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": t0, "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 1000},
                 {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": t1, "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 1000},
                 {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": t2, "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 1000},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": t3_init, "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 1000},
             ]
             tp = brain / "transcript.jsonl"
             tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
             conn = sqlite3.connect(convs / "demo1234-5678.db")
             conn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
-            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (1, _build_fake_gen_blob(120000, 0, 500, ttft_s=38, strm_s=20)))
+            conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (1, _build_fake_gen_blob(125000, 0, 500, ttft_s=38, strm_s=20)))
             conn.commit()
             conn.close()
 
@@ -569,7 +571,7 @@ class TestLogMonitorLogic(unittest.TestCase):
             snap = engine.poll(now_ts=now)
             self.assertEqual(snap.grade, "T1")
             self.assertEqual(snap.level, "red")
-            self.assertEqual(snap.max_consec_miss, 2)
+            self.assertEqual(snap.max_consec_miss, 3)
             self.assertIsNone(snap.min_freshness_sec)
             self.assertIn("无热缓存", snap.min_freshness_invalid_reason)
             self.assertEqual(snap.primary_speed_status, "slow")
@@ -578,16 +580,16 @@ class TestLogMonitorLogic(unittest.TestCase):
 
             # Append another cr=0 in the same streak -> must NOT spam another T1 alert for the same streak
             time.sleep(0.02)
-            t3 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 2))
-            rows.append({"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": t3, "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 1000})
+            t4 = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 2))
+            rows.append({"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": t4, "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 1000})
             tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
             snap2 = engine.poll(now_ts=now + 2)
-            self.assertEqual(snap2.max_consec_miss, 3)
+            self.assertEqual(snap2.max_consec_miss, 4)
             self.assertEqual(snap2.alerts, [])
 
             summary = format_text_summary(snap2)
             self.assertIn("T1", summary)
-            self.assertIn("360.0K", summary)
+            self.assertIn("490.0K", summary)
 
 
 class TestShortcutsAndIcons(unittest.TestCase):
@@ -938,16 +940,18 @@ class TestShortcutsAndIcons(unittest.TestCase):
             b_main.mkdir(parents=True)
             main_rows = [
                 {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "test"},
-                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 400)), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 400},
-                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 380)), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 400},
-                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 360)), "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 500},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 420)), "model": "gemini-4-neon-xhigh", "input_tokens": 100000, "cache_read_tokens": 0, "output_tokens": 400},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 400)), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 400},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 380)), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 400},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now - 360)), "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 500},
             ]
             (b_main / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in main_rows) + "\n", encoding="utf-8")
             mconn = sqlite3.connect(convs / f"{main_id}.db")
             mconn.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
-            mconn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(110000, 0, 400, ttft_s=12, strm_s=4),))
-            mconn.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(120000, 0, 400, ttft_s=50, strm_s=5),))
-            mconn.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(130000, 0, 500, ttft_s=95, strm_s=5),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(100000, 0, 400, ttft_s=12, strm_s=4),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(110000, 0, 400, ttft_s=28, strm_s=4),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(120000, 0, 400, ttft_s=50, strm_s=5),))
+            mconn.execute("INSERT INTO gen_metadata VALUES (4, ?)", (_build_fake_gen_blob(130000, 0, 500, ttft_s=95, strm_s=5),))
             mconn.commit()
             mconn.close()
 
@@ -977,11 +981,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             self.assertEqual(snap.grade, "T1")
             self.assertEqual(snap.pressure, "degraded")
             self.assertEqual(compute_cli_exit_code(snap), 1)
-            self.assertEqual(snap.main_today_steps, 3)
+            self.assertEqual(snap.main_today_steps, 4)
             self.assertEqual(snap.subagent_today_steps, 28)
-            self.assertEqual(snap.today_steps, 31)
-            self.assertGreaterEqual(snap.last_1h_steps, 31)
-            self.assertGreaterEqual(snap.peak_hour_steps_today, 31)
+            self.assertEqual(snap.today_steps, 32)
+            self.assertGreaterEqual(snap.last_1h_steps, 32)
+            self.assertGreaterEqual(snap.peak_hour_steps_today, 32)
             self.assertIsNotNone(snap.target_conversation)
             assert snap.target_conversation is not None
             self.assertEqual(snap.target_conversation.conversation_id, main_id)
@@ -991,10 +995,10 @@ class TestShortcutsAndIcons(unittest.TestCase):
             detail = engine.read_conversation_detail("main99", now_ts=now)
             self.assertIsNotNone(detail)
             assert detail is not None
-            self.assertEqual(detail.total_steps, 3)
+            self.assertEqual(detail.total_steps, 4)
             self.assertEqual(detail.peak_context_tokens, 130000)
             self.assertAlmostEqual(detail.max_ttft_sec or 0.0, 95.5, places=1)
-            self.assertEqual(len(detail.points), 3)
+            self.assertEqual(len(detail.points), 4)
             self.assertAlmostEqual(detail.points[0].ttft_sec or 0.0, 12.5, places=1)
             txt = format_detail_text_report(detail)
             self.assertIn("main99", txt)
@@ -1880,10 +1884,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(t_52h + 20), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 200},
                 {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(t_52h + 40), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 200},
                 {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(t_52h + 60), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": iso(t_52h + 80), "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 200},
             ]
             tp_old = b_old / "transcript.jsonl"
             tp_old.write_text("\n".join(json.dumps(r) for r in old_rows) + "\n", encoding="utf-8")
-            os.utime(tp_old, (t_52h + 60, t_52h + 60))
+            os.utime(tp_old, (t_52h + 80, t_52h + 80))
 
             engine = AntigravityMonitorEngine(
                 paths={
@@ -4485,12 +4490,13 @@ class TestShortcutsAndIcons(unittest.TestCase):
             self.assertIn("2026-11-21", lgr.get_account_daily_profiles("al***1"))
             self.assertLessEqual(len(lgr._daily_step_profiles), 32)
 
-        # 3. End-to-end engine historical transcript scan (yesterday 1350 healthy steps with CHECKPOINT + tool_calls fake model key) AND no chasing today's live steps!
+        # 3. End-to-end engine historical transcript scan (settled 1300 healthy steps >24h ago with CHECKPOINT + tool_calls fake model key) AND no chasing live steps!
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             now = time.time()
             today_start = datetime.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-            yest_base = today_start - 7200.0
+            # Place historical burst strictly before the zero-overlap rolling-24h settlement floor
+            yest_base = min(today_start, now - 86400.0) - 10800.0
             cid_h = "hist0001-1111-2222-3333-444444444444"
             hdir = root / "brain" / cid_h / ".system_generated" / "logs"
             hdir.mkdir(parents=True)
@@ -5038,7 +5044,7 @@ class TestShortcutsAndIcons(unittest.TestCase):
         self.assertTrue(_sel([c_main_stale, sub_sm1])[1])
         # >=2 distinct subagents simultaneously single_miss -> burst precursor MUST NOT be denoised!
         self.assertTrue(_sel([c_main_ok, sub_sm1, sub_sm2])[1])
-        # Subagent consecutive >=2 miss -> T1 NEVER denoised!
+        # Subagent consecutive >=2 miss (WARN observation) & >=3 miss (T1) NEVER denoised!
         sub_t1 = _mk_conv("s-t1", [(-60, "abnormal_miss", "abnormal_zero"), (-20, "abnormal_miss", "abnormal_zero")], is_sub=True)
         self.assertEqual(_sel([c_main_ok, sub_t1])[0], 2)
 
@@ -5114,6 +5120,509 @@ class TestShortcutsAndIcons(unittest.TestCase):
             eng_e._account_cache = AccountQuotaInfo(short_label="de***9", online=True, observed_at=now_e)
             eng_e._last_account_poll = now_e
             self.assertEqual(eng_e.poll(now_ts=now_e, force_account=False).grade, "T0")
+
+    def test_v723_rolling_24h_steps_midnight_hot_window_last1h_and_json_contract(self) -> None:
+        """v7.2.3 Module 1: rolling 24h window across midnight (>48 yesterday subagents preserved), last_1h_steps midnight fix, non-colliding peak_hour_24h, JSON 1.0 + legacy snapshot fallback & alert cooldown."""
+        import datetime
+        import os
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            MonitorSnapshot,
+            compute_pressure,
+            format_json_snapshot,
+            format_text_summary,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # Pick a deterministic 00:10 local time today
+            today_00 = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            now_m = today_00 + 600.0  # 00:10:00 local
+
+            def _iso_m(ts_v: float) -> str:
+                return datetime.datetime.fromtimestamp(ts_v, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+            # 1) 55 yesterday-23:20 subagents (exceeds max_older=48!) -> ALL must survive in rolling 24h hot window
+            for idx in range(55):
+                sid = f"ysub{idx:03d}0-1111-2222-3333-444444444444"
+                sdir = root / "brain" / sid / ".system_generated" / "logs"
+                sdir.mkdir(parents=True)
+                ts_sub = today_00 - 2400.0 + idx * 5.0  # 23:20..23:24 yesterday (also inside last 1h!)
+                tp = sdir / "transcript.jsonl"
+                tp.write_text(
+                    json.dumps({"step_index": 1, "source": "SWARM", "type": "PLANNER_RESPONSE", "created_at": _iso_m(ts_sub), "model": "gemini-4-hydrogen-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 200}) + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(tp, (ts_sub, ts_sub))
+
+            # 2) Main conv with 20 steps at yesterday 15:00, 10 steps at today 00:05, and 5 future steps (now_m + 300)
+            mid = "midm0001-1111-2222-3333-444444444444"
+            mdir = root / "brain" / mid / ".system_generated" / "logs"
+            mdir.mkdir(parents=True)
+            m_lines = [json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso_m(today_00 - 32500.0)})]
+            for i in range(20):
+                m_lines.append(json.dumps({"step_index": i + 1, "type": "PLANNER_RESPONSE", "created_at": _iso_m(today_00 - 32400.0 + i * 10), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 90000, "output_tokens": 300}))
+            for j in range(10):
+                m_lines.append(json.dumps({"step_index": 21 + j, "type": "PLANNER_RESPONSE", "created_at": _iso_m(today_00 + 300.0 + j * 10), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 90000, "output_tokens": 300}))
+            for k in range(5):
+                # Future steps strictly after now_m + 5.0 must NOT bleed into historical slice!
+                m_lines.append(json.dumps({"step_index": 31 + k, "type": "PLANNER_RESPONSE", "created_at": _iso_m(now_m + 300.0 + k * 10), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 90000, "output_tokens": 300}))
+            mtp = mdir / "transcript.jsonl"
+            mtp.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain", "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon", "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="al***1", online=True, observed_at=now_m)
+            eng._last_account_poll = now_m
+            snap = eng.poll(now_ts=now_m, force_account=False)
+
+            self.assertEqual(snap.today_steps, 10)
+            self.assertEqual(snap.rolling_24h_steps, 85)  # 55 yest sub + 20 yest main + 10 today main (5 future excluded)
+            self.assertEqual(snap.main_24h_steps, 30)
+            self.assertEqual(snap.subagent_24h_steps, 55)
+            self.assertEqual(snap.last_1h_steps, 65)  # 55 yesterday 23:20 + 10 today 00:05!
+            self.assertEqual(snap.peak_hour_steps_24h, 55)
+            self.assertTrue(snap.peak_hour_label_24h.startswith("昨日 23:00-00:00"))
+
+            js = json.loads(format_json_snapshot(snap))
+            self.assertEqual(js["schema_version"], "1.0")
+            self.assertEqual(js["steps"]["window_mode"], "rolling_24h")
+            self.assertEqual(js["steps"]["effective_steps"], 85)
+            self.assertEqual(js["steps"]["rolling_24h_steps"], 85)
+            self.assertEqual(js["steps"]["today_steps"], 10)
+            self.assertEqual(js["steps"]["main_24h_steps"], 30)
+            self.assertEqual(js["steps"]["subagent_24h_steps"], 55)
+            self.assertEqual(js["cache"]["t1_consec_threshold"], 3)
+
+            txt = format_text_summary(snap)
+            self.assertIn("近24h al***1 85/", txt)
+            self.assertIn("今日自然日 10", txt)
+
+            # Alert cooldown across midnight (no duplicate popup at 00:00:02; re-arms after dropping <90%)
+            eng._baseline_ready = True
+            a1 = eng._collect_new_alerts("T0", [], [], 0, 100, "al***1", True, daily_steps_alert_override=1000, rolling_24h_steps=1050, now_ts=today_00 - 300.0)
+            self.assertEqual(len(a1), 1)
+            self.assertIn("近24h", a1[0][1])
+            a2 = eng._collect_new_alerts("T0", [], [], 0, 5, "al***1", True, daily_steps_alert_override=1000, rolling_24h_steps=1055, now_ts=today_00 + 2.0)
+            self.assertEqual(a2, [])
+            eng._collect_new_alerts("T0", [], [], 0, 5, "al***1", True, daily_steps_alert_override=1000, rolling_24h_steps=800, now_ts=today_00 + 600.0)
+            a3 = eng._collect_new_alerts("T0", [], [], 0, 5, "al***1", True, daily_steps_alert_override=1000, rolling_24h_steps=1020, now_ts=today_00 + 1200.0)
+            self.assertEqual(len(a3), 1)
+
+            # Backward compatibility: legacy snapshot without rolling_24h_steps falls back cleanly
+            legacy = MonitorSnapshot(
+                generated_at=now_m, level="green", grade="T0", headline="T0", sub_headline="ok",
+                active_model="Neon XHigh", primary_hit_rate=98.0, primary_hit_classification="hit",
+                primary_tps=150.0, primary_ttft=12.0, primary_speed_status="ok",
+                min_freshness_sec=None, min_freshness_conv="", min_freshness_ctx=0, min_freshness_invalid_reason="",
+                today_steps=1100, daily_steps_warn=960, daily_steps_alert=1200,
+                active_conversations=[], large_freshness_list=[],
+                recent_503=0, today_503=0, recent_timeout=0, today_timeout=0, recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+                recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+                account=AccountQuotaInfo(short_label="de***0", online=True, observed_at=now_m),
+                sliding_window_min=30, freshness_window_sec=210,
+                main_today_steps=700, subagent_today_steps=400, total_today_steps=1100, steps_scope_label="de***0",
+            )
+            ljs = json.loads(format_json_snapshot(legacy))
+            self.assertEqual(ljs["steps"]["window_mode"], "today")
+            self.assertEqual(ljs["steps"]["effective_steps"], 1100)
+            self.assertEqual(ljs["steps"]["main_24h_steps"], 700)
+            self.assertEqual(ljs["steps"]["subagent_24h_steps"], 400)
+            self.assertEqual(compute_pressure("T0", 100, 960, 1200, rolling_24h_steps=1250), "red")
+            self.assertEqual(compute_pressure("T0", 1250, 960, 1200), "red")
+
+    def test_v723_settled_rolling_24h_adaptive_limits_zero_overlap_and_hourly_ledger(self) -> None:
+        """v7.2.3 Module 2: zero-overlap settlement at 00:05 (no tail-chasing), step-accurate degraded_24h_at, contamination isolation, non-empty day guard, and compact hourly ledger safety."""
+        import datetime
+        from core.account_ledger import AccountSwitchLedger
+        from core.log_monitor import (
+            compute_adaptive_daily_steps_limits,
+            compute_settled_rolling_24h_records,
+        )
+
+        # Anchor at 2026-11-22 00:05:00 local
+        base_0005 = datetime.datetime(2026, 11, 22, 0, 5, 0).timestamp()
+        h_yest_23 = int(datetime.datetime(2026, 11, 21, 23, 0, 0).timestamp() // 3600)
+        h_yest_10 = h_yest_23 - 13
+
+        # 1) At 00:05, yesterday 10:00..23:00 steps are STILL inside live 24h window -> MUST NOT settle or jump limit!
+        live_overlap_buckets = {h_yest_10 + k: {"steps": 150, "degraded": False, "degraded_24h_at": None} for k in range(14)}
+        self.assertEqual(compute_settled_rolling_24h_records(live_overlap_buckets, now_ts=base_0005), [])
+
+        # Once 25h later (2026-11-23 01:05:00), all 14 hours (2100 steps) have fully exited live 24h -> settles cleanly!
+        recs_settled = compute_settled_rolling_24h_records(live_overlap_buckets, now_ts=base_0005 + 25 * 3600.0)
+        self.assertEqual(len(recs_settled), 1)
+        self.assertEqual(recs_settled[0]["safe_steps"], 2100)
+        self.assertIsNone(recs_settled[0]["degraded_at"])
+        _, eff_a, mode, _, pk = compute_adaptive_daily_steps_limits(960, 1200, recs_settled)
+        self.assertEqual((mode, pk, eff_a), ("adaptive_up", 2100, 2500))
+
+        # 2) Same-hour cold-start degradation (at=5, followed by 450 steps in same hour) must NOT trigger adaptive_down!
+        now_far = datetime.datetime(2026, 11, 22, 16, 0, 0).timestamp()
+        h_1119_10 = int(datetime.datetime(2026, 11, 19, 10, 0, 0).timestamp() // 3600)
+        cold_deg_buckets = {h_1119_10: {"steps": 455, "degraded": True, "degraded_24h_at": 5}}
+        r_cold = compute_settled_rolling_24h_records(cold_deg_buckets, now_ts=now_far)
+        self.assertEqual(r_cold[0]["degraded_at"], 5)
+        self.assertEqual(compute_adaptive_daily_steps_limits(960, 1200, r_cold)[2], "default")
+
+        # 3) Same-hour high-load degradation (at=800, followed by 500 more steps -> total 1300) MUST still tighten!
+        hi_deg_buckets = {h_1119_10: {"steps": 1300, "degraded": True, "degraded_24h_at": 800}}
+        r_hi = compute_settled_rolling_24h_records(hi_deg_buckets, now_ts=now_far)
+        self.assertEqual(r_hi[0]["degraded_at"], 800)
+        _, tightened_a, mode_d, _, _ = compute_adaptive_daily_steps_limits(960, 1200, r_hi)
+        self.assertEqual(mode_d, "adaptive_down")
+        self.assertLess(tightened_a, 1200)
+
+        # 4) Contamination guard: degrade 11-19 01:00 (at=800) + run 900 steps later same day + 0 steps on 11-20 -> MUST NOT fabricate 11-20 recovery!
+        h_1119_01 = int(datetime.datetime(2026, 11, 19, 1, 0, 0).timestamp() // 3600)
+        ghost_buckets = {
+            h_1119_01: {"steps": 800, "degraded": True, "degraded_24h_at": 800},
+            h_1119_01 + 5: {"steps": 900, "degraded": False, "degraded_24h_at": None},
+        }
+        r_ghost = compute_settled_rolling_24h_records(ghost_buckets, now_ts=now_far)
+        self.assertEqual([r["date"] for r in r_ghost], ["2026-11-19"])
+        self.assertEqual(compute_adaptive_daily_steps_limits(960, 1200, r_ghost)[2], "adaptive_down")
+
+        # 5) Next-day real healthy recovery after prior-night 22:00 degradation (even when next-day stops at 21:00)
+        h_1118_22 = int(datetime.datetime(2026, 11, 18, 22, 0, 0).timestamp() // 3600)
+        h_1119_12 = int(datetime.datetime(2026, 11, 19, 12, 0, 0).timestamp() // 3600)
+        recov_buckets = {
+            h_1118_22: {"steps": 750, "degraded": True, "degraded_24h_at": 750},
+            h_1119_12: {"steps": 1500, "degraded": False, "degraded_24h_at": None},
+        }
+        r_recov = compute_settled_rolling_24h_records(recov_buckets, now_ts=now_far)
+        by_d = {r["date"]: r for r in r_recov}
+        self.assertIn("2026-11-19", by_d)
+        self.assertEqual(by_d["2026-11-19"]["safe_steps"], 1500)
+        self.assertIsNone(by_d["2026-11-19"]["degraded_at"])
+        self.assertEqual(compute_adaptive_daily_steps_limits(960, 1200, r_recov)[2], "adaptive_up")
+
+        # 6) Compact hourly ledger round-trip, monotonic max merge, read_only=True zero-write & anti-bool/"false" tolerance
+        with tempfile.TemporaryDirectory() as td:
+            lp = Path(td) / "ledger.json"
+            ro_lgr = AccountSwitchLedger(ledger_path=lp, read_only=True)
+            self.assertFalse(ro_lgr.record_hourly_step_buckets("al***1", {h_1119_10: 120}, now_ts=now_far))
+            self.assertFalse(lp.exists())
+
+            rw_lgr = AccountSwitchLedger(ledger_path=lp, read_only=False)
+            self.assertTrue(rw_lgr.record_hourly_step_buckets("al***1", {h_1119_10: 200}, now_ts=now_far))
+            # Half-bucket smaller value must NEVER overwrite prior larger value!
+            self.assertFalse(rw_lgr.record_hourly_step_buckets("al***1", {h_1119_10: 40}, now_ts=now_far))
+            self.assertEqual(rw_lgr.get_account_hourly_buckets("al***1")[h_1119_10]["steps"], 200)
+            # Compact serialization stores bare int for non-degraded bucket
+            raw_obj = json.loads(lp.read_text(encoding="utf-8"))
+            self.assertEqual(raw_obj["hourly_step_buckets"]["al***1"][str(h_1119_10)], 200)
+            # Inject string "false" & bool steps -> loader must safely sanitize
+            raw_obj["hourly_step_buckets"]["al***1"][str(h_1119_10 + 1)] = {"s": 90, "d": "false"}
+            raw_obj["hourly_step_buckets"]["al***1"][str(h_1119_10 + 2)] = True
+            lp.write_text(json.dumps(raw_obj), encoding="utf-8")
+            reloaded = AccountSwitchLedger(ledger_path=lp, read_only=True)
+            b_rel = reloaded.get_account_hourly_buckets("al***1")
+            self.assertFalse(b_rel[h_1119_10 + 1]["degraded"])
+            self.assertNotIn(h_1119_10 + 2, b_rel)
+
+    def test_v723_t1_consec3_threshold_warn2_orange_freshness_and_ui_sync(self) -> None:
+        """v7.2.3 Module 3 & UI: consec_miss==2 -> orange WARN (not red T1, not denoised for subagents, no duplicate reasons, orange freshness in capsule+detail window); consec_miss>=3 -> red T1; rolling 24h UI labels & thread-safe tooltip."""
+        import datetime
+        import math
+        from dataclasses import replace
+        from core.config_store import ConfigStore
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            ConversationDetailPoint,
+            ConversationDetailReport,
+            ConversationSummary,
+            MonitorSnapshot,
+            StepRecord,
+            T1_CONSEC_MISS_THRESHOLD,
+            is_severe_freshness_invalid,
+        )
+        from ui.capsule_app import AntigravityCapsuleApp
+        from ui.detail_window import ConversationDetailWindow
+        from ui.themes import THEMES
+
+        self.assertEqual(T1_CONSEC_MISS_THRESHOLD, 3)
+        self.assertFalse(is_severe_freshness_invalid("无热缓存 (连掉 2 步)", 2))
+        self.assertFalse(is_severe_freshness_invalid("无热缓存 (连掉 2 步)", 0))
+        self.assertTrue(is_severe_freshness_invalid("无热缓存 (连掉 3 步)", 0))
+        self.assertTrue(is_severe_freshness_invalid("本步 cr=0 无热缓存", 3))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain", "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon", "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            zlog = {"503": 0, "timeout": 0, "403": 0, "retry": 0}
+            c_unrec = ConversationSummary(
+                conversation_id="conv-c2", short_id="conv-c", model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                context_tokens=150000, max_context_tokens=512000, latest_hit_rate=0.0, latest_cached_in=0,
+                latest_uncached_in=150000, latest_timestamp=now - 10, recent_steps=[], consec_miss=2,
+                consec_miss_start_step=3, single_miss=False, wasted_cold_tokens=300000,
+                freshness_remaining_sec=None, freshness_invalid_reason="无热缓存 (连掉 2 步)",
+                abnormal_in_recent10=2, cacheable_in_recent10=4, recent10_hit_ratio=0.5,
+            )
+            # consec_miss == 2 -> orange WARN with clean single reason (no duplicate unstable_recovery string!)
+            lvl2, grd2, _hd2, sub2, _ = eng._evaluate_health(
+                "Neon XHigh", zlog, zlog, 2, False, False, 50, c_unrec,
+                unstable_recovery_conv=c_unrec, rolling_24h_steps=1300, daily_steps_alert_override=1200,
+            )
+            self.assertEqual((lvl2, grd2), ("orange", "WARN"))
+            self.assertIn("连续 2 步掉缓存(观察中)", sub2)
+            self.assertNotIn("观察恢复中", sub2)
+            self.assertIn("近24h步数 1300/1200", sub2)
+
+            # consec_miss == 2 even when unstable_recovery_conv is None (direct call) -> STILL WARN!
+            lvl2b, grd2b, _, _, _ = eng._evaluate_health("Neon XHigh", zlog, zlog, 2, False, False, 50, c_unrec)
+            self.assertEqual((lvl2b, grd2b), ("orange", "WARN"))
+
+            # consec_miss == 3 -> red T1!
+            lvl3, grd3, _, _, _ = eng._evaluate_health("Neon XHigh", zlog, zlog, 3, False, False, 50, c_unrec)
+            self.assertEqual((lvl3, grd3), ("red", "T1"))
+
+            # UI verification: consec_miss == 2 renders orange (NOT red) in bar freshness, card freshness, banner & detail KPI4!
+            cfg_store = ConfigStore(root / "cfg.json")
+            cfg_store.save({"theme": "midnight_blue", "window_x": 100, "window_y": 100})
+            app = AntigravityCapsuleApp(
+                app_root=Path(__file__).resolve().parent.parent,
+                config_store=cfg_store, engine=eng, enable_tray=False, start_minimized_override=False,
+            )
+            dw = None
+            try:
+                app.set_expanded(True)
+                snap_c2 = MonitorSnapshot(
+                    generated_at=now, level="orange", grade="WARN", headline="留意预警 · Neon XHigh",
+                    sub_headline="连续 2 步掉缓存(观察中)", active_model="Neon XHigh",
+                    primary_hit_rate=0.0, primary_hit_classification="abnormal_miss",
+                    primary_tps=150.0, primary_ttft=14.0, primary_speed_status="ok",
+                    min_freshness_sec=None, min_freshness_conv="conv-c", min_freshness_ctx=150000,
+                    min_freshness_invalid_reason="无热缓存 (连掉 2 步)",
+                    today_steps=420, daily_steps_warn=960, daily_steps_alert=1200,
+                    active_conversations=[c_unrec], large_freshness_list=[c_unrec],
+                    recent_503=0, today_503=0, recent_timeout=0, today_timeout=0, recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+                    recent_events=[], wasted_cold_tokens_total=300000, max_consec_miss=2,
+                    account=AccountQuotaInfo(short_label="de***2", online=True, observed_at=now),
+                    sliding_window_min=30, freshness_window_sec=210,
+                    steps_scope_label="de***2", resolved_account="de***2",
+                    rolling_24h_steps=1380, account_24h_steps=1380, total_24h_steps=1410,
+                    main_24h_steps=900, subagent_24h_steps=480, total_main_24h_steps=920, total_subagent_24h_steps=490,
+                    peak_hour_steps_24h=320, peak_hour_label_24h="昨日 22:00-23:00",
+                    current_24h_has_degradation=False,
+                )
+                app.render_snapshot(snap_c2)
+                tm = THEMES["midnight_blue"]
+                self.assertEqual(app._lbl_bar_fresh.cget("fg"), tm["orange"])
+                self.assertEqual(app._lbl_fresh_big.cget("fg"), tm["orange"])
+                self.assertEqual(app._lbl_banner.cget("fg"), tm["orange"])
+                self.assertEqual(app._lbl_bar_steps.cget("text"), "1380/1200")
+                self.assertIn("近24h请求步数保护线", app._lbl_steps_title.cget("text"))
+                self.assertIn("今日自然日: 420", app._steps_hover_text)
+                self.assertIn("昨日 22:00-23:00", app._steps_hover_text)
+                # T0 healthy with current_24h_has_degradation=False shows settlement preview; True suppresses it!
+                snap_t0_ok = replace(snap_c2, level="green", grade="T0", max_consec_miss=0, current_24h_has_degradation=False)
+                self.assertIn("沉淀预告", app._build_steps_tooltip_text(snap_t0_ok))
+                snap_t0_deg = replace(snap_t0_ok, current_24h_has_degradation=True)
+                self.assertNotIn("沉淀预告", app._build_steps_tooltip_text(snap_t0_deg))
+
+                # Final-A P1-1 regression: _hist_hourly_buckets_cache degradation within live 24h window MUST set current_24h_has_degradation=True even in read_only/empty ledger!
+                eng._account_cache = AccountQuotaInfo(short_label="de***2", online=True, observed_at=now)
+                eng._last_account_poll = now
+                eng._hist_hourly_buckets_cache = {"de***2": {int((now - 3600.0) // 3600): {"steps": 80, "degraded": True, "degraded_24h_at": 80}}}
+                eng._hist_daily_profiles_cache_ts = now
+                today_s_chk = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+                settled_end_chk = int(math.floor((now - 86400.0) / 3600.0))
+                eng._hist_daily_profiles_cache_key = (
+                    today_s_chk, settled_end_chk, 0, None, "de***2", (),
+                    int(eng.config.get("idle_rewarm_sec", 180)), int(eng.config.get("min_cacheable_tokens", 32000)),
+                )
+                snap_ro_deg = eng.poll(now_ts=now, force_account=False)
+                self.assertTrue(snap_ro_deg.current_24h_has_degradation)
+
+                # Detail window KPI 4: consec_miss==2 -> orange; consec_miss==3 -> red!
+                rep2 = ConversationDetailReport(
+                    conversation_id="conv-c2", short_id="conv-c", is_subagent=False, model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                    total_steps=2, today_steps=2, peak_context_tokens=150000, latest_context_tokens=150000, latest_context_delta=5000,
+                    max_context_tokens=512000, compact_count=0, cache_hit_steps=0, abnormal_miss_steps=2, expected_cold_steps=0,
+                    overall_cacheable_hit_ratio=0.0, avg_ttft_sec=14.0, p95_ttft_sec=14.0, max_ttft_sec=14.0, avg_tps=150.0,
+                    latest_tps=150.0, latest_ttft_sec=14.0, freshness_remaining_sec=None,
+                    freshness_invalid_reason="无热缓存 (连掉 2 步)", freshness_window_sec=210,
+                    points=[ConversationDetailPoint(1, now - 20, "Neon XHigh", 150000, 5000, 150000, 0, 300, 0.0, "abnormal_miss", "abnormal_zero", 14.0, 150.0, 2.0)],
+                    consec_miss=2,
+                )
+                dw = ConversationDetailWindow(
+                    parent=app.root, theme=tm, load_report=lambda _cid: rep2,
+                    on_toggle_pin=lambda _cid: None, is_pinned_fn=lambda _cid: False,
+                )
+                dw.show_conversation("conv-c2", place_near_parent=False)
+                self.assertEqual(dw._kpi_cards[3]["sub"].cget("fg"), tm["orange"])
+                dw._update_freshness_kpi(None, "无热缓存 (连掉 3 步)", 150.0, 3)
+                self.assertEqual(dw._kpi_cards[3]["sub"].cget("fg"), tm["red"])
+            finally:
+                if dw is not None:
+                    dw.close()
+                app.shutdown()
+
+    def test_v723_final_dual_review_hardening_regressions(self) -> None:
+        """v7.2.3 Final-B regressions: frozen deg anchor (zero write storm & load drift), legacy_days isolation, min_freshness_invalid_reason sync after recompute, 0-step degraded bucket, sparse ancient bucket O(360) guard, same-day unsettled degradation lookahead, and 336/32 integer eviction."""
+        import datetime
+        from core.account_ledger import AccountSwitchLedger
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            compute_adaptive_daily_steps_limits,
+            compute_settled_rolling_24h_records,
+        )
+
+        # 1) B-P2-1: 0-step degraded bucket with explicit degraded_24h_at MUST NOT be dropped by win_steps <= 0!
+        now_far = datetime.datetime(2026, 11, 22, 16, 0, 0).timestamp()
+        h_1119_10 = int(datetime.datetime(2026, 11, 19, 10, 0, 0).timestamp() // 3600)
+        r_zero_deg = compute_settled_rolling_24h_records(
+            {h_1119_10: {"steps": 0, "degraded": True, "degraded_24h_at": 800}},
+            now_ts=now_far,
+        )
+        self.assertEqual(len(r_zero_deg), 1)
+        self.assertEqual(r_zero_deg[0]["degraded_at"], 800)
+
+        # 2) B-P2-2: Sparse ancient bucket {262968, h_1119_10} MUST run in bounded O(360) (<50ms, never 2s!)
+        t_cpu0 = time.perf_counter()
+        r_sparse = compute_settled_rolling_24h_records(
+            {
+                262968: {"steps": 500, "degraded": False, "degraded_24h_at": None},
+                h_1119_10: {"steps": 1400, "degraded": False, "degraded_24h_at": None},
+            },
+            now_ts=now_far,
+        )
+        self.assertLess(time.perf_counter() - t_cpu0, 0.2)
+        self.assertEqual(len(r_sparse), 1)
+        self.assertEqual(r_sparse[0]["safe_steps"], 1400)
+
+        # 3) B-P2-3: Same-day morning healthy 1500 + later-same-day unsettled degradation MUST NOT briefly flash adaptive_up!
+        t_next_0930 = datetime.datetime(2026, 11, 20, 9, 30, 0).timestamp()
+        h_1119_08 = int(datetime.datetime(2026, 11, 19, 8, 0, 0).timestamp() // 3600)
+        h_1119_11 = int(datetime.datetime(2026, 11, 19, 11, 0, 0).timestamp() // 3600)  # > max_settled_h at 11-20 09:30
+        r_nodither = compute_settled_rolling_24h_records(
+            {
+                h_1119_08: {"steps": 1500, "degraded": False, "degraded_24h_at": None},
+                h_1119_11: {"steps": 10, "degraded": True, "degraded_24h_at": 1510},
+            },
+            now_ts=t_next_0930,
+        )
+        self.assertEqual(compute_adaptive_daily_steps_limits(960, 1200, r_nodither)[2], "default")
+
+        # 4) B-P1-1 + B-P1-2 + B-P1-3 end-to-end:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 22, 14, 0, 0).timestamp()
+            def _iso(ts_v: float) -> str:
+                return datetime.datetime.fromtimestamp(ts_v, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+            # B-P1-3: 4 steps where step 2 is 40m old (outside 30m eval floor) and steps 3,4 are inside 30m -> consec_miss recomputes 3->2,
+            # snap.min_freshness_invalid_reason MUST ALSO sync to "(连掉 2 步)"!
+            cid_f = "fres0001-1111-2222-3333-444444444444"
+            fdir = root / "brain" / cid_f / ".system_generated" / "logs"
+            fdir.mkdir(parents=True)
+            f_rows = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(now - 2460)},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 2450), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 2400), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 2340), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 80), "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 40), "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 300},
+            ]
+            # Wait: gap between step 3 (-2340) and step 4 (-80) > 180s idle_rewarm; keep gap <=150s across 30m boundary (-1850, -1750, -1650)!
+            f_rows = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(now - 2000)},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 1960), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 1850), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 1750), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 1650), "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 300},
+            ]
+            # At now - 1600, step 2 (-1850) is inside 30m; at now = base, step 2 (-1850) is strictly < now-1800, while steps 3,4 are inside 30m,
+            # and latest (-1650) is outside 210+300s freshness window — instead use account switch boundary 150s ago!
+            lp_f = root / "ledger_f.json"
+            eng_f = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain", "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon", "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite", "ledger_path": lp_f,
+                },
+                read_only=False,
+            )
+            # Construct steps at now-200 (1st abn), now-120 (2nd abn), now-40 (3rd abn), with config sliding_window=3min (180s)
+            f_rows = [
+                {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(now - 300)},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 260), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 200), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 120), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300},
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 40), "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 300},
+            ]
+            (fdir / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in f_rows) + "\n", encoding="utf-8")
+            eng_f.config["log_sliding_window_min"] = 3  # 180s floor excludes step 2 (-200s) leaving steps 3,4 (consec=2)
+            eng_f._account_cache = AccountQuotaInfo(short_label="de***7", online=True, observed_at=now)
+            eng_f._last_account_poll = now
+            snap_f = eng_f.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_f.grade, "WARN")
+            self.assertEqual(snap_f.max_consec_miss, 2)
+            self.assertEqual(snap_f.min_freshness_invalid_reason, "无热缓存 (连掉 2 步)")
+
+            # B-P1-1: Frozen deg anchor prevents write storm & load drift as older 24h steps slide out!
+            f_rows.append({"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 20), "model": "gemini-4-neon-xhigh", "input_tokens": 130000, "cache_read_tokens": 0, "output_tokens": 300})
+            # Add 500 steps right around now - 86300 so they slide out over the next 200s!
+            old_b = root / "brain" / "oldb0001-1111-2222-3333-444444444444" / ".system_generated" / "logs"
+            old_b.mkdir(parents=True)
+            old_lines = [
+                json.dumps({"step_index": i, "type": "PLANNER_RESPONSE", "created_at": _iso(now - 86350 + i * 0.2), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 90000, "output_tokens": 200})
+                for i in range(500)
+            ]
+            (old_b / "transcript.jsonl").write_text("\n".join(old_lines) + "\n", encoding="utf-8")
+            (fdir / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in f_rows) + "\n", encoding="utf-8")
+            eng_f.config["log_sliding_window_min"] = 30
+            snap_t1_a = eng_f.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_t1_a.grade, "T1")
+            deg_h_a = int((now - 20) // 3600)
+            init_at = eng_f._ledger.get_account_hourly_buckets("de***7")[deg_h_a]["degraded_24h_at"]
+            self.assertGreaterEqual(init_at, 500)
+            # Poll 120s later after ~500 old steps slid out -> degraded_24h_at MUST remain frozen at init_at!
+            eng_f.poll(now_ts=now + 120.0, force_account=False)
+            after_at = eng_f._ledger.get_account_hourly_buckets("de***7")[deg_h_a]["degraded_24h_at"]
+            self.assertEqual(after_at, init_at)
+
+            # B-P1-2: Legacy daily_step_profiles MUST NOT override or cross-contaminate a day covered by hourly buckets!
+            eng_f._ledger.record_daily_step_profile("de***8", "2026-11-19", 450, is_healthy=False, is_degraded=True)
+            eng_f._ledger.record_hourly_step_buckets(
+                "de***8",
+                {h_1119_10 - 10: 800, h_1119_10: 450},
+                degraded_hours={h_1119_10: 1250},
+                now_ts=now,
+            )
+            today_s = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+            today_st = datetime.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            hist_d8 = eng_f._get_account_completed_daily_history("de***8", now, today_st, today_s, [])
+            by_d8 = {r["date"]: r for r in hist_d8}
+            self.assertEqual(by_d8["2026-11-19"]["degraded_at"], 1250)  # NOT dragged down to calendar-day 450!
+            self.assertEqual(compute_adaptive_daily_steps_limits(960, 1200, hist_d8)[2], "default")
+
+            # B-P2-4: AccountSwitchLedger 336-bucket expiry trim & 32-account integer eviction (never evicts active main!)
+            lgr_ev = AccountSwitchLedger(ledger_path=root / "evict.json", read_only=False)
+            cur_h = int(now // 3600)
+            lgr_ev.record_hourly_step_buckets("ma***1", {cur_h - 400: 99, cur_h - 5: 300}, now_ts=now)
+            hb_m = lgr_ev.get_account_hourly_buckets("ma***1")
+            self.assertNotIn(cur_h - 400, hb_m)
+            self.assertEqual(hb_m[cur_h - 5]["steps"], 300)
+            for idx in range(34):
+                lgr_ev.record_hourly_step_buckets(f"o{idx:02d}***9", {cur_h - 100 - idx: 50}, now_ts=now)
+            self.assertLessEqual(len(lgr_ev._hourly_step_buckets), 32)
+            self.assertIn(cur_h - 5, lgr_ev.get_account_hourly_buckets("ma***1"))
 
 
 if __name__ == "__main__":

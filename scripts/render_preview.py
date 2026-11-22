@@ -232,6 +232,15 @@ def _build_demo_alert_snapshot() -> MonitorSnapshot:
         account_today_steps=86,
         total_today_steps=312,
         steps_scope_label="de***o",
+        rolling_24h_steps=428,
+        account_24h_steps=428,
+        total_24h_steps=560,
+        main_24h_steps=310,
+        subagent_24h_steps=118,
+        total_main_24h_steps=392,
+        total_subagent_24h_steps=168,
+        peak_hour_steps_24h=94,
+        peak_hour_label_24h="昨日 22:00-23:00",
     )
 
 
@@ -280,7 +289,7 @@ def _build_demo_detail_report() -> ConversationDetailReport:
             )
         )
     return ConversationDetailReport(
-        conversation_id="demo-detail-v722-0000-000000000001",
+        conversation_id="demo-detail-v723-0000-000000000001",
         short_id="demo72",
         is_subagent=False,
         model="Neon XHigh",
@@ -306,7 +315,7 @@ def _build_demo_detail_report() -> ConversationDetailReport:
         freshness_invalid_reason="",
         freshness_window_sec=210,
         points=pts,
-        title="v7.2.2 跨号改规冷启与大窗校准演示",
+        title="v7.2.3 跨号改规冷启与大窗校准演示",
         revert_count=0,
     )
 
@@ -347,6 +356,45 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         large_ctx_ttft_allowance_sec=28.9,
         title="超大上下文与并发告警演示",
     )
+    c_miss2 = ConversationSummary(
+        conversation_id="demo7230-0000-0000-0000-000000000003",
+        short_id="demo73",
+        model="Neon XHigh",
+        model_raw="gemini-4-neon-xhigh",
+        context_tokens=164200,
+        max_context_tokens=512000,
+        latest_hit_rate=0.0,
+        latest_cached_in=0,
+        latest_uncached_in=164200,
+        latest_timestamp=now - 16,
+        recent_steps=[
+            StepRecord(1, now - 95, "gemini-4-neon-xhigh", 2600, 149400, 520, 152000, 98.3, "hit", "cached"),
+            StepRecord(2, now - 52, "gemini-4-neon-xhigh", 158600, 0, 480, 158600, 0.0, "abnormal_miss", "abnormal_zero"),
+            StepRecord(3, now - 16, "gemini-4-neon-xhigh", 164200, 0, 510, 164200, 0.0, "abnormal_miss", "abnormal_zero"),
+        ],
+        consec_miss=2,
+        consec_miss_start_step=2,
+        single_miss=False,
+        wasted_cold_tokens=322_800,
+        freshness_remaining_sec=None,
+        freshness_invalid_reason="无热缓存 (连掉 2 步)",
+        abnormal_in_recent10=2,
+        cacheable_in_recent10=3,
+        recent10_hit_ratio=1.0 / 3.0,
+        first_abnormal_step_in_recent10=2,
+        ttft_sec=18.4,
+        streaming_sec=3.6,
+        tps=162.0,
+        shard_tag="dm73",
+        speed_status="ok",
+        recent_ttfts=[12.1, 16.8, 18.4],
+        recent_tps_list=[172.0, 166.0, 162.0],
+        ttft_avg_sec=15.8,
+        ttft_max_sec=18.4,
+        latest_cache_reason="abnormal_zero",
+        last_abnormal_ts=now - 16,
+        title="连续 2 步掉缓存观察演示",
+    )
     c_rule = ConversationSummary(
         conversation_id="demo7220-0000-0000-0000-000000000002",
         short_id="demo72",
@@ -385,7 +433,7 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         level="orange",
         grade="WARN",
         headline="留意预警 · Neon XHigh",
-        sub_headline="代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流) / 多图上传超时 (10m) · demo71 [图13(26.2M)] (2次)，建议压图或/compact",
+        sub_headline="连续 2 步掉缓存(观察中) / 代理线路疑似断流 (03:42 60s内 12次跨接口断连，非服务端限流) / 多图上传超时 (10m) · demo71 [图13(26.2M)] (2次)",
         active_model="Neon XHigh",
         primary_hit_rate=99.5,
         primary_hit_classification="hit",
@@ -396,10 +444,10 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         min_freshness_conv="demo71",
         min_freshness_ctx=473800,
         min_freshness_invalid_reason="",
-        today_steps=1180,
+        today_steps=520,
         daily_steps_warn=1280,
         daily_steps_alert=1600,
-        active_conversations=[c_big, c_rule],
+        active_conversations=[c_big, c_miss2, c_rule],
         large_freshness_list=[c_big],
         recent_503=0,
         today_503=0,
@@ -410,8 +458,8 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         recent_retry=3,
         today_retry=3,
         recent_events=[],
-        wasted_cold_tokens_total=0,
-        max_consec_miss=0,
+        wasted_cold_tokens_total=322_800,
+        max_consec_miss=2,
         account=AccountQuotaInfo(
             email_masked="de***o@example.com",
             short_label="de***o",
@@ -426,9 +474,14 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         primary_ttft_avg=43.6,
         primary_ttft_max=56.2,
         primary_recent_ttfts=[32.0, 38.5, 42.1, 49.0, 56.2],
-        account_today_steps=1180,
-        total_today_steps=1240,
+        account_today_steps=520,
+        total_today_steps=580,
+        main_today_steps=340,
+        subagent_today_steps=180,
+        total_main_today_steps=380,
+        total_subagent_today_steps=200,
         steps_scope_label="de***o",
+        log_scope_label="de***o",
         resolved_account="de***o",
         heavy_media_timeout_recent=2,
         proxy_outage_recent=12,
@@ -437,6 +490,15 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         daily_steps_limit_note="按历史安全峰值 1400 步自适应上调",
         daily_steps_base_alert=1200,
         account_hist_safe_peak=1400,
+        rolling_24h_steps=1340,
+        account_24h_steps=1340,
+        total_24h_steps=1490,
+        main_24h_steps=890,
+        subagent_24h_steps=450,
+        total_main_24h_steps=980,
+        total_subagent_24h_steps=510,
+        peak_hour_steps_24h=186,
+        peak_hour_label_24h="昨日 23:00-00:00",
     )
 
 
@@ -486,10 +548,10 @@ def main() -> int:
             app._on_update_check_result(
                 UpdateCheckResult(
                     checked_at=time.time(),
-                    local_version="7.2.2",
+                    local_version="7.2.3",
                     remote_version="7.3.0",
                     has_update=True,
-                    summary="已恢复掉缓存预警自动销账、识别全局改规则冷启与后台子代理单步瞬抖降噪",
+                    summary="主步数进度条升级动态滚动24小时滑窗、历史自适应升级为小时桶24h沉淀峰值，并将T1连续掉缓存门槛升至3步",
                     released_at="2026-11-22",
                     install_mode="zip",
                     is_manual=True,
@@ -497,7 +559,7 @@ def main() -> int:
             )
             _capture_widget(app.root, out_dir / "shot_6_update_banner_midnight.png")
 
-            # 8. v7.2.2 concurrent heavy-media timeout + proxy outage WARN + rule_change + adaptive steps preview
+            # 8. v7.2.3 rolling 24h + consec_miss=2 WARN + heavy-media timeout + proxy outage + rule_change + adaptive steps preview
             app._hide_update_banner()
             warn_v721 = _build_demo_v721_warn_snapshot()
             app.render_snapshot(warn_v721)

@@ -17,6 +17,7 @@ from core.log_monitor import (
     format_detail_text_report,
     format_media_size,
     format_tokens,
+    is_severe_freshness_invalid,
     truncate_display_width,
 )
 
@@ -443,11 +444,11 @@ class ConversationDetailWindow:
         if latest_tps is None:
             latest_tps = rep.latest_tps
         if rep.freshness_invalid_reason:
-            self._update_freshness_kpi(None, rep.freshness_invalid_reason, latest_tps)
+            self._update_freshness_kpi(None, rep.freshness_invalid_reason, latest_tps, getattr(rep, "consec_miss", 0))
             return
         if rep.freshness_remaining_sec is not None and latest_pt.timestamp > 0:
             rem = int(round(rep.freshness_window_sec - (now_ts - latest_pt.timestamp)))
-            self._update_freshness_kpi(max(0, rem), "", latest_tps)
+            self._update_freshness_kpi(max(0, rem), "", latest_tps, 0)
 
     def sync_from_snapshot(self, snap: MonitorSnapshot) -> None:
         """Keep the open detail modal dynamically in sync with the main 2.5s poll loop."""
@@ -469,7 +470,12 @@ class ConversationDetailWindow:
             if latest_tps is None:
                 latest_tps = self._report.latest_tps if self._report is not None else conv.tps
             if not (snap.is_custom_account_view or snap.history_range != "30m"):
-                self._update_freshness_kpi(conv.freshness_remaining_sec, conv.freshness_invalid_reason, latest_tps)
+                self._update_freshness_kpi(
+                    conv.freshness_remaining_sec,
+                    conv.freshness_invalid_reason,
+                    latest_tps,
+                    conv.consec_miss,
+                )
             else:
                 self._tick_own_freshness_kpi(snap.generated_at)
             self._sync_pin_button()
@@ -714,9 +720,14 @@ class ConversationDetailWindow:
         else:
             self._kpi_cards[3]["val"].configure(text="— t/s", fg=t["text_muted"])
         if self._is_historical_badge:
-            self._update_freshness_kpi(None, "", wstats["latest_tps"])
+            self._update_freshness_kpi(None, "", wstats["latest_tps"], 0)
         else:
-            self._update_freshness_kpi(rep.freshness_remaining_sec, rep.freshness_invalid_reason, wstats["latest_tps"])
+            self._update_freshness_kpi(
+                rep.freshness_remaining_sec,
+                rep.freshness_invalid_reason,
+                wstats["latest_tps"],
+                getattr(rep, "consec_miss", 0),
+            )
 
         self.win.update_idletasks()
         self._draw_context_chart(pts)
@@ -731,10 +742,11 @@ class ConversationDetailWindow:
         freshness_remaining_sec: Optional[int],
         freshness_invalid_reason: str,
         latest_tps: Optional[float],
+        consec_miss: int = 0,
     ) -> None:
         t = self.theme
         if freshness_invalid_reason:
-            is_severe = "连掉" in freshness_invalid_reason
+            is_severe = is_severe_freshness_invalid(freshness_invalid_reason, consec_miss)
             f_txt, f_col = freshness_invalid_reason, (t["red"] if is_severe else t["orange"])
         elif freshness_remaining_sec is not None:
             if freshness_remaining_sec <= 0:

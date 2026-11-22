@@ -84,6 +84,7 @@ class AccountSwitchLedger:
         self.read_only: bool = bool(read_only)
         self._own_events: List[Tuple[float, str]] = []
         self._daily_step_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._hourly_step_buckets: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self._rule_change_timestamps: List[float] = []
         self._cockpit_cache: Dict[str, Tuple[Tuple[int, int], List[Tuple[float, str]]]] = {}
         self._load_own()
@@ -97,6 +98,34 @@ class AccountSwitchLedger:
         except (TypeError, ValueError, OverflowError):
             return None
         return max(0, val)
+
+    @staticmethod
+    def _parse_strict_int(raw: Any) -> Optional[int]:
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s and s.isascii() and s.isdigit():
+                return int(s)
+        return None
+
+    @staticmethod
+    def _pick_preferred_deg_at(a: Optional[int], b: Optional[int]) -> Optional[int]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        a_high = a >= 400
+        b_high = b >= 400
+        if a_high and b_high:
+            return min(a, b)
+        if a_high:
+            return a
+        if b_high:
+            return b
+        return min(a, b)
 
     def _load_own(self) -> None:
         if self.ledger_path is None or not self.ledger_path.is_file():
@@ -209,6 +238,91 @@ class AccountSwitchLedger:
             dedup_rules.append(val)
         self._rule_change_timestamps = dedup_rules[-64:]
 
+        hourly_buckets: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        h_canon_by_low: Dict[str, str] = {}
+        raw_hourly = data.get("hourly_step_buckets")
+        if isinstance(raw_hourly, dict):
+            for raw_acct, hmap_raw in raw_hourly.items():
+                lbl = _mask_short(str(raw_acct))
+                if not lbl or _is_invalid_label(lbl) or not isinstance(hmap_raw, dict):
+                    continue
+                low = lbl.lower()
+                canon_lbl = h_canon_by_low.setdefault(low, lbl)
+                target_hours = hourly_buckets.setdefault(canon_lbl, {})
+                for hk_raw, val in hmap_raw.items():
+                    hk = self._parse_strict_int(hk_raw)
+                    if hk is None or not (262968 <= hk <= 1139568):
+                        continue
+                    steps: Optional[int] = None
+                    degraded = False
+                    deg_at: Optional[int] = None
+                    if isinstance(val, int) and not isinstance(val, bool):
+                        if not (0 <= val <= 500_000):
+                            continue
+                        steps = val
+                    elif isinstance(val, dict):
+                        if "steps" in val:
+                            raw_s = val["steps"]
+                        elif "s" in val:
+                            raw_s = val["s"]
+                        else:
+                            raw_s = 0
+                        steps = self._parse_strict_int(raw_s)
+                        if steps is None or not (0 <= steps <= 500_000):
+                            continue
+                        if "degraded" in val:
+                            raw_d = val["degraded"]
+                        elif "d" in val:
+                            raw_d = val["d"]
+                        else:
+                            raw_d = False
+                        degraded = isinstance(raw_d, bool) and raw_d
+                        if degraded:
+                            if "degraded_24h_at" in val:
+                                raw_at = val["degraded_24h_at"]
+                            elif "at" in val:
+                                raw_at = val["at"]
+                            else:
+                                raw_at = None
+                            if raw_at is not None:
+                                parsed_at = self._parse_strict_int(raw_at)
+                                if parsed_at is not None and 1 <= parsed_at <= 500_000:
+                                    deg_at = parsed_at
+                    else:
+                        continue
+                    if steps == 0 and not degraded:
+                        continue
+                    prev = target_hours.get(hk)
+                    if prev is None:
+                        target_hours[hk] = {
+                            "steps": steps,
+                            "degraded": degraded,
+                            "degraded_24h_at": deg_at,
+                        }
+                    else:
+                        merged_deg = bool(prev["degraded"]) or degraded
+                        merged_at = (
+                            self._pick_preferred_deg_at(prev.get("degraded_24h_at"), deg_at)
+                            if merged_deg
+                            else None
+                        )
+                        target_hours[hk] = {
+                            "steps": max(int(prev["steps"]), steps),
+                            "degraded": merged_deg,
+                            "degraded_24h_at": merged_at,
+                        }
+        trimmed_hourly: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        active_hourly_accts = [
+            (max(hmap.keys()), lbl)
+            for lbl, hmap in hourly_buckets.items()
+            if hmap
+        ]
+        active_hourly_accts.sort(key=lambda x: x[0])
+        for _last_h, lbl in active_hourly_accts[-32:]:
+            hmap = hourly_buckets[lbl]
+            trimmed_hourly[lbl] = {hk: hmap[hk] for hk in sorted(hmap.keys())[-336:]}
+        self._hourly_step_buckets = trimmed_hourly
+
     def _save_own(self) -> None:
         if self.read_only or self.ledger_path is None:
             return
@@ -232,6 +346,35 @@ class AccountSwitchLedger:
                     keep_days = sorted(dmap.keys())[-30:]
                     trimmed_profiles[lbl] = {dk: dmap[dk] for dk in keep_days}
                 out_obj["daily_step_profiles"] = trimmed_profiles
+            if self._hourly_step_buckets:
+                active_hourly = [
+                    (max(hmap.keys()), lbl)
+                    for lbl, hmap in self._hourly_step_buckets.items()
+                    if hmap
+                ]
+                active_hourly.sort(key=lambda x: x[0])
+                trimmed_hourly_out: Dict[str, Dict[str, Any]] = {}
+                for _last_h, lbl in active_hourly[-32:]:
+                    hmap = self._hourly_step_buckets[lbl]
+                    acct_out: Dict[str, Any] = {}
+                    for hk in sorted(hmap.keys())[-336:]:
+                        rec = hmap[hk]
+                        steps = max(0, min(500_000, int(rec.get("steps", 0))))
+                        degraded = bool(rec.get("degraded", False))
+                        if degraded:
+                            item: Dict[str, Any] = {"s": steps, "d": True}
+                            deg_at = rec.get("degraded_24h_at")
+                            if deg_at is not None and not isinstance(deg_at, bool):
+                                deg_at_i = int(deg_at)
+                                if 1 <= deg_at_i <= 500_000:
+                                    item["at"] = deg_at_i
+                            acct_out[str(hk)] = item
+                        elif steps > 0:
+                            acct_out[str(hk)] = steps
+                    if acct_out:
+                        trimmed_hourly_out[lbl] = acct_out
+                if trimmed_hourly_out:
+                    out_obj["hourly_step_buckets"] = trimmed_hourly_out
             if self._rule_change_timestamps:
                 out_obj["rule_change_timestamps"] = [round(ts, 3) for ts in self._rule_change_timestamps[-64:]]
             payload = json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
@@ -364,6 +507,163 @@ class AccountSwitchLedger:
             )
             self._daily_step_profiles.pop(oldest_acct, None)
         self._save_own()
+
+    def get_account_hourly_buckets(self, short_label: str) -> Dict[int, Dict[str, Any]]:
+        """Return a shallow copy of stored hourly step buckets for a masked account label (case-insensitive)."""
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return {}
+        target_low = lbl.lower()
+        merged: Dict[int, Dict[str, Any]] = {}
+        for k, hmap in self._hourly_step_buckets.items():
+            if k.lower() != target_low:
+                continue
+            for hk, rec in hmap.items():
+                prev = merged.get(hk)
+                if prev is None:
+                    merged[hk] = dict(rec)
+                else:
+                    m_deg = bool(prev.get("degraded", False)) or bool(rec.get("degraded", False))
+                    m_at = (
+                        self._pick_preferred_deg_at(prev.get("degraded_24h_at"), rec.get("degraded_24h_at"))
+                        if m_deg
+                        else None
+                    )
+                    merged[hk] = {
+                        "steps": max(int(prev.get("steps", 0)), int(rec.get("steps", 0))),
+                        "degraded": m_deg,
+                        "degraded_24h_at": m_at,
+                    }
+        return merged
+
+    def record_hourly_step_buckets(
+        self,
+        short_label: str,
+        hour_counts: Dict[int, int],
+        degraded_hours: Optional[Dict[int, Optional[int]]] = None,
+        now_ts: Optional[float] = None,
+    ) -> bool:
+        """Throttled privacy-safe persistence of per-account UTC hourly step & degradation buckets."""
+        if self.read_only:
+            return False
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return False
+        if now_ts is None:
+            now = time.time()
+        else:
+            if isinstance(now_ts, bool):
+                return False
+            try:
+                now = float(now_ts)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(now):
+                return False
+
+        cur_h = int(now // 3600)
+        min_valid_h = cur_h - 336
+        max_valid_h = cur_h + 1
+
+        clean_counts: Dict[int, int] = {}
+        if isinstance(hour_counts, dict):
+            for hk_raw, cnt_raw in hour_counts.items():
+                hk = self._parse_strict_int(hk_raw)
+                if hk is None or not (262968 <= hk <= 1139568) or hk < min_valid_h or hk > max_valid_h:
+                    continue
+                cnt = self._parse_strict_int(cnt_raw)
+                if cnt is None or not (0 <= cnt <= 500_000):
+                    continue
+                prev_c = clean_counts.get(hk, 0)
+                if cnt > prev_c:
+                    clean_counts[hk] = cnt
+
+        clean_deg: Dict[int, Optional[int]] = {}
+        if isinstance(degraded_hours, dict):
+            for hk_raw, at_raw in degraded_hours.items():
+                hk = self._parse_strict_int(hk_raw)
+                if hk is None or not (262968 <= hk <= 1139568) or hk < min_valid_h or hk > max_valid_h:
+                    continue
+                parsed_at: Optional[int] = None
+                if at_raw is not None:
+                    at_val = self._parse_strict_int(at_raw)
+                    if at_val is not None and 1 <= at_val <= 500_000:
+                        parsed_at = at_val
+                if hk in clean_deg:
+                    clean_deg[hk] = self._pick_preferred_deg_at(clean_deg[hk], parsed_at)
+                else:
+                    clean_deg[hk] = parsed_at
+
+        all_hks = set(clean_counts.keys()) | set(clean_deg.keys())
+        if not all_hks:
+            return False
+
+        canon_key = next((k for k in self._hourly_step_buckets if k.lower() == lbl.lower()), lbl)
+        existing_hmap = self._hourly_step_buckets.get(canon_key, {})
+
+        pending_updates: Dict[int, Dict[str, Any]] = {}
+        dirty = False
+        for hk in all_hks:
+            cur_steps = clean_counts.get(hk, 0)
+            is_deg = hk in clean_deg
+            cur_at = clean_deg.get(hk) if is_deg else None
+
+            prev = existing_hmap.get(hk)
+            if prev is None:
+                new_steps = cur_steps
+                new_deg = is_deg
+                new_at = cur_at if new_deg else None
+                if new_steps == 0 and not new_deg:
+                    continue
+                pending_updates[hk] = {
+                    "steps": new_steps,
+                    "degraded": new_deg,
+                    "degraded_24h_at": new_at,
+                }
+                dirty = True
+            else:
+                prev_steps = int(prev.get("steps", 0))
+                prev_deg = bool(prev.get("degraded", False))
+                prev_at = prev.get("degraded_24h_at") if prev_deg else None
+
+                new_steps = max(prev_steps, cur_steps)
+                new_deg = prev_deg or is_deg
+                new_at = self._pick_preferred_deg_at(prev_at, cur_at) if new_deg else None
+                if new_steps == 0 and not new_deg:
+                    continue
+                pending_updates[hk] = {
+                    "steps": new_steps,
+                    "degraded": new_deg,
+                    "degraded_24h_at": new_at,
+                }
+                if (
+                    (new_steps - prev_steps) >= 25
+                    or (new_deg and not prev_deg)
+                    or (new_at != prev_at)
+                ):
+                    dirty = True
+
+        if not dirty:
+            return False
+
+        hmap = self._hourly_step_buckets.setdefault(canon_key, {})
+        hmap.update(pending_updates)
+        for old_hk in [k for k in hmap if k < min_valid_h]:
+            hmap.pop(old_hk, None)
+        if len(hmap) > 336:
+            for old_hk in sorted(hmap.keys())[:-336]:
+                hmap.pop(old_hk, None)
+        while len(self._hourly_step_buckets) > 32:
+            evict_candidates = [k for k in self._hourly_step_buckets if k != canon_key]
+            if not evict_candidates:
+                break
+            oldest_acct = min(
+                evict_candidates,
+                key=lambda k: max(self._hourly_step_buckets[k].keys()) if self._hourly_step_buckets[k] else -1,
+            )
+            self._hourly_step_buckets.pop(oldest_acct, None)
+        self._save_own()
+        return True
 
     def observe_online(
         self,
