@@ -2028,9 +2028,9 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-500), "content": "try 1"},
                 {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-490), "content": "try 1 resend"},
                 {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(-480), "model": "gemini-4-neon-xhigh", "input_tokens": 450000, "cache_read_tokens": 0, "output_tokens": 300},
-                # True compaction with partial prefix cache hit (cr > 0, 450K -> 180K) -> is_compact=True, compact_count=1
+                # True compaction with high prefix cache hit (>=75%, e.g. pre-warmed after retry) -> is_compact=True, reason="cached", [压缩·命中]
                 {"type": "CHECKPOINT", "step_index": 3, "created_at": iso(-450)},
-                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(-440), "model": "gemini-4-neon-xhigh", "input_tokens": 155000, "cache_read_tokens": 25000, "output_tokens": 300},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(-440), "model": "gemini-4-neon-xhigh", "input_tokens": 20000, "cache_read_tokens": 160000, "output_tokens": 300},
                 # True Undo revert that still hits earlier prefix cache (cr > 0) -> is_revert=True, reason="cached", [回溯·命中]
                 {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 2, "created_at": iso(-400), "content": "undo and retry"},
                 {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": iso(-395), "model": "gemini-4-neon-xhigh", "input_tokens": 20000, "cache_read_tokens": 100000, "output_tokens": 250},
@@ -5623,6 +5623,1163 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 lgr_ev.record_hourly_step_buckets(f"o{idx:02d}***9", {cur_h - 100 - idx: 50}, now_ts=now)
             self.assertLessEqual(len(lgr_ev._hourly_step_buckets), 32)
             self.assertIn(cur_h - 5, lgr_ev.get_account_hourly_buckets("ma***1"))
+
+    def test_v724_bug1_localhost_direct_debouncing_pid_reuse_and_diag_readonly(self) -> None:
+        """v7.2.4 Bug 1: zero-proxy localhost RPC, 111+ hub files & PID reuse guard, live-Hub debounce, auto_offline lock, read_only diag."""
+        import http.server
+        import os
+        import threading
+        import urllib.request
+        from unittest import mock
+
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            AntigravityMonitorEngine,
+            _open_localhost_url,
+        )
+
+        # 1. Localhost opener MUST refuse non-localhost URLs and ignore poisoned proxy env vars
+        with self.assertRaises(ValueError):
+            _open_localhost_url(urllib.request.Request("http://example.com/status"), timeout=0.5)
+        with self.assertRaises(ValueError):
+            _open_localhost_url(urllib.request.Request("https://127.0.0.1:443/status"), timeout=0.5)
+
+        serve_mode = {"mode": "ok"}
+
+        class _HubHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_POST(self):  # noqa: N802
+                if serve_mode["mode"] == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "http://example.com/steal")
+                    self.end_headers()
+                    return
+                if serve_mode["mode"] == "fail":
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                body = json.dumps(
+                    {
+                        "userStatus": {
+                            "email": "v724tester@gmail.com",
+                            "userTier": {"id": "g1-ultra-tier"},
+                            "planStatus": {"planInfo": {"planName": "Pro", "teamsTier": "TEAMS_TIER_PRO"}},
+                            "cascadeModelConfigData": {
+                                "clientModelConfigs": [
+                                    {
+                                        "label": "Gemini 4 Neon (XHigh)",
+                                        "modelOrAlias": {"model": "MODEL_GEMINI_4_NEON"},
+                                        "quotaInfo": {"remainingFraction": 0.88, "resetTime": "2026-11-24T00:00:00Z"},
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HubHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                daemon = root / "daemon"
+                daemon.mkdir()
+                now = time.time()
+                convs, brain, sum_db, conn = self._create_slot_env(root, now)
+                try:
+                    # 1 main conversation (never cleanable) + 1 old completed subagent (>30m, truly cleanable when offline!)
+                    self._add_slot_conv(convs, brain, conn, "main-v724-01", 86400, now, title="重要主对话")
+                    self._add_slot_conv(
+                        convs,
+                        brain,
+                        conn,
+                        "sub-old-01",
+                        10800,
+                        now,
+                        title="",
+                        agent_name="Research",
+                        parent_id="main-v724-01",
+                        nesting_depth=1,
+                    )
+                    sub_db = convs / "sub-old-01.db"
+                finally:
+                    conn.close()
+
+                # Populate 55 stale hub files (>40 old cap) + 1 live-port hub at the tail
+                for i in range(55):
+                    p = daemon / f"hub_{10000 + i}.json"
+                    p.write_text(json.dumps({"pid": 999990 + i, "httpPort": 10000 + i, "csrfToken": "dead"}), encoding="utf-8")
+                # Real live test server hub file with older mtime (beyond index 40!)
+                live_hub = daemon / f"hub_{port}.json"
+                live_hub.write_text(json.dumps({"pid": os.getpid(), "httpPort": port, "csrfToken": "secret-tok"}), encoding="utf-8")
+                os.utime(live_hub, (now - 7200, now - 7200))
+
+                diag_log = root / "logs" / "monitor_diag.log"
+                base_paths = {
+                    "brain_dir": brain,
+                    "conversations_dir": convs,
+                    "summaries_db_path": sum_db,
+                    "daemon_dir": daemon,
+                    "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                    "slot_journal_path": root / "slot_journal.jsonl",
+                    "diag_log_path": diag_log,
+                }
+
+                # 1a. Poison proxy env vars + NO_PROXY="" -> must still connect directly & read_only=True writes zero diag log!
+                with mock.patch.dict(
+                    os.environ,
+                    {"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""},
+                    clear=False,
+                ):
+                    ro_eng = AntigravityMonitorEngine(paths=base_paths, read_only=True)
+                    snap_ro = ro_eng.poll(now_ts=now, force_account=True)
+                    self.assertTrue(snap_ro.account.online)
+                    self.assertTrue(snap_ro.hub_pid_alive)
+                    self.assertEqual(snap_ro.account.short_label, "v7***r")
+                    self.assertFalse(diag_log.exists())
+
+                    # 302 redirect must fail cleanly without following to external host
+                    serve_mode["mode"] = "redirect"
+                    with self.assertRaises(urllib.error.HTTPError):
+                        _open_localhost_url(
+                            urllib.request.Request(f"http://127.0.0.1:{port}/test", data=b"{}", headers={"x-codeium-csrf-token": "secret-tok"}),
+                            timeout=1.0,
+                        )
+                    serve_mode["mode"] = "ok"
+
+                # 2. Writable engine: live-Hub RPC transient failures debounce (<3 & <15s) -> preserve online, then WAIT (blocks auto_offline!)
+                import shutil as _shutil
+
+                def _fake_recycle(p: Path):
+                    if p.is_dir():
+                        _shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink(missing_ok=True)
+                    return True, ""
+
+                eng = AntigravityMonitorEngine(paths=base_paths, config={"slot_auto_clean_enabled": True}, read_only=False)
+                eng.slot_cleaner._recycle_fn = _fake_recycle
+                snap1 = eng.poll(now_ts=now, force_account=True)
+                self.assertTrue(snap1.account.online)
+                self.assertTrue(snap1.hub_pid_alive)
+                self.assertIsNotNone(snap1.slot_inventory)
+                self.assertTrue(snap1.slot_inventory.summary_db_ok)
+                self.assertEqual(snap1.slot_inventory.cleanable_sub_count, 1)
+                eng._last_weekly_email = "v724tester@gmail.com"
+                eng._last_weekly_pools = {"gemini": (92.0, "2026-11-28T00:00:00Z")}
+
+                # Simulate RPC failure while Hub PID is confirmed a real language_server process
+                serve_mode["mode"] = "fail"
+                with mock.patch("core.log_monitor._is_hub_language_server_pid", return_value=True):
+                    snap_g1 = eng.poll(now_ts=now + 6.0, force_account=True)
+                    self.assertTrue(snap_g1.account.online)
+                    self.assertTrue(snap_g1.hub_pid_alive)
+                    self.assertEqual(eng._last_weekly_email, "v724tester@gmail.com")
+
+                    snap_g2 = eng.poll(now_ts=now + 11.0, force_account=True)
+                    self.assertTrue(snap_g2.account.online)
+
+                    # 3rd failure exceeds grace -> drops online to False, keeps hub_pid_alive=True, grade="WAIT" (NOT "IDLE"), blocks auto_offline!
+                    snap_wait = eng.poll(now_ts=now + 16.0, force_account=True)
+                    self.assertFalse(snap_wait.account.online)
+                    self.assertTrue(snap_wait.hub_pid_alive)
+                    self.assertEqual(snap_wait.grade, "WAIT")
+                    self.assertFalse(snap_wait.is_host_idle_offline)
+                    self.assertEqual(compute_cli_exit_code(snap_wait), 2)
+                    wait_json = json.loads(format_json_snapshot(snap_wait))
+                    self.assertTrue(wait_json["account"]["hub_pid_alive"])
+                    self.assertEqual(wait_json["grade"], "WAIT")
+                    self.assertIn("WAIT", format_text_summary(snap_wait))
+                    # Positive lock: WAIT state MUST block auto_offline even after +60s!
+                    self.assertIsNone(eng.maybe_auto_clean_slots(snap_wait, now_ts=now + 16.0))
+                    self.assertIsNone(eng.maybe_auto_clean_slots(snap_wait, now_ts=now + 60.0))
+                    self.assertTrue(sub_db.exists())
+
+                # 2b. Dead cached Hub while another LS Hub is alive -> clears stale _active_hub_pid immediately (no hub_dropped thrashing!)
+                eng._active_hub_pid = 99999999
+                eng._active_hub_port = 54321
+                eng._active_hub_token = "old-dead"
+                eng._active_hub_creation_ft = 123456
+                eng._account_cache.online = True
+                eng._account_rpc_fail_count = 0
+                eng._last_account_rpc_ok_ts = now + 60.0
+                with mock.patch("core.log_monitor._inspect_windows_pid", side_effect=lambda p: (True, "language_server_windows_x64.exe", 999) if p == os.getpid() else (False, "", 0)):
+                    snap_swap = eng.poll(now_ts=now + 65.0, force_account=True)
+                    self.assertEqual(eng._active_hub_pid, 0)
+                    self.assertFalse(snap_swap.account.online)
+                    self.assertTrue(snap_swap.hub_pid_alive)
+                    self.assertEqual(snap_swap.grade, "WAIT")
+
+                # 3. PID reuse guard + real offline negative check: live_hub points to current python.exe (NOT LS) and RPC fails -> IDLE + auto_offline cleans!
+                eng._active_hub_pid = 0
+                eng._active_hub_port = 0
+                eng._active_hub_token = ""
+                eng._active_hub_creation_ft = 0
+                snap_off = eng.poll(now_ts=now + 70.0, force_account=True)
+                self.assertFalse(snap_off.account.online)
+                self.assertFalse(snap_off.hub_pid_alive)
+                self.assertEqual(snap_off.grade, "IDLE")
+                self.assertTrue(snap_off.is_host_idle_offline)
+                # Real offline starts offline_since timer at +70s, then genuinely cleans the 1 old subagent at +90s!
+                self.assertIsNone(eng.maybe_auto_clean_slots(snap_off, now_ts=now + 70.0))
+                res_off = eng.maybe_auto_clean_slots(snap_off, now_ts=now + 95.0)
+                self.assertIsNotNone(res_off)
+                self.assertEqual(res_off.removed_count, 1)
+                self.assertFalse(sub_db.exists())
+
+                # 4. Diag log written, masked (no raw email/token), and atomic <= 64 KB truncation verified
+                self.assertTrue(diag_log.exists())
+                dtxt = diag_log.read_text(encoding="utf-8")
+                self.assertNotIn("v724tester@gmail.com", dtxt)
+                self.assertNotIn("secret-tok", dtxt)
+                # Force oversize (>64 KB) and verify atomic truncation caps size back <= 64 KB
+                diag_log.write_bytes(b"old-line\n" * 9000)
+                self.assertGreater(diag_log.stat().st_size, 64 * 1024)
+                eng._write_diag_log(now + 200.0, "offline", "truncation-check", has_error=True)
+                self.assertLessEqual(diag_log.stat().st_size, 64 * 1024)
+                self.assertIn("truncation-check", diag_log.read_text(encoding="utf-8"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_v724_bug2_job_safe_restart_wmi_and_minimized_fix(self) -> None:
+        """v7.2.4 Bug 2: 64-byte Job struct, A/B/B->C/C restart routing, WMI UTF-16LE + timeout, log truncation, restart_minimized fix."""
+        import base64
+        import ctypes
+        import subprocess
+        from unittest import mock
+
+        import main as m
+
+        # 1. Exact 64-bit Win32 struct size
+        if os.name == "nt" and ctypes.sizeof(ctypes.c_void_p) == 8:
+            self.assertEqual(ctypes.sizeof(m._JOBOBJECT_BASIC_LIMIT_INFORMATION), 64)
+
+        # 2. QueryInformationJobObject failure under active Job -> conservative kill_on_close=True, breakaway_ok=False
+        if os.name == "nt":
+            fake_k32 = mock.MagicMock()
+            fake_k32.GetCurrentProcess.return_value = 1
+            def _in_job(_h, _j, out_ptr):
+                out_ptr._obj.value = 1
+                return 1
+            fake_k32.IsProcessInJob.side_effect = _in_job
+            fake_k32.QueryInformationJobObject.return_value = 0
+            with mock.patch.object(ctypes, "WinDLL", return_value=fake_k32):
+                ji = m._inspect_current_job_limits()
+                self.assertTrue(ji.in_job)
+                self.assertTrue(ji.kill_on_close)
+                self.assertFalse(ji.breakaway_ok)
+                self.assertTrue(ji.query_failed)
+
+        # 3. Branch A (normal desktop) -> Popen without CREATE_BREAKAWAY_FROM_JOB, with DEVNULL & close_fds
+        with mock.patch.object(m, "_inspect_current_job_limits", return_value=m.JobLimitInfo(False, False, False, False)), \
+             mock.patch.object(subprocess, "Popen") as popen_mock:
+            ok = m._spawn_restarted_self(no_tray=False, minimized=False, readonly=True)
+            self.assertTrue(ok)
+            popen_mock.assert_called_once()
+            _, kw = popen_mock.call_args
+            self.assertEqual(kw.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kw.get("stdout"), subprocess.DEVNULL)
+            self.assertEqual(kw.get("stderr"), subprocess.DEVNULL)
+            self.assertTrue(kw.get("close_fds"))
+            if os.name == "nt":
+                self.assertEqual(kw["creationflags"] & m.CREATE_BREAKAWAY_FROM_JOB, 0)
+
+        # 3b. Branch B success -> Popen WITH CREATE_BREAKAWAY_FROM_JOB, no WMI needed
+        with mock.patch.object(m, "_inspect_current_job_limits", return_value=m.JobLimitInfo(True, True, True, False)), \
+             mock.patch.object(subprocess, "Popen") as popen_b, \
+             mock.patch.object(m, "_spawn_via_wmi") as wmi_b:
+            ok = m._spawn_restarted_self(readonly=True)
+            self.assertTrue(ok)
+            popen_b.assert_called_once()
+            wmi_b.assert_not_called()
+            if os.name == "nt":
+                self.assertNotEqual(popen_b.call_args[1]["creationflags"] & m.CREATE_BREAKAWAY_FROM_JOB, 0)
+
+        # 4. Branch B -> PermissionError falls back seamlessly to Branch C (WMI)
+        with mock.patch.object(m, "_inspect_current_job_limits", return_value=m.JobLimitInfo(True, True, True, False)), \
+             mock.patch.object(subprocess, "Popen", side_effect=PermissionError(5, "Access denied")), \
+             mock.patch.object(m, "_spawn_via_wmi", return_value=(True, "ok")) as wmi_mock:
+            ok = m._spawn_restarted_self(readonly=True)
+            self.assertTrue(ok)
+            wmi_mock.assert_called_once()
+
+        # 5. Branch C strict Job -> skips Popen, calls WMI; if WMI fails, respects readonly=True & calls alert hook
+        alerts = []
+        with mock.patch.object(m, "_inspect_current_job_limits", return_value=m.JobLimitInfo(True, True, False, False)), \
+             mock.patch.object(m, "_spawn_via_wmi", return_value=(False, "RV=2")), \
+             mock.patch.object(m, "_RESTART_ALERT_FN", side_effect=alerts.append), \
+             mock.patch.object(m, "_append_restart_error_log") as log_mock:
+            ok = m._spawn_restarted_self(readonly=True)
+            self.assertFalse(ok)
+            log_mock.assert_not_called()
+            self.assertEqual(len(alerts), 1)
+
+        # 6. _spawn_via_wmi parses RV=0;PID=12345, verifies UTF-16LE -EncodedCommand (incl. Chinese + quotes), RV=8 failure & timeout kill+wait
+        fake_proc_ok = mock.MagicMock()
+        fake_proc_ok.communicate.return_value = (b"RV=0;PID=12345\r\n", b"")
+        fake_proc_ok.returncode = 0
+        with mock.patch.object(subprocess, "Popen", return_value=fake_proc_ok) as wmi_popen:
+            ok, _detail = m._spawn_via_wmi(["pythonw.exe", "C:\\中文'目录\u2019\\main.py", "--restarting"], Path("C:\\中文'目录\u2019"))
+            self.assertTrue(ok)
+            args_passed = wmi_popen.call_args[0][0]
+            enc_idx = args_passed.index("-EncodedCommand")
+            decoded_ps = base64.b64decode(args_passed[enc_idx + 1]).decode("utf-16le")
+            self.assertIn("$ProgressPreference = 'SilentlyContinue'", decoded_ps)
+            self.assertIn("Win32_ProcessStartup", decoded_ps)
+            self.assertIn("中文''目录\u2019\u2019", decoded_ps)
+
+        fake_proc_bad = mock.MagicMock()
+        fake_proc_bad.communicate.return_value = (b"RV=8;PID=0\r\n", b"")
+        fake_proc_bad.returncode = 0
+        with mock.patch.object(subprocess, "Popen", return_value=fake_proc_bad):
+            ok, _detail = m._spawn_via_wmi(["pythonw.exe", "main.py"], Path("."))
+            self.assertFalse(ok)
+
+        fake_proc_to = mock.MagicMock()
+        fake_proc_to.communicate.side_effect = subprocess.TimeoutExpired(cmd="powershell.exe", timeout=0.1)
+        with mock.patch.object(subprocess, "Popen", return_value=fake_proc_to):
+            ok, detail = m._spawn_via_wmi(["pythonw.exe", "main.py"], Path("."), timeout_sec=0.1)
+            self.assertFalse(ok)
+            self.assertIn("timed out", detail)
+            fake_proc_to.kill.assert_called_once()
+            fake_proc_to.wait.assert_called_once()
+
+        # 6b. _spawn_restarted_self(readonly=True) writes zero restart_error.log, while _append_restart_error_log caps <= 64 KB
+        with tempfile.TemporaryDirectory() as td:
+            fake_root = Path(td)
+            err_log = fake_root / "logs" / "restart_error.log"
+            with mock.patch.object(m, "APP_ROOT", fake_root):
+                with mock.patch.object(m, "_inspect_current_job_limits", return_value=m.JobLimitInfo(True, True, False, False)), \
+                     mock.patch.object(m, "_spawn_via_wmi", return_value=(False, "RV=2")), \
+                     mock.patch.object(m, "_RESTART_ALERT_FN", side_effect=lambda _msg: None):
+                    self.assertFalse(m._spawn_restarted_self(readonly=True))
+                self.assertFalse(err_log.exists())
+                err_log.parent.mkdir(parents=True, exist_ok=True)
+                err_log.write_bytes(b"x\n" * 40000)
+                m._append_restart_error_log("cap-check-entry")
+                self.assertLessEqual(err_log.stat().st_size, 64 * 1024)
+                self.assertIn("cap-check-entry", err_log.read_text(encoding="utf-8"))
+
+        # 7. Verify main.py source has 12.0s restart wait, fixed restart_minimized, and start_minimized_override on --restarting
+        src_main = (Path(m.__file__).resolve()).read_text(encoding="utf-8")
+        self.assertIn("12.0 if args.restarting else 0.0", src_main)
+        self.assertNotIn("args.minimized or (not args.no_tray", src_main)
+        self.assertIn("False if args.restarting else None", src_main)
+
+    def test_v724_bug3_smooth_window_dragger_ui_guards_and_logs_live(self) -> None:
+        """v7.2.4 Bug 3: SmoothWindowDragger coalescing, watchdog stationary lock, defer-render/clamp, restart_app guard, logs_live & WAIT text."""
+        import tkinter as tk
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from core.config_store import ConfigStore
+        from core.log_monitor import AccountQuotaInfo, AntigravityMonitorEngine, MonitorSnapshot
+        from ui.capsule_app import AntigravityCapsuleApp
+        from ui.window_drag import SmoothWindowDragger
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tk display unavailable")
+
+        try:
+            # 1. SmoothWindowDragger coalesces 100 synthetic high-rate B1-Motion events & preserves <4px click vs drag
+            root.geometry("200x40+100+100")
+            root.update_idletasks()
+            events_end = []
+            geom_calls = []
+            orig_geom = root.geometry
+
+            def _spy_geom(*a, **kw):
+                if a:
+                    geom_calls.append(a[0])
+                return orig_geom(*a, **kw)
+
+            root.geometry = _spy_geom  # type: ignore[assignment]
+            dragger = SmoothWindowDragger(
+                root,
+                move_threshold=4,
+                on_drag_end=lambda moved: events_end.append(moved),
+            )
+            # Click (<4px) -> moved=False, zero geometry writes
+            dragger.on_start(SimpleNamespace(x_root=150, y_root=120))
+            dragger.on_move(SimpleNamespace(x_root=152, y_root=121))
+            dragger.on_end(SimpleNamespace(x_root=152, y_root=121))
+            self.assertEqual(events_end, [False])
+            self.assertEqual(len(geom_calls), 0)
+
+            # High-rate 100 motion burst -> coalesced without 100 geometry calls, flush executes once, final commit syncs +200+150
+            dragger.on_start(SimpleNamespace(x_root=150, y_root=120))
+            for step in range(1, 101):
+                dragger.on_move(SimpleNamespace(x_root=150 + step, y_root=120 + (step // 2)))
+            self.assertEqual(len(geom_calls), 0)
+            dragger._flush_move()
+            self.assertEqual(len(geom_calls), 1)
+            self.assertIn("+200+150", geom_calls[-1])
+            dragger.on_end(SimpleNamespace(x_root=250, y_root=170))
+            self.assertEqual(events_end, [False, True])
+            self.assertEqual(len(geom_calls), 2)
+
+            # Watchdog stationary lock: if release was lost and cursor later moved far away, finish_or_cancel(commit=True) locks current rect (no jump!)
+            dragger.on_start(SimpleNamespace(x_root=100, y_root=100))
+            dragger._use_win32_cursor = True
+            dragger._hwnd = 1234
+            dragger._moved = True
+            dragger._last_applied_pos = (320, 180)
+            with mock.patch("ui.window_drag._get_user32", return_value=object()), \
+                 mock.patch("ui.window_drag._is_primary_button_pressed", return_value=False), \
+                 mock.patch.object(dragger, "_read_win32_window_origin", return_value=(320, 180)), \
+                 mock.patch.object(dragger, "_read_win32_cursor", return_value=(999, 999)):
+                self.assertTrue(dragger.check_release_watchdog())
+            self.assertIn("+320+180", geom_calls[-1])
+            self.assertNotIn("+999", geom_calls[-1])
+
+            # Negative multi-monitor coordinate formatting (+-300+-50 places window at x=-300, y=-50 in Tk)
+            dragger._apply_geometry(-300, -50)
+            self.assertEqual(geom_calls[-1], "+-300+-50")
+            self.assertIn("+-300+-50", root.wm_geometry())
+            dragger.cancel()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+        # 2. CapsuleApp: drag defers render_snapshot & _clamp_window_to_screen, release flushes; restart_app respects _closing; logs_live & "连接中" align with hub_pid_alive
+        project_root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as td:
+            troot = Path(td)
+            cfg_store = ConfigStore(troot / "config.json")
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": troot / "brain",
+                    "conversations_dir": troot / "conversations",
+                    "daemon_dir": troot / "daemon",
+                    "ls_log_path": troot / "ls.log",
+                    "cockpit_quota_db": troot / "missing.sqlite",
+                    "ledger_path": troot / "ledger.json",
+                },
+                read_only=True,
+            )
+            restart_hits = []
+            app = AntigravityCapsuleApp(
+                app_root=project_root,
+                config_store=cfg_store,
+                engine=eng,
+                enable_tray=False,
+                start_minimized_override=True,
+                on_restart=lambda: restart_hits.append(1),
+            )
+            try:
+                now = time.time()
+                snap_wait = MonitorSnapshot(
+                    generated_at=now,
+                    level="green",
+                    grade="WAIT",
+                    headline="已运行 · 等待账号响应",
+                    sub_headline="检测到 Antigravity 服务运行中，正在等待账号状态响应",
+                    active_model="Neon XHigh",
+                    primary_hit_rate=None,
+                    primary_hit_classification="",
+                    primary_tps=None,
+                    primary_ttft=None,
+                    primary_speed_status="",
+                    min_freshness_sec=None,
+                    min_freshness_conv="",
+                    min_freshness_ctx=0,
+                    min_freshness_invalid_reason="",
+                    today_steps=0,
+                    daily_steps_warn=960,
+                    daily_steps_alert=1200,
+                    active_conversations=[],
+                    large_freshness_list=[],
+                    recent_503=0,
+                    today_503=0,
+                    recent_timeout=0,
+                    today_timeout=0,
+                    recent_403=0,
+                    today_403=0,
+                    recent_retry=0,
+                    today_retry=0,
+                    recent_events=[],
+                    wasted_cold_tokens_total=0,
+                    max_consec_miss=0,
+                    account=AccountQuotaInfo(short_label="离线", online=False, observed_at=now),
+                    sliding_window_min=30,
+                    freshness_window_sec=210,
+                    hub_pid_alive=True,
+                )
+                # Expand panel so Module 4 (_lbl_logs_title) is actively rendered, then test drag defer & logs_live
+                app.set_expanded(True)
+                # While dragging, render_snapshot is deferred, _drag_idle_event pauses background poll, and _clamp_window_to_screen sets _pending_clamp
+                self.assertTrue(app._drag_idle_event.is_set())
+                app._on_drag_start(SimpleNamespace(x_root=100, y_root=100))
+                self.assertTrue(app._dragging)
+                self.assertFalse(app._drag_idle_event.is_set())
+                app.render_snapshot(snap_wait)
+                self.assertIs(app._pending_drag_snapshot, snap_wait)
+                app._clamp_window_to_screen()
+                self.assertTrue(app._pending_clamp)
+
+                # Losing release -> finish_or_cancel clears _dragging, resumes background poll, and flushes pending snapshot
+                app._dragger.finish_or_cancel(commit=False)
+                self.assertFalse(app._dragging)
+                self.assertTrue(app._drag_idle_event.is_set())
+                self.assertIsNone(app._pending_drag_snapshot)
+                self.assertIs(app._latest_snapshot, snap_wait)
+                # logs_live MUST be active & account badges MUST say "连接中" (never "离线") for WAIT + hub_pid_alive=True
+                self.assertNotIn("客户端未运行", str(app._lbl_logs_title.cget("text")))
+                self.assertIn("连接中", str(app._lbl_bar_acc.cget("text")))
+                self.assertIn("连接中", str(app._lbl_acc_pill.cget("text")))
+
+                # When hub_pid_alive=False & account.online=False & grade="T0" (<120s after shutdown), logs_live MUST stay offline!
+                snap_closing = MonitorSnapshot(**{**snap_wait.__dict__, "grade": "T0", "hub_pid_alive": False})
+                app.render_snapshot(snap_closing)
+                self.assertIn("客户端未运行", str(app._lbl_logs_title.cget("text")))
+                self.assertIn("离线", str(app._lbl_bar_acc.cget("text")))
+
+                # restart_app must be ignored once _closing is True
+                app._closing = True
+                app.restart_app()
+                self.assertEqual(restart_hits, [])
+                app._closing = False
+            finally:
+                app.shutdown()
+
+    def test_v725_history_boundary_compact_partial_miss_diluted_and_revert_guards(self) -> None:
+        """v7.2.5: 14-day historical boundaries (compact partial hit, revert/error-retry guards, partial_miss, cached_diluted, sub-32k post-compact, visual tier)."""
+        from core.log_monitor import (
+            AntigravityMonitorEngine,
+            classify_steps,
+            format_detail_text_report,
+            resolve_cache_visual_tier,
+        )
+
+        now = time.time()
+
+        # 1. Pure classify_steps matrix covering every 14-day boundary finding
+        raw_steps = [
+            # Step 0: first turn warmable baseline (490K)
+            {"step_index": 100, "timestamp": now - 600, "model": "gemini-4-neon-xhigh", "input_tokens": 490000, "cache_read_tokens": 0, "output_tokens": 200, "after_checkpoint": False, "after_revert": False},
+            # Step 1: Compaction retaining 32K static prefix (59.2% < 75%) -> expected_cold / compact_reset + is_compact=True
+            {"step_index": 101, "timestamp": now - 580, "model": "gemini-4-neon-xhigh", "input_tokens": 22331, "cache_read_tokens": 32374, "output_tokens": 200, "after_checkpoint": True, "after_revert": False},
+            # Step 2: Normal large tool return dilution (cr=54703 = 100% prev, hr=45.7%) -> hit / cached_diluted (green!)
+            {"step_index": 102, "timestamp": now - 560, "model": "gemini-4-neon-xhigh", "input_tokens": 64943, "cache_read_tokens": 54703, "output_tokens": 200, "after_checkpoint": False, "after_revert": False},
+            # Step 3: True partial prefix miss (prev=119.6K >= 50K, cr=21.4K < 50% prev, hr=15.4%) -> abnormal_miss / partial_miss!
+            {"step_index": 103, "timestamp": now - 513, "model": "gemini-4-neon-xhigh", "input_tokens": 117291, "cache_read_tokens": 21390, "output_tokens": 200, "after_checkpoint": False, "after_revert": False},
+            # Step 4: Exact dt == 180.0s idle rewarm retaining only 21K static prefix -> expected_cold / idle_rewarm!
+            {"step_index": 104, "timestamp": now - 333, "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 21000, "output_tokens": 200, "after_checkpoint": False, "after_revert": False},
+            # Step 5: Compaction dropping below 32K (28K total, cr=0) -> expected_cold / compact_reset
+            {"step_index": 105, "timestamp": now - 310, "model": "gemini-4-neon-xhigh", "input_tokens": 28000, "cache_read_tokens": 0, "output_tokens": 200, "after_checkpoint": True, "after_revert": False},
+            # Step 6: Next step after sub-32K compaction drops cache (cr=0) -> MUST be abnormal_miss (NOT whitewashed by first_cacheable!)
+            {"step_index": 106, "timestamp": now - 290, "model": "gemini-4-neon-xhigh", "input_tokens": 35000, "cache_read_tokens": 0, "output_tokens": 200, "after_checkpoint": False, "after_revert": False},
+        ]
+        recs = classify_steps(raw_steps, idle_rewarm_sec=180)
+        self.assertEqual((recs[1].classification, recs[1].reason, recs[1].is_compact), ("expected_cold", "compact_reset", True))
+        self.assertEqual((recs[2].classification, recs[2].reason), ("hit", "cached_diluted"))
+        self.assertEqual((recs[3].classification, recs[3].reason), ("abnormal_miss", "partial_miss"))
+        self.assertEqual((recs[4].classification, recs[4].reason), ("expected_cold", "idle_rewarm"))
+        self.assertEqual((recs[5].classification, recs[5].reason, recs[5].is_compact), ("expected_cold", "compact_reset", True))
+        self.assertEqual((recs[6].classification, recs[6].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2. Shared visual tier contract (zero green-bar + orange/red-text contradiction!)
+        self.assertEqual(resolve_cache_visual_tier("abnormal_miss", "partial_miss"), "red")
+        self.assertEqual(resolve_cache_visual_tier("expected_cold", "compact_reset", is_compact=True), "purple")
+        self.assertEqual(resolve_cache_visual_tier("hit", "cached", is_compact=True), "purple")
+        self.assertEqual(resolve_cache_visual_tier("hit", "cached", is_revert=True), "orange")
+        self.assertEqual(resolve_cache_visual_tier("hit", "cached_diluted"), "green")
+
+        # 3. Transcript reader guards: (a) 5f461e #4745 USER_INPUT -> CHECKPOINT -> PR with regressed step_index MUST be compact (not revert);
+        #    (b) a46f77 #928 ERROR_MESSAGE -> resent USER_INPUT -> same-step PR MUST NOT be revert!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "v725hist-1111-2222"
+            bdir = root / "brain" / cid / ".system_generated" / "logs"
+            bdir.mkdir(parents=True)
+
+            def iso(off: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now + off))
+
+            rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 927, "created_at": iso(-500), "content": "ask"},
+                {"type": "PLANNER_RESPONSE", "step_index": 928, "created_at": iso(-495), "model": "gemini-4-neon-xhigh", "input_tokens": 2473, "cache_read_tokens": 245283, "output_tokens": 100},
+                # Stream error followed by resent USER_INPUT(927) & retried PR(928) -> NOT revert!
+                {"type": "ERROR_MESSAGE", "step_index": 929, "created_at": iso(-490), "content": "stream interrupted"},
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 927, "created_at": iso(-485), "content": "ask"},
+                {"type": "PLANNER_RESPONSE", "step_index": 928, "created_at": iso(-480), "model": "gemini-4-neon-xhigh", "input_tokens": 2472, "cache_read_tokens": 245283, "output_tokens": 200},
+                # Compaction whose rebuilt step_index regresses (USER_INPUT 925 -> CHECKPOINT 926 -> PR 927, 247K -> 36K) -> MUST be compact, NOT revert!
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 925, "created_at": iso(-400), "content": "continue"},
+                {"type": "CHECKPOINT", "step_index": 926, "created_at": iso(-395)},
+                {"type": "PLANNER_RESPONSE", "step_index": 927, "created_at": iso(-390), "model": "gemini-4-neon-xhigh", "input_tokens": 15000, "cache_read_tokens": 21000, "output_tokens": 200},
+                # Followed by normal dilution then partial_miss (<180s gap) so freshness invalid text says "部分掉缓存" (not "cr=0")
+                {"type": "PLANNER_RESPONSE", "step_index": 928, "created_at": iso(-80), "model": "gemini-4-neon-xhigh", "input_tokens": 84000, "cache_read_tokens": 36000, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 929, "created_at": iso(-20), "model": "gemini-4-neon-xhigh", "input_tokens": 118000, "cache_read_tokens": 21000, "output_tokens": 200},
+            ]
+            (bdir / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            det = eng.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(det)
+            assert det is not None
+            self.assertEqual(det.revert_count, 0)
+            self.assertEqual(det.compact_count, 1)
+            self.assertFalse(det.points[1].is_revert)
+            self.assertTrue(det.points[2].is_compact)
+            self.assertFalse(det.points[2].is_revert)
+            self.assertEqual(det.points[2].reason, "compact_reset")
+            self.assertEqual(det.points[3].reason, "cached_diluted")
+            self.assertEqual((det.points[4].classification, det.points[4].reason), ("abnormal_miss", "partial_miss"))
+            self.assertIsNotNone(det.cacheable_token_hit_ratio)
+            rep_txt = format_detail_text_report(det)
+            self.assertIn("Token", rep_txt)
+
+            snap = eng.poll(now_ts=now)
+            self.assertIn("部分", snap.min_freshness_invalid_reason)
+            self.assertNotIn("cr=0", snap.min_freshness_invalid_reason)
+
+    def test_v725_perf_incremental_transcript_cockpit_sqlite_slots_and_ui_lazy(self) -> None:
+        """v7.2.5: incremental transcript byte_offset + half-line guard + _RawStepSlot Mapping + single-slot _classified_cache + Cockpit 4-in-1 + SQLite incremental + lazy UI."""
+        from collections.abc import Mapping
+        from core.config_store import ConfigStore
+        from core.log_monitor import AccountQuotaInfo, AntigravityMonitorEngine
+        from core.sqlite_reader import ConversationDbReader
+        from ui.capsule_app import AntigravityCapsuleApp
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cid = "v725perf-3333-4444"
+            bdir = root / "brain" / cid / ".system_generated" / "logs"
+            bdir.mkdir(parents=True)
+            tp = bdir / "transcript.jsonl"
+
+            def iso(off: float) -> str:
+                return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now + off))
+
+            r1 = {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-100), "content": "hi"}
+            r2 = {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(-90), "model": "gemini-4-neon-xhigh", "input_tokens": 40000, "cache_read_tokens": 0, "output_tokens": 100}
+            tp.write_text(json.dumps(r1) + "\n" + json.dumps(r2) + "\n", encoding="utf-8")
+
+            # Cockpit SQLite with same-timestamp duplicate rows + 5h fallback + stale row check
+            cockpit_dir = root / "cockpit"
+            cockpit_dir.mkdir()
+            acc_db = cockpit_dir / "antigravity_accounts.sqlite"
+            ac = sqlite3.connect(acc_db)
+            ac.execute("CREATE TABLE summaries (account_id TEXT, email TEXT)")
+            ac.execute("INSERT INTO summaries VALUES ('acc-1', 'perf725@example.com')")
+            ac.commit()
+            ac.close()
+
+            q_db = cockpit_dir / "platform-quota-history-v1.sqlite"
+            qc = sqlite3.connect(q_db)
+            qc.execute("CREATE TABLE quota_observations (account_id TEXT, metric TEXT, remaining REAL, observed_at REAL, reset_at TEXT)")
+            # Two rows at exact same observed_at for gemini-weekly (first rowid=1 has 88.5, second has 12.0 -> MUST pick first rowid!)
+            qc.execute("INSERT INTO quota_observations VALUES ('acc-1', 'gemini-weekly', 88.5, ?, '2026-11-28T00:00:00Z')", (now - 60,))
+            qc.execute("INSERT INTO quota_observations VALUES ('acc-1', 'gemini-weekly', 12.0, ?, '2026-11-28T00:00:00Z')", (now - 60,))
+            qc.execute("INSERT INTO quota_observations VALUES ('acc-1', 'gemini-5h', 77.0, ?, '2026-11-23T09:00:00Z')", (now - 30,))
+            qc.execute("INSERT INTO quota_observations VALUES ('acc-1', '3p-weekly', NULL, ?, NULL)", (now - 10,))
+            qc.execute("INSERT INTO quota_observations VALUES ('acc-1', '3p-weekly', 55.0, ?, NULL)", (now - 500,))
+            qc.commit()
+            qc.close()
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": q_db,
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+
+            # 1. Transcript initial read -> _RawStepSlot implements Mapping contract
+            raw1, has_u, _ = eng._read_transcript_cached(cid, tp)
+            self.assertTrue(has_u)
+            self.assertEqual(len(raw1), 1)
+            self.assertIsInstance(raw1[0], Mapping)
+            self.assertEqual(raw1[0]["input_tokens"], 40000)
+            self.assertEqual(dict(raw1[0])["step_index"], 2)
+
+            # 2. Half-written line without trailing newline MUST NOT lose the step once completed!
+            r3 = {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": iso(-50), "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 40000, "output_tokens": 120}
+            r3_txt = json.dumps(r3)
+            with tp.open("ab") as fh:
+                fh.write(r3_txt[:30].encode("utf-8"))
+            os.utime(tp, (now + 1, now + 1))
+            raw_half, _, _ = eng._read_transcript_cached(cid, tp)
+            self.assertEqual(len(raw_half), 1)
+
+            with tp.open("ab") as fh:
+                fh.write((r3_txt[30:] + "\n").encode("utf-8"))
+            os.utime(tp, (now + 2, now + 2))
+            raw2, _, _ = eng._read_transcript_cached(cid, tp)
+            self.assertEqual(len(raw2), 2)
+            self.assertEqual(raw2[1]["cache_read_tokens"], 40000)
+
+            # 2b. Same-size in-place rewrite MUST invalidate incremental cache (never return stale steps!)
+            r2_rewritten = dict(r2, input_tokens=99999)
+            rewritten_txt = json.dumps(r1) + "\n" + json.dumps(r2_rewritten) + "\n" + json.dumps(r3) + "\n"
+            # Pad r1 content if needed to make exact same byte size as tp
+            cur_sz = tp.stat().st_size
+            cur_b = rewritten_txt.encode("utf-8")
+            if len(cur_b) < cur_sz:
+                r1_pad = dict(r1, content="h" * (len(r1["content"]) + (cur_sz - len(cur_b))))
+                rewritten_txt = json.dumps(r1_pad) + "\n" + json.dumps(r2_rewritten) + "\n" + json.dumps(r3) + "\n"
+            tp.write_bytes(rewritten_txt.encode("utf-8"))
+            os.utime(tp, (now + 3, now + 3))
+            raw_rw, _, _ = eng._read_transcript_cached(cid, tp)
+            self.assertEqual(raw_rw[0]["input_tokens"], 99999)
+
+            # 3. Single-slot _classified_cache never accumulates duplicate stale stamps for the same conv_id
+            eng._classify_steps_cached(cid, raw1, [])
+            eng._classify_steps_cached(cid, raw2, [])
+            self.assertEqual(len(eng._classified_cache), 1)
+
+            # 4. Cockpit fallback SQL respects latest observed_at, does NOT fall back past NULL latest row, preserves 5h fallback, and caches cleanly
+            acct = AccountQuotaInfo(online=True)
+            eng._enrich_weekly_from_cockpit(acct, "perf725@example.com", now)
+            self.assertIn("gemini", acct.pools)
+            self.assertAlmostEqual(acct.pools["gemini"].weekly_pct or 0.0, 88.5, places=1)
+            self.assertAlmostEqual(acct.pools["gemini"].five_hour_pct or 0.0, 77.0, places=1)
+            self.assertTrue("3p" not in acct.pools or acct.pools["3p"].weekly_pct is None)
+            # Re-evaluating cached rows 8 days in the future MUST drop stale >7d rows dynamically
+            acct_stale = AccountQuotaInfo(online=True)
+            eng._enrich_weekly_from_cockpit(acct_stale, "perf725@example.com", now + 8 * 86400)
+            self.assertTrue("gemini" not in acct_stale.pools or acct_stale.pools["gemini"].weekly_pct is None)
+
+            # 5. Real SQLite read_full_history incremental append + cache hit + tail overwrite full-reload
+            convs_dir = root / "conversations"
+            convs_dir.mkdir(exist_ok=True)
+            dbp = convs_dir / f"{cid}.db"
+            sc = sqlite3.connect(dbp)
+            sc.execute("CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+            sc.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)")
+            sc.execute("CREATE TABLE trajectory_metadata_blob (data BLOB)")
+            sc.execute("INSERT INTO gen_metadata VALUES (1, ?)", (_build_fake_gen_blob(40000, 0, 200, ttft_s=5, strm_s=2),))
+            sc.execute("INSERT INTO gen_metadata VALUES (2, ?)", (_build_fake_gen_blob(3000, 40000, 250, ttft_s=6, strm_s=2),))
+            sc.execute("INSERT INTO gen_metadata VALUES (3, ?)", (_build_fake_gen_blob(2000, 43000, 300, ttft_s=7, strm_s=2),))
+            sc.commit()
+            sc.close()
+            rdr = ConversationDbReader(convs_dir)
+            self.assertGreaterEqual(rdr.max_cache_entries, 36)
+            h1 = rdr.read_full_history(cid)
+            self.assertEqual(len(h1), 3)
+            self.assertEqual(h1[2].output_tokens, 300)
+            # Cache hit with unchanged stamp
+            h1_cached = rdr.read_full_history(cid)
+            self.assertEqual(len(h1_cached), 3)
+            # Append row 4 -> incremental append path
+            sc = sqlite3.connect(dbp)
+            sc.execute("INSERT INTO gen_metadata VALUES (4, ?)", (_build_fake_gen_blob(1500, 45000, 360, ttft_s=8, strm_s=2),))
+            sc.commit()
+            sc.close()
+            os.utime(dbp, (now + 10, now + 10))
+            h2 = rdr.read_full_history(cid)
+            self.assertEqual(len(h2), 4)
+            self.assertEqual(h2[3].output_tokens, 360)
+            # Overwrite existing tail row 4 in place -> tail_sig mismatch forces full reload
+            sc = sqlite3.connect(dbp)
+            sc.execute("UPDATE gen_metadata SET data = ? WHERE idx = 4", (_build_fake_gen_blob(1500, 45000, 777, ttft_s=9, strm_s=2),))
+            sc.commit()
+            sc.close()
+            os.utime(dbp, (now + 20, now + 20))
+            h3 = rdr.read_full_history(cid)
+            self.assertEqual(len(h3), 4)
+            self.assertEqual(h3[3].output_tokens, 777)
+
+            # 6. Lazy expanded panel + collapsed update banner replay/cancel + icon_builder cache + slot_manager dir cache
+            from core.slot_manager import SlotInventoryScanner
+            from ui.icon_builder import _BASE_CANVAS_CACHE, build_tray_icon
+            from PIL import Image
+
+            sm = SlotInventoryScanner(
+                conversations_dir=convs_dir,
+                brain_dir=root / "brain",
+                summaries_db_path=root / "summaries.db",
+            )
+            old_dir = root / "brain" / "old-slot-1"
+            old_dir.mkdir(parents=True)
+            (old_dir / "payload.bin").write_bytes(b"x" * 1024)
+            os.utime(old_dir, (now - 7200, now - 7200))
+            os.utime(old_dir / "payload.bin", (now - 7200, now - 7200))
+            db_old = convs_dir / "old-slot-1.db"
+            db_old.write_bytes(b"y" * 512)
+            os.utime(db_old, (now - 7200, now - 7200))
+            sm.scan(now_ts=now, include_items=True)
+            self.assertIn("old-slot-1", sm._dir_size_cache)
+            prev_ep = sm._dir_size_epoch
+            sm.invalidate_cache()
+            self.assertEqual(len(sm._dir_size_cache), 0)
+            self.assertEqual(sm._dir_size_epoch, prev_ep + 1)
+
+            base_png = root / "icon_test.png"
+            Image.new("RGBA", (32, 32), (80, 160, 240, 255)).save(base_png)
+            ic1 = build_tray_icon(base_png, level="green", size=32)
+            ic2 = build_tray_icon(base_png, level="orange", size=32)
+            self.assertEqual(ic1.size, (32, 32))
+            self.assertEqual(ic2.size, (32, 32))
+            self.assertTrue(any(k[0] == str(base_png) for k in _BASE_CANVAS_CACHE.keys()))
+
+            project_root = Path(__file__).resolve().parent.parent
+            cfg_store = ConfigStore(root / "config.json")
+            app = AntigravityCapsuleApp(
+                app_root=project_root,
+                config_store=cfg_store,
+                engine=eng,
+                enable_tray=False,
+                start_minimized_override=True,
+            )
+            try:
+                self.assertFalse(getattr(app, "_expanded_built", True))
+                app.set_theme("midnight_blue")
+                # Show update banner while collapsed -> deferred until expand
+                app._show_update_banner("有新版本可用", is_error=False, badge_ver="7.2.6")
+                self.assertIsNotNone(getattr(app, "_pending_update_banner", None))
+                # Hide before expand -> clears deferred state so expand won't stale-show
+                app._hide_update_banner()
+                self.assertIsNone(getattr(app, "_pending_update_banner", None))
+                # Show again then expand -> replays cleanly onto detached expanded Toplevel while root stays ultra-light!
+                app._show_update_banner("新版已就绪", is_error=False, badge_ver="7.2.6")
+                app.set_expanded(True)
+                self.assertTrue(getattr(app, "_expanded_built", False))
+                self.assertTrue(app._update_banner_visible)
+                self.assertIsNotNone(getattr(app, "_details_win", None))
+                # Verify physical HWND isolation: expanding & collapsing NEVER adds the ~200 detail widgets into self.root!
+                app.set_expanded(False)
+                root_descendants = []
+                stack_w = list(app.root.winfo_children())
+                while stack_w:
+                    w_item = stack_w.pop()
+                    if w_item is getattr(app, "_details_win", None):
+                        continue
+                    root_descendants.append(w_item)
+                    stack_w.extend(w_item.winfo_children())
+                self.assertLessEqual(len(root_descendants), 32)
+            finally:
+                app.shutdown()
+
+    def test_v725_live_weekly_rpc_without_rowid_and_revert_edge_guards(self) -> None:
+        """v7.2.5: native Hub RetrieveUserQuotaSummary live weekly + WITHOUT ROWID Cockpit fallback + CHECKPOINT/Undo/error-retry/switch guards."""
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        from core.log_monitor import AccountQuotaInfo, AntigravityMonitorEngine, classify_steps
+
+        now = time.time()
+        serve_summary = {"enabled": True}
+
+        class _QuotaRpcHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length > 0:
+                    self.rfile.read(length)
+                if self.path.endswith("/GetUserStatus"):
+                    body = json.dumps(
+                        {
+                            "userStatus": {
+                                "email": "livewk@example.com",
+                                "userTier": {"id": "g1-ultra-tier"},
+                                "planStatus": {"planInfo": {"planName": "Pro"}},
+                                "cascadeModelConfigData": {
+                                    "clientModelConfigs": [
+                                        {
+                                            "label": "Gemini 4 Neon (XHigh)",
+                                            "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M532"},
+                                            "quotaInfo": {"remainingFraction": 0.602, "resetTime": "2026-11-22T23:33:47Z"},
+                                        }
+                                    ]
+                                },
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.endswith("/RetrieveUserQuotaSummary") and serve_summary["enabled"]:
+                    body = json.dumps(
+                        {
+                            "response": {
+                                "groups": [
+                                    {
+                                        "displayName": "Gemini Models",
+                                        "buckets": [
+                                            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.8594, "resetTime": "2026-11-28T08:55:47Z"},
+                                            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.6007, "resetTime": "2026-11-22T23:33:47Z"},
+                                        ],
+                                    },
+                                    {
+                                        "displayName": "Claude and GPT models",
+                                        "buckets": [
+                                            {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0, "resetTime": "2026-11-29T22:01:14Z"},
+                                            {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0, "resetTime": "2026-11-23T03:01:14Z"},
+                                        ],
+                                    },
+                                ]
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        srv = HTTPServer(("127.0.0.1", 0), _QuotaRpcHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                daemon_dir = root / "daemon"
+                daemon_dir.mkdir()
+                (daemon_dir / f"hub_{port}.json").write_text(
+                    json.dumps({"pid": os.getpid(), "httpPort": port, "csrfToken": "tok-live-wk"}),
+                    encoding="utf-8",
+                )
+                # Real Cockpit WITHOUT ROWID DDL (stale 89.0% in DB vs live 85.94% from Hub RPC!)
+                cdir = root / "cockpit"
+                cdir.mkdir()
+                ac = sqlite3.connect(cdir / "antigravity_accounts.sqlite")
+                ac.execute("CREATE TABLE summaries (account_id TEXT, email TEXT)")
+                ac.execute("INSERT INTO summaries VALUES ('acc-wk', 'livewk@example.com')")
+                ac.commit()
+                ac.close()
+                qdb = cdir / "platform-quota-history-v1.sqlite"
+                qc = sqlite3.connect(qdb)
+                qc.execute(
+                    "CREATE TABLE quota_observations ("
+                    "platform TEXT NOT NULL, account_id TEXT NOT NULL, account_created_at INTEGER NOT NULL, "
+                    "metric TEXT NOT NULL, observed_at INTEGER NOT NULL, remaining REAL, reset_at TEXT, "
+                    "PRIMARY KEY(platform, account_id, account_created_at, metric, observed_at)) WITHOUT ROWID"
+                )
+                qc.execute(
+                    "INSERT INTO quota_observations VALUES ('antigravity', 'acc-wk', 1700000000, 'gemini-weekly', ?, 89.0, '2026-11-28T08:55:47Z')",
+                    (int((now - 1800) * 1000),),
+                )
+                qc.execute(
+                    "INSERT INTO quota_observations VALUES ('antigravity', 'acc-wk', 1700000000, '3p-weekly', ?, 99.0, '2026-11-29T22:01:14Z')",
+                    (int((now - 1800) * 1000),),
+                )
+                qc.commit()
+                qc.close()
+
+                eng = AntigravityMonitorEngine(
+                    paths={
+                        "brain_dir": root / "brain",
+                        "conversations_dir": root / "conversations",
+                        "daemon_dir": daemon_dir,
+                        "ls_log_path": root / "ls.log",
+                        "cockpit_quota_db": qdb,
+                        "ledger_path": root / "ledger.json",
+                    },
+                    read_only=True,
+                )
+
+                # 1. Live Hub RetrieveUserQuotaSummary takes priority over stale Cockpit 89% -> returns 85.94%!
+                info_live = eng._poll_account_and_quota(now, active_family="gemini")
+                self.assertTrue(info_live.online)
+                self.assertAlmostEqual(info_live.weekly_pct or 0.0, 85.94, places=2)
+                self.assertAlmostEqual(info_live.five_hour_pct or 0.0, 60.2, places=1)
+                self.assertAlmostEqual(info_live.pools["3p"].weekly_pct or 0.0, 100.0, places=1)
+
+                # 2. When older client lacks RetrieveUserQuotaSummary (404), gracefully falls back to WITHOUT ROWID Cockpit (89.0%)!
+                serve_summary["enabled"] = False
+                eng._last_weekly_poll_ts = 0.0
+                info_fb = eng._poll_account_and_quota(now + 40.0, active_family="gemini")
+                self.assertTrue(info_fb.online)
+                self.assertAlmostEqual(info_fb.weekly_pct or 0.0, 89.0, places=1)
+                self.assertAlmostEqual(info_fb.pools["3p"].weekly_pct or 0.0, 99.0, places=1)
+
+                # 3. CHECKPOINT(si=500) -> Undo USER_INPUT(si=500) -> PR(si=501) MUST be revert_reset (NOT compact_reset!)
+                def iso(off: float) -> str:
+                    return time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(now + off))
+
+                cid_u = "v725undo-5555-6666"
+                tp_u = root / "brain" / cid_u / ".system_generated" / "logs" / "transcript.jsonl"
+                tp_u.parent.mkdir(parents=True)
+                lines_u = [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 498, "created_at": iso(-200)},
+                    {"type": "PLANNER_RESPONSE", "step_index": 499, "created_at": iso(-190), "model": "gemini-4-neon-xhigh", "input_tokens": 200000, "cache_read_tokens": 0, "output_tokens": 100},
+                    {"type": "CHECKPOINT", "step_index": 500, "created_at": iso(-150)},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 500, "created_at": iso(-140)},
+                    {"type": "PLANNER_RESPONSE", "step_index": 501, "created_at": iso(-130), "model": "gemini-4-neon-xhigh", "input_tokens": 80000, "cache_read_tokens": 0, "output_tokens": 100},
+                ]
+                tp_u.write_text("\n".join(json.dumps(x) for x in lines_u) + "\n", encoding="utf-8")
+                raw_u, _, _ = eng._read_transcript_cached(cid_u, tp_u)
+                st_u = classify_steps(raw_u)
+                self.assertEqual(st_u[-1].reason, "revert_reset")
+                self.assertTrue(st_u[-1].is_revert)
+                self.assertFalse(st_u[-1].is_compact)
+
+                # 4. ERROR_MESSAGE -> retry PR(cr=0) NOT whitewashed as revert_reset; 40s later true Undo clears old media!
+                cid_e = "v725err-7777-8888"
+                tp_e = root / "brain" / cid_e / ".system_generated" / "logs" / "transcript.jsonl"
+                tp_e.parent.mkdir(parents=True)
+                fake_img = root / "img.png"
+                fake_img.write_bytes(b"PNG" * 100)
+                lines_e = [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 1, "created_at": iso(-120)},
+                    {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(-115), "model": "gemini-4-neon-xhigh", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 100},
+                    {"type": "ERROR_MESSAGE", "step_index": 2, "created_at": iso(-110), "content": "stream err"},
+                    {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": iso(-105), "model": "gemini-4-neon-xhigh", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 100},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 4, "created_at": iso(-90), "media": [{"uri": str(fake_img)}]},
+                    {"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": iso(-85), "model": "gemini-4-neon-xhigh", "input_tokens": 5000, "cache_read_tokens": 60000, "output_tokens": 100},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 4, "created_at": iso(-45)},
+                    {"type": "PLANNER_RESPONSE", "step_index": 5, "created_at": iso(-40), "model": "gemini-4-neon-xhigh", "input_tokens": 58000, "cache_read_tokens": 0, "output_tokens": 100},
+                ]
+                tp_e.write_text("\n".join(json.dumps(x) for x in lines_e) + "\n", encoding="utf-8")
+                raw_e, _, _ = eng._read_transcript_cached(cid_e, tp_e)
+                st_e = classify_steps(raw_e)
+                self.assertEqual(st_e[1].reason, "abnormal_zero")
+                self.assertFalse(st_e[1].is_revert)
+                self.assertEqual(st_e[-1].reason, "revert_reset")
+                self.assertTrue(st_e[-1].is_revert)
+                self.assertEqual(raw_e[-1].active_media_count, 0)
+
+                # 5. crossed_switch + compact_reset co-occurrence -> account_switch priority + is_compact=True
+                st_sw = classify_steps(
+                    [
+                        {"step_index": 1, "timestamp": now - 100, "model": "gemini-4-neon-xhigh", "input_tokens": 200000, "cache_read_tokens": 0, "output_tokens": 100},
+                        {"step_index": 2, "timestamp": now - 50, "model": "gemini-4-neon-xhigh", "input_tokens": 60000, "cache_read_tokens": 0, "output_tokens": 100, "after_checkpoint": True},
+                    ],
+                    account_switches=[now - 70],
+                )
+                self.assertEqual(st_sw[1].reason, "account_switch")
+                self.assertTrue(st_sw[1].is_compact)
+                self.assertTrue(st_sw[1].is_account_switch)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_v725_native_win32_sc_move_drag_state_machine_and_fallback(self) -> None:
+        """v7.2.5+: Win32 kernel-native ReleaseCapture + PostMessageW(WM_SYSCOMMAND, SC_MOVE|HTCAPTION) drag handoff, FocusOut guard, release commit & fallback."""
+        import tkinter as tk
+        from types import SimpleNamespace
+        from unittest import mock
+        from ui.window_drag import SC_MOVE_HTCAPTION, SmoothWindowDragger, WM_SYSCOMMAND
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            posted = []
+            released = []
+            ended = []
+            geom_calls = []
+            orig_geom = root.geometry
+
+            def _rec_geom(*a, **kw):
+                if a:
+                    geom_calls.append(a[0])
+                return orig_geom(*a, **kw)
+
+            root.geometry = _rec_geom  # type: ignore[method-assign]
+
+            class _FakeU32:
+                def IsWindow(self, _hw):
+                    return True
+
+                def SetWindowPos(self, *_a):
+                    return True
+
+                def ReleaseCapture(self):
+                    released.append(True)
+                    return True
+
+                def PostMessageW(self, hw, msg, wp, lp):
+                    posted.append((int(hw.value), int(msg.value), int(wp.value), int(lp.value)))
+                    return True
+
+            fake_u32 = _FakeU32()
+            dragger = SmoothWindowDragger(root, move_threshold=4, on_drag_end=lambda moved: ended.append(moved))
+
+            # 1. Cross 4px threshold -> snaps once & hands off via ReleaseCapture + PostMessageW(WM_SYSCOMMAND, 0xF012)
+            with mock.patch("ui.window_drag._get_user32", return_value=fake_u32), \
+                 mock.patch("ui.window_drag._is_primary_button_pressed", return_value=True), \
+                 mock.patch.object(dragger, "_resolve_mapped_root_hwnd", return_value=9999), \
+                 mock.patch.object(dragger, "_read_win32_cursor", side_effect=[(500, 100), (506, 102), (506, 102), (506, 102)]), \
+                 mock.patch.object(dragger, "_read_win32_window_origin", return_value=(400, 80)):
+                dragger.on_start(SimpleNamespace(x_root=500, y_root=100))
+                self.assertTrue(dragger.use_win32_cursor)
+                dragger.on_move(SimpleNamespace(x_root=506, y_root=102))
+                self.assertTrue(dragger.native_drag_active)
+                self.assertEqual(len(released), 1)
+                self.assertEqual(len(posted), 1)
+                self.assertEqual(posted[0][1], WM_SYSCOMMAND)
+                self.assertEqual(posted[0][2], SC_MOVE_HTCAPTION)
+
+            # 2. Transient FocusOut during active OS move loop MUST NOT abort drag
+            with mock.patch("ui.window_drag._get_user32", return_value=fake_u32), \
+                 mock.patch("ui.window_drag._is_hwnd_in_move_size_loop", return_value=True), \
+                 mock.patch("ui.window_drag._is_primary_button_pressed", return_value=True):
+                self.assertFalse(dragger.finish_or_cancel(commit=True))
+                self.assertTrue(dragger.active)
+                self.assertTrue(dragger.native_drag_active)
+
+            # 3. Once OS loop exits & button is released, monitor commits final HWND rect to Tk geometry & fires on_drag_end(True)
+            with mock.patch("ui.window_drag._get_user32", return_value=fake_u32), \
+                 mock.patch("ui.window_drag._is_hwnd_in_move_size_loop", return_value=False), \
+                 mock.patch("ui.window_drag._is_primary_button_pressed", return_value=False), \
+                 mock.patch.object(dragger, "_read_win32_window_origin", return_value=(720, 240)):
+                dragger._poll_native_drag_state()
+                self.assertFalse(dragger.active)
+                self.assertFalse(dragger.native_drag_active)
+                self.assertEqual(ended, [True])
+                self.assertIn("+720+240", geom_calls[-1])
+
+            # 4. If OS swallows WM_SYSCOMMAND (>160ms grace while button still held), seamlessly switches to SetWindowPos chase!
+            with mock.patch("ui.window_drag._get_user32", return_value=fake_u32), \
+                 mock.patch("ui.window_drag._is_primary_button_pressed", return_value=True), \
+                 mock.patch("ui.window_drag._is_hwnd_in_move_size_loop", return_value=False), \
+                 mock.patch.object(dragger, "_resolve_mapped_root_hwnd", return_value=9999), \
+                 mock.patch.object(dragger, "_read_win32_cursor", return_value=(510, 110)), \
+                 mock.patch.object(dragger, "_read_win32_window_origin", return_value=(400, 80)):
+                dragger.on_start(SimpleNamespace(x_root=510, y_root=110))
+                dragger._cursor_origin_x = 500
+                dragger.on_move(SimpleNamespace(x_root=510, y_root=110))
+                self.assertTrue(dragger.native_drag_active)
+                dragger._native_drag_started_perf = time.perf_counter() - 0.5
+                dragger._poll_native_drag_state()
+                self.assertFalse(dragger.native_drag_active)
+                self.assertTrue(dragger._fallback_chasing)
+                dragger.cancel()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
 
 
 if __name__ == "__main__":

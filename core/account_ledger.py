@@ -782,9 +782,14 @@ class AccountSwitchLedger:
             dedup.append((ts, lbl))
         return dedup
 
-    def get_switch_timestamps(self, since_ts: float) -> List[float]:
+    def get_switch_timestamps(
+        self,
+        since_ts: float,
+        *,
+        timeline: Optional[List[Tuple[float, str]]] = None,
+    ) -> List[float]:
         """Return timestamps where the active account actually changed from a different prior account."""
-        tl = self.get_timeline(since_ts)
+        tl = timeline if timeline is not None else self.get_timeline(since_ts)
         if len(tl) < 2:
             return []
         return [ts for ts, _ in tl[1:] if ts >= since_ts]
@@ -793,9 +798,11 @@ class AccountSwitchLedger:
         self,
         since_ts: float,
         current_label: str = "",
+        *,
+        timeline: Optional[List[Tuple[float, str]]] = None,
     ) -> List[str]:
         """Return known masked account labels ordered by most-recent appearance (current online first)."""
-        tl = self.get_timeline(since_ts)
+        tl = timeline if timeline is not None else self.get_timeline(since_ts)
         ordered: List[str] = []
         seen_low: set[str] = set()
         cur_clean = _mask_short(current_label) if current_label else ""

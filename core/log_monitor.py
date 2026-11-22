@@ -15,6 +15,7 @@ import bisect
 import ctypes
 from ctypes import wintypes
 import datetime
+import http.client
 import json
 import math
 import os
@@ -29,9 +30,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
+_DATACLASS_SLOTS: Dict[str, Any] = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 from core.account_ledger import AccountSwitchLedger, _mask_short
 from core.config_store import DEFAULT_CONFIG, sanitize_config
@@ -439,6 +443,7 @@ MODEL_SHORT_MAP = (
 
 CACHE_REASON_CN_MAP: Dict[str, str] = {
     "cached": "命中",
+    "cached_diluted": "命中·新输入稀释",
     "compact_reset": "压缩重热",
     "revert_reset": "回溯重热",
     "first_turn": "首轮冷启",
@@ -449,6 +454,7 @@ CACHE_REASON_CN_MAP: Dict[str, str] = {
     "first_cacheable": "入32K首建",
     "rule_change": "改规冷启",
     "abnormal_zero": "异常掉缓存",
+    "partial_miss": "部分失效",
 }
 
 COLD_SHORT_BADGE_MAP: Dict[str, str] = {
@@ -461,7 +467,34 @@ COLD_SHORT_BADGE_MAP: Dict[str, str] = {
     "first_turn": "首轮冷",
     "idle_rewarm": "闲置冷",
     "rule_change": "规则冷",
+    "partial_miss": "部分失",
 }
+
+
+def resolve_cache_visual_tier(
+    classification: str,
+    reason: str = "",
+    *,
+    is_compact: bool = False,
+    is_revert: bool = False,
+) -> str:
+    """Return canonical visual color tier: 'red' | 'purple' | 'orange' | 'green'."""
+    if classification == "abnormal_miss":
+        return "red"
+    if (is_compact or reason == "compact_reset") and not is_revert:
+        return "purple"
+    if is_revert or classification == "expected_cold":
+        return "orange"
+    return "green"
+
+
+def _format_freshness_invalid_reason(consec_miss: int, latest_reason: str = "") -> str:
+    """Format freshness invalidation banner, distinguishing partial_miss from pure cr=0."""
+    if consec_miss >= 2:
+        return f"无热缓存 (连掉 {consec_miss} 步)"
+    if latest_reason == "partial_miss":
+        return "本步部分掉缓存"
+    return "本步 cr=0 无热缓存"
 
 _NORM_MODEL_RE = re.compile(r"[^a-z0-9]+")
 
@@ -630,6 +663,37 @@ def parse_iso_timestamp(raw: str) -> Optional[float]:
     return dt.timestamp()
 
 
+APP_ROOT = Path(__file__).resolve().parent.parent
+_DIAG_LOG_MAX_BYTES = 64 * 1024
+
+
+def _build_localhost_opener() -> urllib.request.OpenerDirector:
+    """Build a minimal OpenerDirector pinned to direct localhost HTTP (zero proxy, no redirects/file/ftp)."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.ProxyHandler({}))
+    opener.add_handler(urllib.request.HTTPHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    return opener
+
+
+_LOCALHOST_OPENER: urllib.request.OpenerDirector = _build_localhost_opener()
+
+
+def _open_localhost_url(req: urllib.request.Request, timeout: float):
+    """Open an HTTP request strictly targeting localhost/127.0.0.1, bypassing all proxies & redirects."""
+    url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+    parsed = urllib.parse.urlsplit(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme != "http" or host not in ("127.0.0.1", "localhost") or parsed.username or parsed.password:
+        raise ValueError(f"Refused non-localhost HTTP request: scheme={scheme!r}, host={host!r}")
+    resp = _LOCALHOST_OPENER.open(req, timeout=timeout)
+    if resp is None:
+        raise urllib.error.URLError("Localhost opener returned no response")
+    return resp
+
+
 _KERNEL32_LIVENESS: Optional[ctypes.WinDLL] = None
 
 
@@ -643,6 +707,21 @@ def _get_kernel32() -> ctypes.WinDLL:
         k32.GetExitCodeProcess.restype = wintypes.BOOL
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         k32.CloseHandle.restype = wintypes.BOOL
+        k32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        k32.GetProcessTimes.restype = wintypes.BOOL
         _KERNEL32_LIVENESS = k32
     return _KERNEL32_LIVENESS
 
@@ -675,7 +754,185 @@ def _is_windows_pid_alive(pid: int) -> bool:
         return False
 
 
-@dataclass(frozen=True)
+def _inspect_windows_pid(pid: int) -> Tuple[bool, str, int]:
+    """Single-handle zero-subprocess Win32 inspection: returns (alive, exe_basename_lower, creation_ft)."""
+    if pid <= 0:
+        return False, "", 0
+    if os.name != "nt":
+        return _is_windows_pid_alive(pid), "", 0
+    try:
+        kernel32 = _get_kernel32()
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False, "", 0
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                return False, "", 0
+            ct = wintypes.FILETIME()
+            et = wintypes.FILETIME()
+            kt = wintypes.FILETIME()
+            ut = wintypes.FILETIME()
+            creation_ft = 0
+            if kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(ct),
+                ctypes.byref(et),
+                ctypes.byref(kt),
+                ctypes.byref(ut),
+            ):
+                creation_ft = (int(ct.dwHighDateTime) << 32) | int(ct.dwLowDateTime)
+            exe_name = ""
+            buf_len = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
+                exe_name = os.path.basename(buf.value).lower()
+            return True, exe_name, creation_ft
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False, "", 0
+
+
+def _get_windows_pid_creation_ft(pid: int) -> int:
+    """Return Win32 process creation FILETIME (64-bit int) or 0 if unavailable/non-Windows."""
+    if os.name != "nt" or pid <= 0:
+        return 0
+    alive, _exe, cft = _inspect_windows_pid(pid)
+    return cft if alive else 0
+
+
+def _is_hub_language_server_pid(
+    pid: int,
+    expected_active_pid: int = 0,
+    expected_creation_ft: int = 0,
+) -> bool:
+    """Verify an alive Hub PID is genuinely Antigravity's language_server (immune to Windows PID reuse).
+
+    Uses OpenProcess(0x1000) + QueryFullProcessImageNameW + GetProcessTimes on a single handle.
+    On non-Windows or when image name cannot be queried, conservatively allows only expected_active_pid
+    (with matching creation_ft when known).
+    """
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        if not _is_windows_pid_alive(pid):
+            return False
+        return bool(expected_active_pid > 0 and pid == expected_active_pid)
+    alive, exe_name, creation_ft = _inspect_windows_pid(pid)
+    if not alive:
+        return False
+    if exe_name and ("language_server" in exe_name or exe_name in ("antigravity.exe", "antigravity")):
+        return True
+    if expected_active_pid > 0 and pid == expected_active_pid:
+        if expected_creation_ft > 0:
+            return creation_ft > 0 and creation_ft == expected_creation_ft
+        return not exe_name
+    return False
+
+
+class _RawStepSlot(Mapping):
+    """Memory-compact slotted Mapping replacing 10-key raw step dicts (~112B vs ~272B)."""
+
+    __slots__ = (
+        "step_index",
+        "timestamp",
+        "model",
+        "input_tokens",
+        "cache_read_tokens",
+        "output_tokens",
+        "after_checkpoint",
+        "after_revert",
+        "active_media_count",
+        "active_media_bytes",
+        "is_error_retry",
+    )
+    _KEYS = (
+        "step_index",
+        "timestamp",
+        "model",
+        "input_tokens",
+        "cache_read_tokens",
+        "output_tokens",
+        "after_checkpoint",
+        "after_revert",
+        "active_media_count",
+        "active_media_bytes",
+    )
+    _KEY_SET = frozenset(_KEYS)
+
+    def __init__(
+        self,
+        step_index: Optional[int] = None,
+        timestamp: float = 0.0,
+        model: str = "",
+        input_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        output_tokens: int = 0,
+        after_checkpoint: bool = False,
+        after_revert: bool = False,
+        active_media_count: int = 0,
+        active_media_bytes: int = 0,
+        is_error_retry: bool = False,
+    ) -> None:
+        self.step_index = step_index
+        self.timestamp = timestamp
+        self.model = model
+        self.input_tokens = input_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.output_tokens = output_tokens
+        self.after_checkpoint = after_checkpoint
+        self.after_revert = after_revert
+        self.active_media_count = active_media_count
+        self.active_media_bytes = active_media_bytes
+        self.is_error_retry = bool(is_error_retry)
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._KEY_SET:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._KEY_SET:
+            return getattr(self, key)
+        return default
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._KEY_SET
+
+    def __iter__(self):
+        return iter(self._KEYS)
+
+    def __len__(self) -> int:
+        return len(self._KEYS)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _RawStepSlot):
+            return (
+                self.step_index == other.step_index
+                and self.timestamp == other.timestamp
+                and self.model == other.model
+                and self.input_tokens == other.input_tokens
+                and self.cache_read_tokens == other.cache_read_tokens
+                and self.output_tokens == other.output_tokens
+                and self.after_checkpoint == other.after_checkpoint
+                and self.after_revert == other.after_revert
+                and self.active_media_count == other.active_media_count
+                and self.active_media_bytes == other.active_media_bytes
+            )
+        if isinstance(other, Mapping):
+            if len(other) != len(self._KEYS):
+                return False
+            for k in self._KEYS:
+                if k not in other or other[k] != getattr(self, k):
+                    return False
+            return True
+        return NotImplemented
+
+
+@dataclass(frozen=True, **_DATACLASS_SLOTS)
 class StepRecord:
     step_index: int
     timestamp: float
@@ -686,7 +943,7 @@ class StepRecord:
     total_tokens: int
     hit_rate: float
     classification: str  # "hit" | "expected_cold" | "abnormal_miss"
-    reason: str          # "cached" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "revert_reset" | "small_ctx" | "first_cacheable" | "rule_change" | "abnormal_zero"
+    reason: str          # "cached" | "cached_diluted" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "revert_reset" | "small_ctx" | "first_cacheable" | "rule_change" | "abnormal_zero" | "partial_miss"
     context_delta: int = 0
     is_revert: bool = False
     is_compact: bool = False
@@ -745,7 +1002,7 @@ class ConversationSummary:
     _scoped_gens_all: List[Optional[Any]] = field(default_factory=list, repr=False, compare=False)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, **_DATACLASS_SLOTS)
 class ConversationDetailPoint:
     step_index: int
     timestamp: float
@@ -800,9 +1057,10 @@ class ConversationDetailReport:
     revert_count: int = 0
     scope_label: str = ""
     consec_miss: int = 0
+    cacheable_token_hit_ratio: Optional[float] = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, **_DATACLASS_SLOTS)
 class LogEvent:
     timestamp: float
     category: str   # "503" | "timeout" | "403" | "retry"
@@ -816,7 +1074,7 @@ class LogEvent:
     culprit_cid: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, **_DATACLASS_SLOTS)
 class ModelPerfStats:
     model: str
     step_count: int
@@ -963,6 +1221,9 @@ class MonitorSnapshot:
     peak_hour_steps_24h: int = 0
     peak_hour_label_24h: str = ""
     current_24h_has_degradation: bool = False
+    hub_pid_alive: bool = False
+    primary_hit_is_compact: bool = False
+    primary_hit_is_revert: bool = False
 
 
 HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
@@ -1031,7 +1292,8 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "ls_log_path": appdata / "Antigravity" / "logs" / "language_server.log",
         "cockpit_quota_db": home / ".antigravity_cockpit" / "platform-quota-history-v1.sqlite",
         "cockpit_logs_dir": home / ".antigravity_cockpit" / "logs",
-        "ledger_path": Path(__file__).resolve().parent.parent / "account_ledger.json",
+        "ledger_path": APP_ROOT / "account_ledger.json",
+        "diag_log_path": APP_ROOT / "logs" / "monitor_diag.log",
         "vscdb_path": appdata / "Antigravity" / "User" / "globalStorage" / "state.vscdb",
         "global_rules_path": home / ".gemini" / "GEMINI.md",
     }
@@ -1084,13 +1346,13 @@ def parse_pbtxt_title(raw: bytes) -> str:
 
 
 def classify_steps(
-    raw_steps: List[Dict[str, Any]],
+    raw_steps: List[Any],
     idle_rewarm_sec: int = 180,
     min_cacheable_tokens: int = 32000,
     account_switches: Optional[List[float]] = None,
     rule_change_timestamps: Optional[List[float]] = None,
 ) -> List[StepRecord]:
-    """Classify consecutive PLANNER_RESPONSE steps, filtering normal zero-cache causes."""
+    """Classify consecutive PLANNER_RESPONSE steps, filtering normal zero/partial-cache causes."""
     classified: List[StepRecord] = []
     prev_ts: Optional[float] = None
     prev_model: Optional[str] = None
@@ -1098,6 +1360,8 @@ def classify_steps(
     prev_step_idx: Optional[int] = None
     prev_cls: str = ""
     prev_reason: str = ""
+    has_prior_cache: bool = False
+    has_prior_compact: bool = False
     first_non_ooo_ts: Optional[float] = None
     consumed_rule_watermark: float = 0.0
     non_ooo_hit_ts: List[float] = []
@@ -1113,15 +1377,34 @@ def classify_steps(
     )
 
     for idx, item in enumerate(raw_steps):
-        inp = max(0, int(item.get("input_tokens", 0) or 0))
-        cr = max(0, int(item.get("cache_read_tokens", 0) or 0))
-        out = max(0, int(item.get("output_tokens", 0) or 0))
+        if isinstance(item, _RawStepSlot):
+            inp = max(0, int(item.input_tokens or 0))
+            cr = max(0, int(item.cache_read_tokens or 0))
+            out = max(0, int(item.output_tokens or 0))
+            ts = float(item.timestamp or 0.0)
+            model = str(item.model or "").strip()
+            raw_si = item.step_index
+            after_revert = bool(item.after_revert)
+            after_checkpoint = bool(item.after_checkpoint)
+            media_cnt = int(item.active_media_count or 0)
+            media_bytes = int(item.active_media_bytes or 0)
+            is_error_retry = bool(item.is_error_retry)
+        else:
+            inp = max(0, int(item.get("input_tokens", 0) or 0))
+            cr = max(0, int(item.get("cache_read_tokens", 0) or 0))
+            out = max(0, int(item.get("output_tokens", 0) or 0))
+            ts = float(item.get("timestamp", 0.0) or 0.0)
+            model = str(item.get("model", "") or "").strip()
+            raw_si = item.get("step_index")
+            after_revert = bool(item.get("after_revert", False))
+            after_checkpoint = bool(item.get("after_checkpoint", False))
+            media_cnt = int(item.get("active_media_count", 0) or 0)
+            media_bytes = int(item.get("active_media_bytes", 0) or 0)
+            is_error_retry = bool(item.get("is_error_retry", False))
+
         total = inp + cr
         if total <= 0:
             continue
-        ts = float(item.get("timestamp", 0.0) or 0.0)
-        model = str(item.get("model", "") or "").strip()
-        raw_si = item.get("step_index")
         step_idx = int(raw_si) if raw_si is not None else idx
         hit_rate = (cr / total) * 100.0
 
@@ -1141,43 +1424,49 @@ def classify_steps(
             if r_idx > 0:
                 latest_t_rule = rule_ts[r_idx - 1]
 
-        after_revert = bool(item.get("after_revert", False))
+        is_ckpt_shrink = (
+            (not after_revert)
+            and after_checkpoint
+            and prev_total is not None
+            and prev_total >= min_cacheable_tokens
+            and total < prev_total * 0.85
+        )
         if (
             not after_revert
+            and not is_ckpt_shrink
             and prev_step_idx is not None
             and raw_si is not None
             and step_idx <= prev_step_idx
             and (prev_ts is None or ts <= 0.0 or prev_ts <= 0.0 or ts >= prev_ts - 5.0)
         ):
-            after_revert = True
+            # Stream-error auto-retry on the exact same step_index (explicit ERROR_MESSAGE retry or tight <=2% cr>0 match)
+            is_same_step_retry = is_error_retry or (
+                step_idx == prev_step_idx
+                and cr > 0
+                and prev_total is not None
+                and prev_total > 0
+                and abs(total - prev_total) <= max(2048, int(prev_total * 0.02))
+            )
+            if not is_same_step_retry:
+                after_revert = True
 
-        after_checkpoint = bool(item.get("after_checkpoint", False))
         is_real_compact = (
             not after_revert
             and prev_total is not None
             and prev_total >= min_cacheable_tokens
             and ((after_checkpoint and total < prev_total * 0.85) or (total < prev_total * 0.75))
         )
-        if cr > 0:
-            cls, reason = "hit", "cached"
-        elif prev_ts is None:
-            cls, reason = "expected_cold", "first_turn"
-        elif crossed_switch:
-            cls, reason = "expected_cold", "account_switch"
-        elif after_revert:
-            cls, reason = "expected_cold", "revert_reset"
-        elif is_real_compact:
-            cls, reason = "expected_cold", "compact_reset"
-        elif ts > 0 and prev_ts > 0 and (ts - prev_ts) > idle_rewarm_sec:
-            cls, reason = "expected_cold", "idle_rewarm"
-        elif prev_model and model and model.lower() != prev_model.lower():
-            cls, reason = "expected_cold", "model_switch"
-        elif total < min_cacheable_tokens:
-            cls, reason = "expected_cold", "small_ctx"
-        elif prev_total is not None and prev_total < min_cacheable_tokens:
-            # First turn crossing the >=32K implicit cache threshold cannot have a prior warm prefix yet
-            cls, reason = "expected_cold", "first_cacheable"
-        elif (
+        is_expected_partial = (
+            cr > 0
+            and prev_total is not None
+            and prev_total >= min_cacheable_tokens
+            and cr < prev_total * 0.50
+            and hit_rate < 50.0
+        )
+        is_expected_cold_candidate = (cr == 0) or is_expected_partial
+        is_idle_rewarm = prev_ts is not None and ts > 0 and prev_ts > 0 and (ts - prev_ts) >= idle_rewarm_sec
+        is_model_switch = bool(prev_model and model and model.lower() != prev_model.lower())
+        is_rule_change_eligible = (
             not is_delayed_ooo
             and latest_t_rule is not None
             and latest_t_rule > consumed_rule_watermark
@@ -1186,13 +1475,56 @@ def classify_steps(
             and first_non_ooo_ts < latest_t_rule
             and prev_cls != "abnormal_miss"
             and prev_reason != "rule_change"
+            and prev_ts is not None
             and prev_ts <= latest_t_rule + 90.0
             and (len(non_ooo_hit_ts) - bisect.bisect_left(non_ooo_hit_ts, latest_t_rule)) <= 1
+        )
+
+        if prev_ts is None:
+            if cr > 0:
+                cls, reason = "hit", "cached"
+            else:
+                cls, reason = "expected_cold", "first_turn"
+        elif crossed_switch and is_expected_cold_candidate:
+            cls, reason = "expected_cold", "account_switch"
+        elif after_revert and is_expected_cold_candidate:
+            cls, reason = "expected_cold", "revert_reset"
+        elif is_real_compact:
+            if cr == 0 or hit_rate < 75.0:
+                cls, reason = "expected_cold", "compact_reset"
+            else:
+                cls, reason = "hit", "cached"
+        elif is_expected_cold_candidate and is_idle_rewarm:
+            cls, reason = "expected_cold", "idle_rewarm"
+        elif is_expected_cold_candidate and is_model_switch:
+            cls, reason = "expected_cold", "model_switch"
+        elif cr == 0 and total < min_cacheable_tokens:
+            cls, reason = "expected_cold", "small_ctx"
+        elif (
+            cr == 0
+            and prev_total is not None
+            and prev_total < min_cacheable_tokens
+            and (not has_prior_cache)
+            and (not has_prior_compact)
         ):
+            # First turn crossing >=32K implicit cache threshold (only before any prior cache or compaction)
+            cls, reason = "expected_cold", "first_cacheable"
+        elif is_expected_cold_candidate and is_rule_change_eligible:
             # Global GEMINI.md rule edit invalidates prompt prefix once per conversation; monotonic watermark blocks multi-step whitewashing
             cls, reason = "expected_cold", "rule_change"
-        else:
+        elif cr == 0:
             cls, reason = "abnormal_miss", "abnormal_zero"
+        elif (
+            prev_total is not None
+            and prev_total >= 50000
+            and cr < prev_total * 0.50
+            and hit_rate < 50.0
+        ):
+            cls, reason = "abnormal_miss", "partial_miss"
+        elif prev_total is not None and prev_total > 0 and cr >= prev_total * 0.85 and hit_rate < 70.0:
+            cls, reason = "hit", "cached_diluted"
+        else:
+            cls, reason = "hit", "cached"
 
         ctx_delta = (total - prev_total) if prev_total is not None else 0
         classified.append(
@@ -1211,8 +1543,8 @@ def classify_steps(
                 is_revert=after_revert,
                 is_compact=is_real_compact,
                 is_account_switch=crossed_switch,
-                active_media_count=int(item.get("active_media_count", 0) or 0),
-                active_media_bytes=int(item.get("active_media_bytes", 0) or 0),
+                active_media_count=media_cnt,
+                active_media_bytes=media_bytes,
             )
         )
         # Do not let an out-of-order delayed historical step clobber the forward cursor or rule watermark
@@ -1226,6 +1558,10 @@ def classify_steps(
                     consumed_rule_watermark = latest_t_rule
             if cls == "hit" and ts > 0.0:
                 bisect.insort(non_ooo_hit_ts, ts)
+            if cr > 0:
+                has_prior_cache = True
+            if is_real_compact or reason == "compact_reset":
+                has_prior_compact = True
             if first_non_ooo_ts is None and ts > 0.0:
                 first_non_ooo_ts = ts
             prev_ts = ts if (prev_ts is None or ts <= 0.0) else max(prev_ts, ts)
@@ -1238,6 +1574,32 @@ def classify_steps(
     return classified
 
 
+# Fast O(1) lowercase substring pre-filter covering every necessary literal of TOS_403_RE,
+# STREAM_TIMEOUT_RE, HTTP_503_RE, RETRY_RE, proxy-EOF capture, and non-inference error guards.
+_LOG_FAST_KEYWORDS: Tuple[str, ...] = (
+    "503",
+    "429",
+    "403",
+    "timed out",
+    "timeout",
+    "attempt ",
+    "eof",
+    "broken pipe",
+    "forcibly closed",
+    "connection reset",
+    "unavailable",
+    "no capacity",
+    "resource_exhausted",
+    "permission_denied",
+    "tos_violation",
+    "suspended",
+    "disabled",
+    "banned",
+    "error",
+    "failed",
+)
+
+
 class LanguageServerLogTailer:
     """Incremental seek(offset) tailer with rotation, partial-line, and sliding-window guards."""
 
@@ -1248,6 +1610,9 @@ class LanguageServerLogTailer:
         self._events: Deque[LogEvent] = deque(maxlen=self.max_events)
         self._initialized: bool = False
         self._last_seen_ts: Optional[float] = None
+        self._last_seen_ts_token: Optional[Tuple[Any, ...]] = None
+        self._cached_fallback_ts: float = -1.0
+        self._cached_fallback_dt: Optional[datetime.datetime] = None
         # Bounded O(1) dedup & non-inference goroutine tracking (prevents errorreport.go double counting)
         self._ignored_goroutines: OrderedDict[str, float] = OrderedDict()
         self._ignored_non_inference_403_gids: OrderedDict[str, float] = OrderedDict()
@@ -1409,6 +1774,7 @@ class LanguageServerLogTailer:
             self._offset = 0
             self._events.clear()
             self._last_seen_ts = None
+            self._last_seen_ts_token = None
             self._ignored_goroutines.clear()
             self._ignored_non_inference_403_gids.clear()
             self._recent_error_sigs.clear()
@@ -1460,6 +1826,72 @@ class LanguageServerLogTailer:
             if event is not None:
                 self._events.append(event)
 
+    def _materialize_ts_token(self, token: Tuple[Any, ...], fallback_ts: float) -> Optional[float]:
+        kind = token[0]
+        if kind == "glog":
+            _k, mm, dd, h, mi, s, usec = token
+            if self._cached_fallback_dt is None or self._cached_fallback_ts != fallback_ts:
+                self._cached_fallback_dt = datetime.datetime.fromtimestamp(fallback_ts)
+                self._cached_fallback_ts = fallback_ts
+            now_dt = self._cached_fallback_dt
+            try:
+                cand = now_dt.replace(month=mm, day=dd, hour=h, minute=mi, second=s, microsecond=usec)
+                ts_val = cand.timestamp()
+                if ts_val > fallback_ts + 86400:
+                    ts_val = cand.replace(year=now_dt.year - 1).timestamp()
+                return ts_val
+            except ValueError:
+                return None
+        if kind == "iso":
+            return parse_iso_timestamp(token[1])
+        return None
+
+    def _resolve_effective_ts(self, fallback_ts: float, is_cold_start: bool) -> float:
+        if self._last_seen_ts is None and self._last_seen_ts_token is not None:
+            self._last_seen_ts = self._materialize_ts_token(self._last_seen_ts_token, fallback_ts)
+            self._last_seen_ts_token = None
+        if self._last_seen_ts is not None:
+            return self._last_seen_ts
+        return 0.0 if is_cold_start else fallback_ts
+
+    def _split_header_meta_lazy(
+        self,
+        line: str,
+        fallback_ts: float,
+    ) -> Tuple[bool, Optional[Tuple[Any, ...]], Optional[float], str, str, str, str]:
+        """Parse log header quickly, deferring datetime.replace().timestamp() until a line actually needs a timestamp."""
+        c0 = line[0]
+        if c0 in ("I", "W", "E", "F"):
+            m_glog = GLOG_PREFIX_RE.match(line)
+            if m_glog:
+                sev = m_glog.group(1)
+                mm, dd, hms = int(m_glog.group(2)), int(m_glog.group(3)), m_glog.group(4)
+                frac = (m_glog.group(5) or "")[:6]
+                usec = int(frac.ljust(6, "0")) if frac else 0
+                goroutine_id, source, body = m_glog.group(6), m_glog.group(7), m_glog.group(8)
+                h, mi, s = int(hms[0:2]), int(hms[3:5]), int(hms[6:8])
+                if 1 <= mm <= 12 and 1 <= dd <= 31 and 0 <= h <= 23 and 0 <= mi <= 59 and 0 <= s <= 59:
+                    tok = ("glog", mm, dd, h, mi, s, usec)
+                    # Only eagerly validate rare month/day edge combinations (e.g. Feb 30)
+                    if dd >= 29 and mm in (2, 4, 6, 9, 11):
+                        ts_val = self._materialize_ts_token(tok, fallback_ts)
+                        if ts_val is None:
+                            return False, None, None, sev, goroutine_id, source, body
+                        return True, None, ts_val, sev, goroutine_id, source, body
+                    return True, tok, None, sev, goroutine_id, source, body
+                return False, None, None, sev, goroutine_id, source, body
+
+        if len(line) >= 19:
+            m_full = FULL_TS_RE.match(line)
+            if m_full:
+                iso_norm = f"{m_full.group(1)}-{m_full.group(2)}-{m_full.group(3)}T{m_full.group(4)}"
+                parsed = parse_iso_timestamp(iso_norm)
+                if parsed is not None:
+                    return True, None, parsed, "", "", "", m_full.group(5)
+                return False, None, None, "", "", "", m_full.group(5)
+
+        return False, None, None, "", "", "", line
+
     def _parse_line(self, line: str, fallback_ts: float, is_cold_start: bool = False) -> Optional[LogEvent]:
         if not line:
             return None
@@ -1469,10 +1901,13 @@ class LanguageServerLogTailer:
         if ("127.0.0.1" in low_full or "localhost" in low_full) and "googleapis.com" not in low_full:
             return None
 
-        ts, severity_ch, goroutine_id, source, body = self._split_header_meta(line, fallback_ts, is_cold_start=is_cold_start)
-        is_continuation = ts is None
+        has_header_ts, ts_token, eager_ts, severity_ch, goroutine_id, source, body = self._split_header_meta_lazy(
+            line, fallback_ts
+        )
+        is_continuation = not has_header_ts
         if not is_continuation:
-            self._last_seen_ts = ts
+            self._last_seen_ts = eager_ts
+            self._last_seen_ts_token = ts_token
             self._last_header_gid = goroutine_id
             self._last_header_src = self._source_base_name(source)
             self._block_emitted_cats.clear()
@@ -1491,11 +1926,23 @@ class LanguageServerLogTailer:
             if not source and self._last_header_src:
                 source = self._last_header_src
 
-        effective_ts = ts if ts is not None else (self._last_seen_ts if self._last_seen_ts is not None else (0.0 if is_cold_start else fallback_ts))
+        # Cheap lowercase keyword pre-filter: skip heavy regexes and lazy datetime parsing on 95%+ benign INFO lines
+        has_event_kw = any(kw in low_full for kw in _LOG_FAST_KEYWORDS)
+        if not has_event_kw:
+            # Still honor state-machine side effects (multi-line JSON block skip / ignored goroutine tagging)
+            if (
+                severity_ch not in ("E", "W", "F")
+                and (is_continuation or not body.rstrip().endswith("{"))
+                and not any(marker in low_full for marker in NON_INFERENCE_RPC_MARKERS)
+            ):
+                return None
 
         src_low = source.lower()
         src_base = self._source_base_name(source)
         body_low = body.lower()
+
+        effective_ts = self._resolve_effective_ts(fallback_ts, is_cold_start=is_cold_start)
+
         # Capture cross-endpoint proxy disconnect bursts BEFORE non-inference early returns
         # (with O(1) keyword short-circuit and strict ResponseID exclusion).
         if (
@@ -1551,11 +1998,24 @@ class LanguageServerLogTailer:
                 self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
             return None
 
+        if not has_event_kw:
+            return None
+
         category: Optional[str] = None
         label = ""
         parsed_dur_sec: Optional[float] = None
-        m_to = STREAM_TIMEOUT_RE.search(body)
-        if TOS_403_RE.search(body):
+        m_to = STREAM_TIMEOUT_RE.search(body) if ("timeout" in body_low or "timed out" in body_low) else None
+        if (
+            (
+                "403" in body_low
+                or "tos_violation" in body_low
+                or "permission_denied" in body_low
+                or "suspended" in body_low
+                or "disabled" in body_low
+                or "banned" in body_low
+            )
+            and TOS_403_RE.search(body)
+        ):
             category = "403"
             label = "403 TOS/权限拒绝"
         elif m_to is not None:
@@ -1572,7 +2032,10 @@ class LanguageServerLogTailer:
                 if norm_dur.endswith("0m") and "h" in norm_dur:
                     norm_dur = norm_dur[:-2]
                 label = f"流超时 ({norm_dur})" if norm_dur else "流超时"
-        elif HTTP_503_RE.search(body):
+        elif (
+            ("503" in body_low or "no capacity" in body_low or "resource_exhausted" in body_low)
+            and HTTP_503_RE.search(body)
+        ):
             category = "503"
             if "capacity" in body_low:
                 label = "服务端 503 No capacity"
@@ -1580,7 +2043,13 @@ class LanguageServerLogTailer:
                 label = "服务端 503 资源耗尽"
             else:
                 label = "服务端 503 Unavailable"
-        elif RETRY_RE.search(line) and "context canceled" not in body_low and "shutting down" not in body_low:
+        elif (
+            "attempt " in low_full
+            and "failed" in low_full
+            and RETRY_RE.search(line)
+            and "context canceled" not in body_low
+            and "shutting down" not in body_low
+        ):
             category = "retry"
             label = "代理/流断连重试"
 
@@ -1829,9 +2298,16 @@ class AntigravityMonitorEngine:
         config: Optional[Dict[str, Any]] = None,
         paths: Optional[Dict[str, Path]] = None,
         read_only: bool = False,
+        should_yield_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.config = sanitize_config(config or DEFAULT_CONFIG)
         self.read_only: bool = bool(read_only)
+        self._should_yield_fn: Optional[Callable[[], bool]] = should_yield_fn
+        self._poll_yield_budget_remaining: float = 0.0
+        self._poll_seq: int = 0
+        self._in_poll: bool = False
+        self._vscdb_last_stat_poll_seq: int = -1
+        self._static_conv_agg_cache: "OrderedDict[str, Tuple[Tuple[Any, ...], Dict[str, Any]]]" = OrderedDict()
         base_paths = default_antigravity_paths()
         if paths:
             base_paths.update(paths)
@@ -1842,13 +2318,16 @@ class AntigravityMonitorEngine:
         self.cockpit_quota_db = Path(base_paths["cockpit_quota_db"])
         cockpit_logs_dir = base_paths.get("cockpit_logs_dir")
         ledger_path = base_paths.get("ledger_path")
+        diag_log_path = base_paths.get("diag_log_path")
         vscdb_path = base_paths.get("vscdb_path")
         annotations_dir = base_paths.get("annotations_dir")
         global_rules_path = base_paths.get("global_rules_path")
-        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path/annotations_dir/global_rules_path,
-        # avoid reading the host's real Cockpit logs, VSCode state DB, annotations, GEMINI.md, or polluting the real local ledger file.
+        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path/annotations_dir/global_rules_path/diag_log_path,
+        # avoid reading the host's real Cockpit logs, VSCode state DB, annotations, GEMINI.md, or polluting the real local ledger/diag files.
         if paths and "ledger_path" not in paths:
             ledger_path = None
+        if paths and "diag_log_path" not in paths:
+            diag_log_path = None
         if paths and "cockpit_logs_dir" not in paths:
             cockpit_logs_dir = None
         if paths and "vscdb_path" not in paths:
@@ -1858,6 +2337,9 @@ class AntigravityMonitorEngine:
         if paths and "global_rules_path" not in paths:
             global_rules_path = None
 
+        self.diag_log_path: Optional[Path] = (
+            None if (self.read_only or diag_log_path is None) else Path(diag_log_path)
+        )
         self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
         self.annotations_dir: Optional[Path] = Path(annotations_dir) if annotations_dir is not None else None
         self.global_rules_path: Optional[Path] = Path(global_rules_path) if global_rules_path is not None else None
@@ -1867,14 +2349,15 @@ class AntigravityMonitorEngine:
             summaries_db_path = self.conversations_dir.parent / "conversation_summaries.db"
         self.summaries_db_path: Path = Path(summaries_db_path) if summaries_db_path is not None else (self.conversations_dir.parent / "conversation_summaries.db")
         self._lock = threading.RLock()
-        self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]]" = OrderedDict()
+        self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Any], bool, bool]]" = OrderedDict()
+        self._transcript_inc_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._transcript_error_ts: "OrderedDict[str, List[Tuple[float, str, int, int, int]]]" = OrderedDict()
         self._transcript_tail_meta: "OrderedDict[str, Tuple[List[Tuple[float, int, int, int]], int, int, int]]" = OrderedDict()
         self._hist_daily_profiles_cache_key: Tuple[Any, ...] = ()
         self._hist_daily_profiles_cache_ts: float = 0.0
         self._hist_daily_profiles_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._hist_hourly_buckets_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
-        self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
+        self._classified_cache: "OrderedDict[str, Tuple[Tuple[Any, ...], List[StepRecord]]]" = OrderedDict()
         self._full_align_cache: "OrderedDict[Tuple[str, Tuple[int, int], int, int], List[Optional[Any]]]" = OrderedDict()
         self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
         self._conv_titles: Dict[str, str] = {}
@@ -1905,11 +2388,22 @@ class AntigravityMonitorEngine:
         self._active_hub_pid: int = 0
         self._active_hub_port: int = 0
         self._active_hub_token: str = ""
+        self._active_hub_creation_ft: int = 0
+        self._any_hub_pid_alive: bool = False
+        self._account_rpc_fail_count: int = 0
+        self._last_account_rpc_ok_ts: float = 0.0
+        self._last_probe_any_hub_pid_alive: bool = False
+        self._last_probe_seq: int = 0
+        self._last_probe_diag: Dict[str, Any] = {}
+        self._last_diag_state: str = ""
+        self._last_diag_log_ts: float = 0.0
         self._last_account_poll: float = 0.0
         self._last_titles_poll_ts: float = 0.0
         self._last_weekly_poll_ts: float = 0.0
         self._last_weekly_email: str = ""
-        self._last_weekly_pools: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
+        self._last_weekly_pools: Dict[str, Tuple[Optional[float], Optional[str], Optional[float], Optional[str]]] = {}
+        self._cockpit_weekly_cache_key: Tuple[Any, ...] = ()
+        self._cockpit_weekly_cache_rows: Dict[str, Tuple[Any, float, Any]] = {}
         self._last_quota_family: str = "gemini"
         self._baseline_ready: bool = False
         self._emitted_alert_keys: Deque[str] = deque(maxlen=256)
@@ -1917,6 +2411,24 @@ class AntigravityMonitorEngine:
         self._recorded_deg_anchors: "OrderedDict[Tuple[str, int], Optional[int]]" = OrderedDict()
         self._media_size_cache: "OrderedDict[str, int]" = OrderedDict()
         self._model_enum_map: "OrderedDict[str, str]" = OrderedDict()
+
+    def set_should_yield_fn(self, fn: Optional[Callable[[], bool]]) -> None:
+        """Register an optional predicate (e.g. UI dragging flag) so long scan loops yield the GIL."""
+        self._should_yield_fn = fn
+
+    def _maybe_yield_for_ui(self) -> None:
+        fn = self._should_yield_fn
+        if fn is None or self._poll_yield_budget_remaining <= 0.0:
+            return
+        try:
+            if not fn():
+                return
+        except Exception:
+            return
+        step_sleep = min(0.05, self._poll_yield_budget_remaining)
+        if step_sleep > 0.0:
+            self._poll_yield_budget_remaining -= step_sleep
+            time.sleep(step_sleep)
 
     def read_slot_inventory(self, include_items: bool = True, force: bool = True, now_ts: Optional[float] = None) -> SlotInventorySnapshot:
         with self._lock:
@@ -1978,8 +2490,11 @@ class AntigravityMonitorEngine:
             with self._lock:
                 for cid in res.removed_cids:
                     self._transcript_cache.pop(cid, None)
+                    self._transcript_inc_state.pop(cid, None)
                     self._transcript_error_ts.pop(cid, None)
                     self._transcript_tail_meta.pop(cid, None)
+                    self._classified_cache.pop(cid, None)
+                    self._static_conv_agg_cache.pop(cid, None)
                 if update_summary:
                     hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
                     tag = "手动清理" if trigger == "manual" else "自动让位"
@@ -2004,8 +2519,13 @@ class AntigravityMonitorEngine:
             if inv is None or not inv.summary_db_ok:
                 return None
             now = float(now_ts if now_ts is not None else time.time())
-            # Decouple offline detection from UI history view filters (6h/today/7d/custom account)!
-            is_offline_idle = bool(snap.is_host_idle_offline or ((not snap.account.online) and (snap.grade == "IDLE")))
+            # Decouple offline detection from UI history view filters (6h/today/7d/custom account),
+            # and hard-lock against auto_offline cleanup whenever any live Antigravity Hub PID is present!
+            is_offline_idle = bool(
+                (not getattr(snap, "hub_pid_alive", False))
+                and (not self._any_hub_pid_alive)
+                and (snap.is_host_idle_offline or ((not snap.account.online) and (snap.grade == "IDLE")))
+            )
             if is_offline_idle:
                 if self._offline_since_ts <= 0.0:
                     self._offline_since_ts = now
@@ -2120,29 +2640,59 @@ class AntigravityMonitorEngine:
     def _classify_steps_cached(
         self,
         conv_id: str,
-        raw_steps: List[Dict[str, Any]],
+        raw_steps: List[Any],
         switch_timestamps: List[float],
         rule_change_timestamps: Optional[List[float]] = None,
     ) -> List[StepRecord]:
         t_entry = self._transcript_cache.get(conv_id)
         t_stamp = t_entry[0] if t_entry is not None else (0, len(raw_steps))
-        sw_sig = tuple(round(t, 1) for t in switch_timestamps[-24:])
+        if switch_timestamps and raw_steps:
+            inc_meta = self._transcript_inc_state.get(conv_id)
+            min_ts: Optional[float] = None
+            max_ts: Optional[float] = None
+            if (
+                inc_meta is not None
+                and t_entry is not None
+                and len(raw_steps) == len(t_entry[1])
+                and inc_meta.get("min_step_ts", 0.0) > 0.0
+                and inc_meta.get("max_step_ts", 0.0) > 0.0
+            ):
+                min_ts = float(inc_meta["min_step_ts"])
+                max_ts = float(inc_meta["max_step_ts"])
+            else:
+                for item in raw_steps:
+                    ts_v = float(item.timestamp if isinstance(item, _RawStepSlot) else (item.get("timestamp", 0.0) or 0.0))
+                    if ts_v > 0.0:
+                        if min_ts is None or ts_v < min_ts:
+                            min_ts = ts_v
+                        if max_ts is None or ts_v > max_ts:
+                            max_ts = ts_v
+            if min_ts is not None and max_ts is not None:
+                lo_sw = min_ts - 2.0
+                hi_sw = max_ts + 2.0
+                sw_sig = tuple(round(t, 1) for t in sorted(switch_timestamps) if lo_sw <= t <= hi_sw)
+            else:
+                sw_sig = ()
+        else:
+            sw_sig = ()
         rule_ts = rule_change_timestamps or []
         rule_sig = tuple(round(t, 1) for t in rule_ts[-64:])
         idle_sec = int(self.config["idle_rewarm_sec"])
-        key = (conv_id, t_stamp, sw_sig, rule_sig, idle_sec)
-        cached = self._classified_cache.get(key)
-        if cached is not None:
-            self._classified_cache.move_to_end(key)
-            return cached
+        min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
+        cache_sig = (t_stamp, len(raw_steps), sw_sig, rule_sig, idle_sec, min_cache_tok)
+        cached_slot = self._classified_cache.get(conv_id)
+        if cached_slot is not None and cached_slot[0] == cache_sig:
+            self._classified_cache.move_to_end(conv_id)
+            return cached_slot[1]
         steps = classify_steps(
             raw_steps,
             idle_rewarm_sec=idle_sec,
+            min_cacheable_tokens=min_cache_tok,
             account_switches=switch_timestamps,
             rule_change_timestamps=rule_ts,
         )
-        self._classified_cache[key] = steps
-        self._classified_cache.move_to_end(key)
+        self._classified_cache[conv_id] = (cache_sig, steps)
+        self._classified_cache.move_to_end(conv_id)
         while len(self._classified_cache) > 256:
             self._classified_cache.popitem(last=False)
         return steps
@@ -2224,11 +2774,7 @@ class AntigravityMonitorEngine:
         c.tail_consec_hits_after_abnormal = st["tail_consec_hits_after_abnormal"]
         c.last_abnormal_ts = st["last_abnormal_ts"]
         if c.freshness_invalid_reason:
-            c.freshness_invalid_reason = (
-                f"无热缓存 (连掉 {c.consec_miss} 步)"
-                if c.consec_miss >= 2
-                else "本步 cr=0 无热缓存"
-            )
+            c.freshness_invalid_reason = _format_freshness_invalid_reason(c.consec_miss, c.latest_cache_reason)
 
     @staticmethod
     def _count_steps_in_window(c: ConversationSummary, lo_ts: float, hi_ts: float) -> Tuple[int, int]:
@@ -2397,7 +2943,7 @@ class AntigravityMonitorEngine:
     def _build_conversation_summary(
         self,
         conv_id: str,
-        raw_steps: List[Dict[str, Any]],
+        raw_steps: List[Any],
         has_user_explicit: bool,
         has_subagent_marker: bool,
         now: float,
@@ -2406,6 +2952,7 @@ class AntigravityMonitorEngine:
         account_filter_fn: Optional[Callable[[float], bool]] = None,
         range_start_ts: float = 0.0,
         rule_change_timestamps: Optional[List[float]] = None,
+        resolve_title: bool = True,
     ) -> Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]]:
         all_steps = self._classify_steps_cached(
             conv_id,
@@ -2459,7 +3006,7 @@ class AntigravityMonitorEngine:
                     or current_acct_since_ts <= 0.0
                     or latest.timestamp >= current_acct_since_ts - 2.0
                 ):
-                    fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
+                    fresh_invalid = _format_freshness_invalid_reason(consec_miss, latest.reason)
                 elif (
                     account_filter_fn is not None
                     or current_acct_since_ts <= 0.0
@@ -2492,7 +3039,7 @@ class AntigravityMonitorEngine:
             is_subagent=(not has_user_explicit) and has_subagent_marker,
             latest_context_delta=latest.context_delta,
             total_step_count=len(scoped_steps),
-            title=self._resolve_conv_title(conv_id),
+            title=self._resolve_conv_title(conv_id) if resolve_title else "",
             full_step_count=len(all_steps),
             full_latest_timestamp=all_steps[-1].timestamp,
             latest_cache_reason=latest.reason,
@@ -2649,7 +3196,7 @@ class AntigravityMonitorEngine:
                     full_aligned = _align_steps_with_gen_history(all_steps, full_gens)
                     self._full_align_cache[a_key] = full_aligned
                     self._full_align_cache.move_to_end(a_key)
-                    while len(self._full_align_cache) > 48:
+                    while len(self._full_align_cache) > 12:
                         self._full_align_cache.popitem(last=False)
                 scoped_gens = [full_aligned[i] for i in scoped_indices]
                 c._scoped_gens_all = scoped_gens
@@ -2790,12 +3337,185 @@ class AntigravityMonitorEngine:
                 earliest_cold = cand_cold
         return (earliest_cold - 0.5) if earliest_cold is not None else None
 
+    def _is_cached_hub_still_same_process(self) -> bool:
+        """Verify the cached Hub PID is still alive and (on Windows) has not been recycled."""
+        pid = self._active_hub_pid
+        if pid <= 0 or not _is_windows_pid_alive(pid):
+            return False
+        if os.name == "nt" and self._active_hub_creation_ft > 0:
+            alive, _exe, cft = _inspect_windows_pid(pid)
+            return bool(alive and cft > 0 and cft == self._active_hub_creation_ft)
+        return True
+
+    def _write_diag_log(self, now: float, state: str, detail: str, has_error: bool = False) -> None:
+        """Write throttled, privacy-masked diagnostics strictly when read_only=False (<= 64 KB tail cap)."""
+        if self.read_only or self.diag_log_path is None:
+            return
+        prev_state = self._last_diag_state
+        state_changed = bool(prev_state) and (state != prev_state)
+        is_initial_abnormal = (not prev_state) and (state in ("grace", "wait_pid_alive") or has_error)
+        throttled_ok = (self._last_diag_log_ts <= 0.0) or ((now - self._last_diag_log_ts) >= 60.0)
+        should_write = (
+            state_changed
+            or is_initial_abnormal
+            or ((state in ("grace", "wait_pid_alive") or has_error) and throttled_ok)
+        )
+        self._last_diag_state = state
+        if not should_write:
+            return
+        self._last_diag_log_ts = now
+        try:
+            ts_str = _epoch_to_iso_local(now)
+        except (OSError, OverflowError, ValueError):
+            ts_str = str(int(now))
+        trans = f"{prev_state}->{state}" if (prev_state and prev_state != state) else state
+        raw_line = f"[{ts_str}] [{trans}] {detail}".replace("\r", " ").replace("\n", " ")
+        line = mask_email(raw_line)
+        if len(line) > 320:
+            line = line[:317] + "..."
+        entry_bytes = (line + "\n").encode("utf-8", errors="replace")
+        try:
+            self.diag_log_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = b""
+            if self.diag_log_path.is_file():
+                with self.diag_log_path.open("rb") as fh:
+                    existing = fh.read()
+            combined = existing + entry_bytes
+            if len(combined) > _DIAG_LOG_MAX_BYTES:
+                keep = combined[-_DIAG_LOG_MAX_BYTES:]
+                nl = keep.find(b"\n")
+                if nl != -1 and nl + 1 < len(keep):
+                    keep = keep[nl + 1 :]
+                tmp_path = self.diag_log_path.with_name(f"{self.diag_log_path.name}.tmp.{os.getpid()}")
+                try:
+                    with tmp_path.open("wb") as fh:
+                        fh.write(keep)
+                    os.replace(tmp_path, self.diag_log_path)
+                finally:
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+            else:
+                with self.diag_log_path.open("ab") as fh:
+                    fh.write(entry_bytes)
+        except OSError:
+            pass
+
+    def _refresh_account_cache(self, now: float, active_family: str) -> None:
+        """Unified account/quota refresh entry with live-Hub debounce and zero-delay true-offline drop.
+
+        All timers strictly use the passed ``now`` timestamp (never ``time.monotonic()``).
+        """
+        seq_before = self._last_probe_seq
+        probed = self._poll_account_and_quota(now, active_family)
+        self._last_account_poll = now
+        ran_real_probe = self._last_probe_seq != seq_before
+        diag = dict(self._last_probe_diag) if ran_real_probe else {}
+
+        if probed.online:
+            self._account_cache = probed
+            self._account_rpc_fail_count = 0
+            self._last_account_rpc_ok_ts = now
+            self._any_hub_pid_alive = True
+            self._write_diag_log(
+                now,
+                "online",
+                (
+                    f"online=1 hub_pid_alive=1 fail=0 port={self._active_hub_port} "
+                    f"probes={diag.get('probes', 0)} files={diag.get('files', 0)} "
+                    f"acct={probed.short_label or 'unknown'}"
+                ),
+                has_error=False,
+            )
+            return
+
+        any_alive = bool(self._last_probe_any_hub_pid_alive) if ran_real_probe else False
+        err_kind = str(diag.get("err", "") or "")
+        err_port = int(diag.get("port", 0) or 0)
+        probes_n = int(diag.get("probes", 0) or 0)
+        files_n = int(diag.get("files", 0) or 0)
+
+        if not any_alive:
+            # No alive Antigravity Hub process -> 0-debounce immediate offline transition
+            self._active_hub_pid = 0
+            self._active_hub_port = 0
+            self._active_hub_token = ""
+            self._active_hub_creation_ft = 0
+            self._last_weekly_email = ""
+            self._last_weekly_poll_ts = 0.0
+            self._last_weekly_pools = {}
+            self._any_hub_pid_alive = False
+            self._account_rpc_fail_count = 0
+            self._account_cache = AccountQuotaInfo(observed_at=now, quota_family=active_family, online=False)
+            self._write_diag_log(
+                now,
+                "offline",
+                (
+                    f"online=0 hub_pid_alive=0 fail=0 port={err_port} "
+                    f"err={err_kind or 'none'} probes={probes_n} files={files_n}"
+                ),
+                has_error=bool(err_kind),
+            )
+            return
+
+        # Live Antigravity Hub PID detected -> protect cached Hub & weekly data, debounce transient RPC blips
+        # If the previously cached Hub PID actually exited (another Hub PID is alive), clear stale cached Hub
+        # fields immediately so hub_dropped does not hammer full scans every poll cycle and old account data
+        # is never held in grace for a dead process.
+        cached_hub_dead = (
+            self._active_hub_pid > 0
+            and not self._is_cached_hub_still_same_process()
+        )
+        if cached_hub_dead:
+            self._active_hub_pid = 0
+            self._active_hub_port = 0
+            self._active_hub_token = ""
+            self._active_hub_creation_ft = 0
+        self._any_hub_pid_alive = True
+        self._account_rpc_fail_count += 1
+        within_grace = (
+            not cached_hub_dead
+            and self._account_cache.online
+            and self._last_account_rpc_ok_ts > 0.0
+            and self._account_rpc_fail_count < 3
+            and (now - self._last_account_rpc_ok_ts) < 15.0
+        )
+        if within_grace:
+            if self._account_cache.quota_family != active_family:
+                if self._account_cache.pools:
+                    self._sync_account_active_pool(self._account_cache, active_family)
+                else:
+                    self._account_cache.quota_family = active_family
+            self._write_diag_log(
+                now,
+                "grace",
+                (
+                    f"online=1(grace) hub_pid_alive=1 fail={self._account_rpc_fail_count} "
+                    f"port={err_port or self._active_hub_port} err={err_kind or 'rpc_fail'} "
+                    f"probes={probes_n} files={files_n}"
+                ),
+                has_error=True,
+            )
+        else:
+            self._account_cache = AccountQuotaInfo(observed_at=now, quota_family=active_family, online=False)
+            self._write_diag_log(
+                now,
+                "wait_pid_alive",
+                (
+                    f"online=0 hub_pid_alive=1 fail={self._account_rpc_fail_count} "
+                    f"port={err_port or self._active_hub_port} err={err_kind or 'rpc_fail'} "
+                    f"probes={probes_n} files={files_n}"
+                ),
+                has_error=True,
+            )
+
     def _probe_active_hub_account_fast(self) -> Optional[str]:
         """Lightweight <3ms check of the cached Hub's current masked email without full hub scan or Cockpit DB reads."""
         port = self._active_hub_port
         token = self._active_hub_token
-        pid = self._active_hub_pid
-        if not (port and token and pid and _is_windows_pid_alive(pid)):
+        if not (port and token and self._is_cached_hub_still_same_process()):
             return None
         try:
             req = urllib.request.Request(
@@ -2807,14 +3527,36 @@ class AntigravityMonitorEngine:
                     "Connect-Protocol-Version": "1",
                 },
             )
-            with urllib.request.urlopen(req, timeout=0.8) as resp:
+            with _open_localhost_url(req, timeout=0.8) as resp:
                 payload = json.loads(resp.read().decode("utf-8", errors="replace"))
             live_email = str((payload.get("userStatus") or {}).get("email", "") or "")
             return short_email_label(live_email) if live_email else None
-        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError):
             return None
 
     def _poll_locked(
+        self,
+        now_ts: Optional[float] = None,
+        force_account: bool = False,
+        target_conversation_id: str = "",
+        view_account: str = "",
+        history_range: str = "30m",
+    ) -> MonitorSnapshot:
+        self._poll_seq += 1
+        self._poll_yield_budget_remaining = 2.0
+        self._in_poll = True
+        try:
+            return self._poll_locked_body(
+                now_ts=now_ts,
+                force_account=force_account,
+                target_conversation_id=target_conversation_id,
+                view_account=view_account,
+                history_range=history_range,
+            )
+        finally:
+            self._in_poll = False
+
+    def _poll_locked_body(
         self,
         now_ts: Optional[float] = None,
         force_account: bool = False,
@@ -2835,7 +3577,11 @@ class AntigravityMonitorEngine:
         # and fast-probe cached Hub when Cockpit timeline just recorded a recent switch (<120s).
         prev_acct_label = self._account_cache.short_label if self._account_cache.online else ""
         prev_poll_ts = self._last_account_poll
-        hub_dropped = self._account_cache.online and self._active_hub_pid > 0 and not _is_windows_pid_alive(self._active_hub_pid)
+        hub_dropped = (
+            (self._account_cache.online or self._any_hub_pid_alive)
+            and self._active_hub_pid > 0
+            and not self._is_cached_hub_still_same_process()
+        )
         account_interval = 5.0
         need_account_poll = force_account or hub_dropped or (now - self._last_account_poll >= account_interval)
         if not need_account_poll and self._account_cache.online and (now - self._last_account_poll >= 1.0):
@@ -2847,8 +3593,7 @@ class AntigravityMonitorEngine:
                     if fast_lbl is None or fast_lbl.lower() != prev_acct_label.lower():
                         need_account_poll = True
         if need_account_poll:
-            self._account_cache = self._poll_account_and_quota(now, self._last_quota_family)
-            self._last_account_poll = now
+            self._refresh_account_cache(now, self._last_quota_family)
             if self._account_cache.online and self._account_cache.short_label:
                 hint_ts = None
                 if prev_acct_label and self._account_cache.short_label.lower() != prev_acct_label.lower():
@@ -2863,7 +3608,11 @@ class AntigravityMonitorEngine:
         timeline = self._ledger.get_timeline(min(today_start, now - 7 * 86400.0))
         timeline_times = [t for t, _ in timeline]
         cur_acct_label = self._account_cache.short_label if self._account_cache.online else ""
-        available_accounts = self._ledger.list_known_accounts(now - 7 * 86400.0, current_label=cur_acct_label)
+        available_accounts = self._ledger.list_known_accounts(
+            now - 7 * 86400.0,
+            current_label=cur_acct_label,
+            timeline=timeline,
+        )
 
         raw_view = (view_account or "").strip()
         if raw_view == "__all__":
@@ -2918,7 +3667,7 @@ class AntigravityMonitorEngine:
                 lookback_cutoff = min(today_start - 3600.0, now - 48 * 3600.0)
                 max_older_convs = 48
 
-        switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
+        switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff, timeline=timeline)
         rule_timestamps = self._observe_and_get_rule_timestamps(now, since_ts=0.0)
         current_acct_since_ts = timeline[-1][0] if (resolved_account and not is_custom_account_view and len(timeline) >= 2) else 0.0
 
@@ -2966,13 +3715,64 @@ class AntigravityMonitorEngine:
         one_hour_cutoff = now - 3600.0
         step_upper_bound = now + 5.0
         eff_range_step_cutoff = range_start_ts if range_start_ts > 0.0 else (now - win_sec)
+        quiet_cutoff_ts = now - max(600.0, float(self.config.get("freshness_window_sec", 210)) + 305.0)
+        four_bounds = (today_start, rolling_24h_cutoff, one_hour_cutoff, eff_range_step_cutoff)
+        agg_env_sig = (
+            resolved_account.lower(),
+            hr_key,
+            len(timeline),
+            timeline[-1] if timeline else None,
+            cur_acct_label.lower(),
+            round(current_acct_since_ts, 1),
+            tuple(round(t, 1) for t in switch_timestamps[-24:]),
+            tuple(round(t, 1) for t in rule_timestamps[-64:]),
+            int(self.config["idle_rewarm_sec"]),
+            int(self.config.get("min_cacheable_tokens", 32000)),
+            int(self.config.get("large_context_threshold", 60000)),
+            len(self._model_enum_map),
+        )
 
-        for idx_conv, (conv_id, tp) in enumerate(all_recent):
-            raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(conv_id, tp)
+        def _boundary_pos(min_ts_v: float, max_ts_v: float, bound_ts: float) -> int:
+            if bound_ts <= min_ts_v:
+                return 0
+            if bound_ts > max_ts_v:
+                return 2
+            return 1
+
+        def _clone_summary_tpl(
+            tpl: ConversationSummary,
+            scoped_tpl: List[StepRecord],
+        ) -> ConversationSummary:
+            return replace(
+                tpl,
+                recent_steps=list(tpl.recent_steps),
+                recent_ttfts=list(tpl.recent_ttfts),
+                recent_tps_list=list(tpl.recent_tps_list),
+                _scoped_steps_all=list(scoped_tpl),
+                _scoped_gens_all=[],
+            )
+
+        for idx_conv, (conv_id, tp, prefetched_stamp) in enumerate(all_recent):
+            self._maybe_yield_for_ui()
+            raw_steps, has_user_explicit, has_subagent_marker = self._read_transcript_cached(
+                conv_id,
+                tp,
+                prefetched_stamp=prefetched_stamp,
+            )
             if not raw_steps:
                 continue
 
-            last_raw_ts = float(raw_steps[-1].get("timestamp", 0.0) or 0.0)
+            last_step_raw = raw_steps[-1]
+            last_raw_ts = float(
+                last_step_raw.timestamp
+                if isinstance(last_step_raw, _RawStepSlot)
+                else (last_step_raw.get("timestamp", 0.0) or 0.0)
+            )
+            inc_meta_ts = self._transcript_inc_state.get(conv_id)
+            if inc_meta_ts is not None:
+                inc_max_ts = float(inc_meta_ts.get("max_step_ts", 0.0) or 0.0)
+                if inc_max_ts > last_raw_ts:
+                    last_raw_ts = inc_max_ts
             if last_raw_ts > latest_host_transcript_ts:
                 latest_host_transcript_ts = last_raw_ts
             if (now - last_raw_ts) <= 120.0:
@@ -2985,74 +3785,253 @@ class AntigravityMonitorEngine:
             else:
                 is_sub_conv = self._check_subagent_hint_cached(conv_id)
 
-            for s in raw_steps:
-                sts = float(s.get("timestamp", 0.0) or 0.0)
-                if sts <= 0.0 or sts > step_upper_bound:
-                    continue
-                if sts >= today_start:
-                    total_today_steps += 1
-                    if is_sub_conv:
-                        total_subagent_today_steps += 1
-                    else:
-                        total_main_today_steps += 1
-                if sts >= rolling_24h_cutoff:
-                    total_24h_steps += 1
-                    if is_sub_conv:
-                        total_subagent_24h_steps += 1
-                    else:
-                        total_main_24h_steps += 1
-
-                in_scope = True if acct_filter_fn is None else acct_filter_fn(sts)
-                if not in_scope:
-                    continue
-
-                if sts >= eff_range_step_cutoff:
-                    range_steps += 1
-                if sts >= one_hour_cutoff:
-                    last_1h_steps += 1
-                if sts >= today_start:
-                    if resolved_account:
-                        account_today_steps += 1
-                        if is_sub_conv:
-                            account_subagent_today_steps += 1
-                        else:
-                            account_main_today_steps += 1
-                    hr = datetime.datetime.fromtimestamp(sts).hour
-                    hourly_counts[hr] = hourly_counts.get(hr, 0) + 1
-                if sts >= rolling_24h_cutoff:
-                    if resolved_account:
-                        account_24h_steps += 1
-                        if is_sub_conv:
-                            account_subagent_24h_steps += 1
-                        else:
-                            account_main_24h_steps += 1
-                        hk_utc = int(sts // 3600)
-                        account_24h_utc_buckets[hk_utc] = account_24h_utc_buckets.get(hk_utc, 0) + 1
-                    dt_s = datetime.datetime.fromtimestamp(sts)
-                    lkey = (dt_s.year, dt_s.month, dt_s.day, dt_s.hour)
-                    hourly_24h_local_counts[lkey] = hourly_24h_local_counts.get(lkey, 0) + 1
-
             matches_target = bool(
                 target_query_low
                 and (conv_id.lower() == target_query_low or conv_id.lower().startswith(target_query_low))
             )
             scan_limit = 96 if (acct_filter_fn is not None or hr_key != "30m") else 24
             want_summary = idx_conv < scan_limit or (not is_sub_conv and collected_main_count < 16) or matches_target
-            if not want_summary:
+
+            is_quiet_static = (not matches_target) and (last_raw_ts > 0.0) and (last_raw_ts < quiet_cutoff_ts)
+            agg_key = (prefetched_stamp, is_sub_conv, agg_env_sig)
+            cached_slot = self._static_conv_agg_cache.get(conv_id) if is_quiet_static else None
+            cached_agg = cached_slot[1] if (cached_slot is not None and cached_slot[0] == agg_key) else None
+            agg_hit = False
+            if cached_agg is not None:
+                c_min_ts = cached_agg["min_ts"]
+                c_max_ts = cached_agg["max_ts"]
+                if c_min_ts is not None and c_max_ts is not None and c_max_ts <= step_upper_bound:
+                    cur_bstate = tuple(_boundary_pos(c_min_ts, c_max_ts, b) for b in four_bounds)
+                    if (1 not in cur_bstate) and cur_bstate == cached_agg["bstate"]:
+                        agg_hit = True
+                elif c_min_ts is None and c_max_ts is None and cached_agg["bstate"] == ():
+                    agg_hit = True
+
+            if agg_hit and cached_agg is not None:
+                self._static_conv_agg_cache.move_to_end(conv_id)
+                total_today_steps += cached_agg["d_total_today"]
+                total_main_today_steps += cached_agg["d_total_main_today"]
+                total_subagent_today_steps += cached_agg["d_total_sub_today"]
+                total_24h_steps += cached_agg["d_total_24h"]
+                total_main_24h_steps += cached_agg["d_total_main_24h"]
+                total_subagent_24h_steps += cached_agg["d_total_sub_24h"]
+                account_today_steps += cached_agg["d_acct_today"]
+                account_main_today_steps += cached_agg["d_acct_main_today"]
+                account_subagent_today_steps += cached_agg["d_acct_sub_today"]
+                account_24h_steps += cached_agg["d_acct_24h"]
+                account_main_24h_steps += cached_agg["d_acct_main_24h"]
+                account_subagent_24h_steps += cached_agg["d_acct_sub_24h"]
+                range_steps += cached_agg["d_range_steps"]
+                last_1h_steps += cached_agg["d_last_1h_steps"]
+                for hr_k, cnt_v in cached_agg["d_hourly_counts"]:
+                    hourly_counts[hr_k] = hourly_counts.get(hr_k, 0) + cnt_v
+                for lkey_k, cnt_v in cached_agg["d_hourly_24h_local"]:
+                    hourly_24h_local_counts[lkey_k] = hourly_24h_local_counts.get(lkey_k, 0) + cnt_v
+                for hk_k, cnt_v in cached_agg["d_acct_24h_utc"]:
+                    account_24h_utc_buckets[hk_k] = account_24h_utc_buckets.get(hk_k, 0) + cnt_v
+
+                if not want_summary:
+                    continue
+                sum_ent = cached_agg["summary_entry"]
+                if sum_ent is None:
+                    built_now = self._build_conversation_summary(
+                        conv_id=conv_id,
+                        raw_steps=raw_steps,
+                        has_user_explicit=has_user_explicit,
+                        has_subagent_marker=has_subagent_marker or is_sub_conv,
+                        now=now,
+                        switch_timestamps=switch_timestamps,
+                        current_acct_since_ts=0.0 if acct_filter_fn is not None else current_acct_since_ts,
+                        account_filter_fn=acct_filter_fn,
+                        range_start_ts=range_start_ts,
+                        rule_change_timestamps=rule_timestamps,
+                        resolve_title=False,
+                    )
+                    if built_now is None:
+                        cached_agg["summary_entry"] = ("empty",)
+                        continue
+                    scoped_tpl = list(built_now[0]._scoped_steps_all)
+                    tpl_copy = replace(
+                        built_now[0],
+                        recent_steps=list(built_now[0].recent_steps),
+                        recent_ttfts=list(built_now[0].recent_ttfts),
+                        recent_tps_list=list(built_now[0].recent_tps_list),
+                        _scoped_steps_all=[],
+                        _scoped_gens_all=[],
+                    )
+                    cached_agg["summary_entry"] = ("built", tpl_copy, built_now[1], built_now[2], scoped_tpl)
+                    built = built_now
+                elif sum_ent[0] == "empty":
+                    continue
+                else:
+                    _tag, tpl_copy, all_st_c, sc_idx_c, scoped_tpl = sum_ent
+                    built = (_clone_summary_tpl(tpl_copy, scoped_tpl), all_st_c, sc_idx_c)
+                convs_bundle.append(built)
+                if not built[0].is_subagent:
+                    collected_main_count += 1
                 continue
 
-            built = self._build_conversation_summary(
-                conv_id=conv_id,
-                raw_steps=raw_steps,
-                has_user_explicit=has_user_explicit,
-                has_subagent_marker=has_subagent_marker or is_sub_conv,
-                now=now,
-                switch_timestamps=switch_timestamps,
-                current_acct_since_ts=0.0 if acct_filter_fn is not None else current_acct_since_ts,
-                account_filter_fn=acct_filter_fn,
-                range_start_ts=range_start_ts,
-                rule_change_timestamps=rule_timestamps,
-            )
+            d_total_today = 0
+            d_total_main_today = 0
+            d_total_sub_today = 0
+            d_total_24h = 0
+            d_total_main_24h = 0
+            d_total_sub_24h = 0
+            d_acct_today = 0
+            d_acct_main_today = 0
+            d_acct_sub_today = 0
+            d_acct_24h = 0
+            d_acct_main_24h = 0
+            d_acct_sub_24h = 0
+            d_range_steps = 0
+            d_last_1h_steps = 0
+            d_hourly: Dict[int, int] = {}
+            d_hourly_24h: Dict[Tuple[int, int, int, int], int] = {}
+            d_acct_utc: Dict[int, int] = {}
+            c_min_ts: Optional[float] = None
+            c_max_ts: Optional[float] = None
+
+            for s in raw_steps:
+                sts = float(s.timestamp if isinstance(s, _RawStepSlot) else (s.get("timestamp", 0.0) or 0.0))
+                if sts <= 0.0 or sts > step_upper_bound:
+                    continue
+                if c_min_ts is None or sts < c_min_ts:
+                    c_min_ts = sts
+                if c_max_ts is None or sts > c_max_ts:
+                    c_max_ts = sts
+                if sts >= today_start:
+                    d_total_today += 1
+                    if is_sub_conv:
+                        d_total_sub_today += 1
+                    else:
+                        d_total_main_today += 1
+                if sts >= rolling_24h_cutoff:
+                    d_total_24h += 1
+                    if is_sub_conv:
+                        d_total_sub_24h += 1
+                    else:
+                        d_total_main_24h += 1
+
+                in_scope = True if acct_filter_fn is None else acct_filter_fn(sts)
+                if not in_scope:
+                    continue
+
+                if sts >= eff_range_step_cutoff:
+                    d_range_steps += 1
+                if sts >= one_hour_cutoff:
+                    d_last_1h_steps += 1
+                if sts >= today_start:
+                    if resolved_account:
+                        d_acct_today += 1
+                        if is_sub_conv:
+                            d_acct_sub_today += 1
+                        else:
+                            d_acct_main_today += 1
+                    hr = datetime.datetime.fromtimestamp(sts).hour
+                    d_hourly[hr] = d_hourly.get(hr, 0) + 1
+                if sts >= rolling_24h_cutoff:
+                    if resolved_account:
+                        d_acct_24h += 1
+                        if is_sub_conv:
+                            d_acct_sub_24h += 1
+                        else:
+                            d_acct_main_24h += 1
+                        hk_utc = int(sts // 3600)
+                        d_acct_utc[hk_utc] = d_acct_utc.get(hk_utc, 0) + 1
+                    dt_s = datetime.datetime.fromtimestamp(sts)
+                    lkey = (dt_s.year, dt_s.month, dt_s.day, dt_s.hour)
+                    d_hourly_24h[lkey] = d_hourly_24h.get(lkey, 0) + 1
+
+            total_today_steps += d_total_today
+            total_main_today_steps += d_total_main_today
+            total_subagent_today_steps += d_total_sub_today
+            total_24h_steps += d_total_24h
+            total_main_24h_steps += d_total_main_24h
+            total_subagent_24h_steps += d_total_sub_24h
+            account_today_steps += d_acct_today
+            account_main_today_steps += d_acct_main_today
+            account_subagent_today_steps += d_acct_sub_today
+            account_24h_steps += d_acct_24h
+            account_main_24h_steps += d_acct_main_24h
+            account_subagent_24h_steps += d_acct_sub_24h
+            range_steps += d_range_steps
+            last_1h_steps += d_last_1h_steps
+            for hr_k, cnt_v in d_hourly.items():
+                hourly_counts[hr_k] = hourly_counts.get(hr_k, 0) + cnt_v
+            for lkey_k, cnt_v in d_hourly_24h.items():
+                hourly_24h_local_counts[lkey_k] = hourly_24h_local_counts.get(lkey_k, 0) + cnt_v
+            for hk_k, cnt_v in d_acct_utc.items():
+                account_24h_utc_buckets[hk_k] = account_24h_utc_buckets.get(hk_k, 0) + cnt_v
+
+            summary_cache_ent: Any = None
+            built = None
+            if want_summary:
+                built = self._build_conversation_summary(
+                    conv_id=conv_id,
+                    raw_steps=raw_steps,
+                    has_user_explicit=has_user_explicit,
+                    has_subagent_marker=has_subagent_marker or is_sub_conv,
+                    now=now,
+                    switch_timestamps=switch_timestamps,
+                    current_acct_since_ts=0.0 if acct_filter_fn is not None else current_acct_since_ts,
+                    account_filter_fn=acct_filter_fn,
+                    range_start_ts=range_start_ts,
+                    rule_change_timestamps=rule_timestamps,
+                    resolve_title=False,
+                )
+                if built is None:
+                    summary_cache_ent = ("empty",)
+                else:
+                    scoped_tpl = list(built[0]._scoped_steps_all)
+                    tpl_copy = replace(
+                        built[0],
+                        recent_steps=list(built[0].recent_steps),
+                        recent_ttfts=list(built[0].recent_ttfts),
+                        recent_tps_list=list(built[0].recent_tps_list),
+                        _scoped_steps_all=[],
+                        _scoped_gens_all=[],
+                    )
+                    summary_cache_ent = ("built", tpl_copy, built[1], built[2], scoped_tpl)
+
+            if is_quiet_static:
+                bstate = (
+                    tuple(_boundary_pos(c_min_ts, c_max_ts, b) for b in four_bounds)
+                    if (c_min_ts is not None and c_max_ts is not None)
+                    else ()
+                )
+                if 1 not in bstate:
+                    self._static_conv_agg_cache[conv_id] = (
+                        agg_key,
+                        {
+                            "min_ts": c_min_ts,
+                            "max_ts": c_max_ts,
+                            "bstate": bstate,
+                            "d_total_today": d_total_today,
+                            "d_total_main_today": d_total_main_today,
+                            "d_total_sub_today": d_total_sub_today,
+                            "d_total_24h": d_total_24h,
+                            "d_total_main_24h": d_total_main_24h,
+                            "d_total_sub_24h": d_total_sub_24h,
+                            "d_acct_today": d_acct_today,
+                            "d_acct_main_today": d_acct_main_today,
+                            "d_acct_sub_today": d_acct_sub_today,
+                            "d_acct_24h": d_acct_24h,
+                            "d_acct_main_24h": d_acct_main_24h,
+                            "d_acct_sub_24h": d_acct_sub_24h,
+                            "d_range_steps": d_range_steps,
+                            "d_last_1h_steps": d_last_1h_steps,
+                            "d_hourly_counts": tuple(d_hourly.items()),
+                            "d_hourly_24h_local": tuple(d_hourly_24h.items()),
+                            "d_acct_24h_utc": tuple(d_acct_utc.items()),
+                            "summary_entry": summary_cache_ent,
+                        },
+                    )
+                    self._static_conv_agg_cache.move_to_end(conv_id)
+                    while len(self._static_conv_agg_cache) > 256:
+                        self._static_conv_agg_cache.popitem(last=False)
+
+            if not want_summary:
+                continue
             if built is None:
                 if want_carryover and (not is_sub_conv) and (now - last_raw_ts) <= 600.0:
                     carryover_candidates.append((last_raw_ts, conv_id, raw_steps, has_user_explicit, has_subagent_marker or is_sub_conv))
@@ -3089,6 +4068,7 @@ class AntigravityMonitorEngine:
                         account_filter_fn=None,
                         range_start_ts=0.0,
                         rule_change_timestamps=rule_timestamps,
+                        resolve_title=False,
                     )
 
         convs_bundle.sort(key=lambda b: b[0].latest_timestamp, reverse=True)
@@ -3106,6 +4086,8 @@ class AntigravityMonitorEngine:
         is_acct_scoped = acct_filter_fn is not None
         need_wide_gens = hr_key != "30m"
         for c, all_st, sc_idx in top_bundles:
+            if not c.title:
+                c.title = self._resolve_conv_title(c.conversation_id)
             self._enrich_conv_from_db(
                 c,
                 all_steps=all_st,
@@ -3114,6 +4096,8 @@ class AntigravityMonitorEngine:
                 need_full_window_gens=need_wide_gens,
             )
         target_conv: Optional[ConversationSummary] = target_bundle[0] if target_bundle is not None else None
+        if target_conv is not None and not target_conv.title:
+            target_conv.title = self._resolve_conv_title(target_conv.conversation_id)
         if target_bundle is not None and target_bundle[0].conversation_id not in seen_ids:
             self._enrich_conv_from_db(
                 target_bundle[0],
@@ -3137,8 +4121,7 @@ class AntigravityMonitorEngine:
             if self._account_cache.pools:
                 self._sync_account_active_pool(self._account_cache, active_family)
             else:
-                self._account_cache = self._poll_account_and_quota(now, active_family)
-                self._last_account_poll = now
+                self._refresh_account_cache(now, active_family)
                 if self._account_cache.online and self._account_cache.short_label:
                     self._ledger.observe_online(self._account_cache.short_label, now)
 
@@ -3198,6 +4181,9 @@ class AntigravityMonitorEngine:
         min_fresh_ctx = 0
         min_fresh_invalid = ""
         if large_freshness:
+            for _fc in large_freshness[:12]:
+                if not _fc.title:
+                    _fc.title = self._resolve_conv_title(_fc.conversation_id)
             head_f = large_freshness[0]
             min_fresh_sec = head_f.freshness_remaining_sec
             min_fresh_conv = head_f.short_id
@@ -3375,8 +4361,11 @@ class AntigravityMonitorEngine:
         eval_primary = eval_mains[0] if eval_mains else (recent_active[0] if recent_active else primary)
         active_model = eval_primary.model if eval_primary else "等待请求"
         primary_hit = eval_primary.latest_hit_rate if eval_primary else None
-        primary_hit_cls = eval_primary.recent_steps[-1].classification if (eval_primary and eval_primary.recent_steps) else ""
+        primary_last_step = eval_primary.recent_steps[-1] if (eval_primary and eval_primary.recent_steps) else None
+        primary_hit_cls = primary_last_step.classification if primary_last_step is not None else ""
         primary_hit_reason = eval_primary.latest_cache_reason if eval_primary else ""
+        primary_hit_is_compact = bool(primary_last_step.is_compact) if primary_last_step is not None else False
+        primary_hit_is_revert = bool(primary_last_step.is_revert) if primary_last_step is not None else False
         primary_tps = eval_primary.tps if eval_primary else None
         primary_ttft = eval_primary.ttft_sec if eval_primary else None
         primary_speed = eval_primary.speed_status if eval_primary else "unknown"
@@ -3538,6 +4527,7 @@ class AntigravityMonitorEngine:
                 acct_hist_safe_peak,
             ) = compute_adaptive_daily_steps_limits(base_steps_warn, base_steps_alert, hist_days)
 
+        hub_pid_alive_val = bool(self._account_cache.online or self._any_hub_pid_alive)
         level, grade, headline, sub_headline, t2_recovery_note = self._evaluate_health(
             active_model=active_model,
             recent_log=recent_log,
@@ -3568,6 +4558,7 @@ class AntigravityMonitorEngine:
             daily_steps_warn_override=eff_steps_warn,
             daily_steps_alert_override=eff_steps_alert,
             rolling_24h_steps=rolling_24h_steps,
+            hub_pid_alive=hub_pid_alive_val,
         )
 
         # Ensure IDLE offline state never leaks transient proxy outage fields
@@ -3687,6 +4678,20 @@ class AntigravityMonitorEngine:
         primary_ttft_max = eval_primary.ttft_max_sec if eval_primary else None
         primary_recent_ttfts = list(eval_primary.recent_ttfts) if eval_primary else []
 
+        # Release temporary per-poll full step/gen lists before crossing thread boundary into UI snapshot
+        for _c in convs:
+            _c._scoped_steps_all = []
+            _c._scoped_gens_all = []
+        for _c in top_convs:
+            _c._scoped_steps_all = []
+            _c._scoped_gens_all = []
+        for _c in carryover_convs:
+            _c._scoped_steps_all = []
+            _c._scoped_gens_all = []
+        if target_conv is not None:
+            target_conv._scoped_steps_all = []
+            target_conv._scoped_gens_all = []
+
         return MonitorSnapshot(
             generated_at=now,
             level=level,
@@ -3719,7 +4724,7 @@ class AntigravityMonitorEngine:
             recent_events=notable_events,
             wasted_cold_tokens_total=wasted_total,
             max_consec_miss=max_consec_miss,
-            account=self._account_cache,
+            account=replace(self._account_cache, pools=dict(self._account_cache.pools)),
             sliding_window_min=self.config["log_sliding_window_min"],
             freshness_window_sec=self.config["freshness_window_sec"],
             alerts=alerts,
@@ -3760,7 +4765,11 @@ class AntigravityMonitorEngine:
             rating_anchor_ts=rating_anchor_ts,
             range_steps=range_steps,
             slot_inventory=slot_inv,
-            is_host_idle_offline=bool((not self._account_cache.online) and ((now - latest_host_transcript_ts) >= 15.0)),
+            is_host_idle_offline=bool(
+                (not self._account_cache.online)
+                and (not self._any_hub_pid_alive)
+                and ((now - latest_host_transcript_ts) >= 15.0)
+            ),
             primary_hit_reason=primary_hit_reason,
             carryover_conversations=carryover_convs,
             heavy_media_timeout_recent=heavy_media_timeout_count,
@@ -3780,6 +4789,9 @@ class AntigravityMonitorEngine:
             peak_hour_steps_24h=peak_hour_steps_24h,
             peak_hour_label_24h=peak_hour_label_24h,
             current_24h_has_degradation=current_24h_has_degradation,
+            hub_pid_alive=hub_pid_alive_val,
+            primary_hit_is_compact=primary_hit_is_compact,
+            primary_hit_is_revert=primary_hit_is_revert,
         )
 
     @staticmethod
@@ -3840,7 +4852,7 @@ class AntigravityMonitorEngine:
         if not hist_timeline:
             hist_timeline = timeline
         tl_times = [t for t, _ in hist_timeline]
-        hist_switches = self._ledger.get_switch_timestamps(hist_cutoff)
+        hist_switches = self._ledger.get_switch_timestamps(hist_cutoff, timeline=hist_timeline)
 
         # Gather bounded set of transcripts modified within 15d (skip pure-today cached subagents; 10m TTL)
         cands: List[Tuple[float, str, Path]] = []
@@ -3863,6 +4875,7 @@ class AntigravityMonitorEngine:
         acct_all_events: Dict[str, List[Tuple[float, bool]]] = {}
         processed_hist_convs = 0
         for _mtime, cid, tp in cands[:600]:
+            self._maybe_yield_for_ui()
             cached = self._transcript_cache.get(cid)
             raw_steps: List[Dict[str, Any]]
             if cached is not None:
@@ -3870,67 +4883,83 @@ class AntigravityMonitorEngine:
                 if not raw_steps or float(raw_steps[0].get("timestamp", 0.0) or 0.0) >= upper_hist_ts:
                     continue
             else:
-                # Header-only scalar extraction strictly before content/thinking/tool_calls (with json.loads fallback + CHECKPOINT tracking)
+                # Binary pre-filter + header-only scalar extraction (verifying all present fields captured before skipping json.loads)
                 raw_steps = []
                 pending_cp = False
                 try:
-                    with tp.open("r", encoding="utf-8", errors="replace") as fh:
-                        for line in fh:
-                            if '"CHECKPOINT"' in line and '"PLANNER_RESPONSE"' not in line:
-                                head_cp = self._extract_head_before_blobs(line, 256)
-                                if '"CHECKPOINT"' in head_cp:
-                                    pending_cp = True
+                    with tp.open("rb") as fh:
+                        for raw_line in fh:
+                            has_pr = b'"PLANNER_RESPONSE"' in raw_line
+                            if not has_pr:
+                                if b'"CHECKPOINT"' in raw_line:
+                                    head_cp = self._extract_head_before_blobs(
+                                        raw_line[:320].decode("utf-8", errors="replace"),
+                                        256,
+                                    )
+                                    if '"CHECKPOINT"' in head_cp:
+                                        pending_cp = True
                                 continue
-                            if '"PLANNER_RESPONSE"' not in line or '"input_tokens"' not in line:
+                            if b'"input_tokens"' not in raw_line:
                                 continue
-                            head = self._extract_head_before_blobs(line, 512)
-                            m_in = _FAST_IN_TOK_RE.search(head)
-                            m_ts = _FAST_CREATED_AT_RE.search(head)
+                            head_raw = raw_line[:640].decode("utf-8", errors="replace")
+                            head = self._extract_head_before_blobs(head_raw, 640)
                             is_pr_head = ('"type":"PLANNER_RESPONSE"' in head) or ('"type": "PLANNER_RESPONSE"' in head)
-                            if is_pr_head and m_in and m_ts:
+                            m_in = _FAST_IN_TOK_RE.search(head) if is_pr_head else None
+                            m_ts = _FAST_CREATED_AT_RE.search(head) if is_pr_head else None
+                            m_cr = _FAST_CR_TOK_RE.search(head) if (is_pr_head and m_in and m_ts) else None
+                            m_out = _FAST_OUT_TOK_RE.search(head) if (is_pr_head and m_in and m_ts) else None
+                            m_si = _FAST_STEP_IDX_RE.search(head) if (is_pr_head and m_in and m_ts) else None
+                            m_mod = _FAST_MODEL_RE.search(head) if (is_pr_head and m_in and m_ts) else None
+                            fast_complete = (
+                                is_pr_head
+                                and (m_in is not None)
+                                and (m_ts is not None)
+                                and (m_cr is not None or b'"cache_read_tokens"' not in raw_line)
+                                and (m_out is not None or b'"output_tokens"' not in raw_line)
+                                and (m_si is not None or b'"step_index"' not in raw_line)
+                                and (m_mod is not None or b'"model"' not in raw_line)
+                            )
+                            if fast_complete:
+                                assert m_in is not None and m_ts is not None
                                 ts_v = parse_iso_timestamp(m_ts.group(1))
                                 if ts_v is None or ts_v < hist_cutoff:
                                     pending_cp = False
                                     continue
-                                m_cr = _FAST_CR_TOK_RE.search(head)
-                                m_out = _FAST_OUT_TOK_RE.search(head)
-                                m_si = _FAST_STEP_IDX_RE.search(head)
-                                m_mod = _FAST_MODEL_RE.search(head)
                                 raw_steps.append(
-                                    {
-                                        "step_index": int(m_si.group(1)) if m_si else len(raw_steps),
-                                        "timestamp": ts_v,
-                                        "model": m_mod.group(1) if m_mod else "",
-                                        "input_tokens": int(m_in.group(1)),
-                                        "cache_read_tokens": int(m_cr.group(1)) if m_cr else 0,
-                                        "output_tokens": int(m_out.group(1)) if m_out else 0,
-                                        "after_checkpoint": pending_cp,
-                                        "after_revert": False,
-                                    }
+                                    _RawStepSlot(
+                                        step_index=int(m_si.group(1)) if m_si else len(raw_steps),
+                                        timestamp=ts_v,
+                                        model=m_mod.group(1) if m_mod else "",
+                                        input_tokens=int(m_in.group(1)),
+                                        cache_read_tokens=int(m_cr.group(1)) if m_cr else 0,
+                                        output_tokens=int(m_out.group(1)) if m_out else 0,
+                                        after_checkpoint=pending_cp,
+                                        after_revert=False,
+                                    )
                                 )
                                 pending_cp = False
                             else:
                                 try:
-                                    obj = json.loads(line)
-                                except json.JSONDecodeError:
+                                    obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                                except (ValueError, TypeError):
                                     continue
-                                if obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
+                                if not isinstance(obj, dict) or obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
                                     continue
                                 ts_v = parse_iso_timestamp(str(obj.get("created_at", "") or ""))
                                 if ts_v is None or ts_v < hist_cutoff:
                                     pending_cp = False
                                     continue
                                 raw_steps.append(
-                                    {
-                                        "step_index": obj.get("step_index", len(raw_steps)),
-                                        "timestamp": ts_v,
-                                        "model": obj.get("model", ""),
-                                        "input_tokens": int(obj.get("input_tokens", 0) or 0),
-                                        "cache_read_tokens": int(obj.get("cache_read_tokens", 0) or 0),
-                                        "output_tokens": int(obj.get("output_tokens", 0) or 0),
-                                        "after_checkpoint": pending_cp,
-                                        "after_revert": False,
-                                    }
+                                    _RawStepSlot(
+                                        step_index=obj.get("step_index", len(raw_steps)),
+                                        timestamp=ts_v,
+                                        model=str(obj.get("model", "") or ""),
+                                        input_tokens=int(obj.get("input_tokens", 0) or 0),
+                                        cache_read_tokens=int(obj.get("cache_read_tokens", 0) or 0),
+                                        output_tokens=int(obj.get("output_tokens", 0) or 0),
+                                        after_checkpoint=pending_cp,
+                                        after_revert=False,
+                                    )
                                 )
                                 pending_cp = False
                 except OSError:
@@ -4545,6 +5574,7 @@ class AntigravityMonitorEngine:
         daily_steps_warn_override: Optional[int] = None,
         daily_steps_alert_override: Optional[int] = None,
         rolling_24h_steps: Optional[int] = None,
+        hub_pid_alive: bool = False,
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
@@ -4556,6 +5586,14 @@ class AntigravityMonitorEngine:
         # When Antigravity desktop client is not running (no live hub) and no very recent (<2m) active steps,
         # stay quietly in standby instead of alerting on stale pre-shutdown log disconnects.
         if not is_online and not has_live_transcript:
+            if hub_pid_alive:
+                return (
+                    "green",
+                    "WAIT",
+                    "已运行 · 等待账号响应",
+                    "检测到 Antigravity 服务运行中，正在等待账号状态响应",
+                    "",
+                )
             return ("green", "IDLE", "离线待机 · Antigravity 未运行", "客户端未启动，已暂停实时异常告警", "")
 
         # Only evaluate live language_server.log T2/T3 alerts while online or inspecting history.
@@ -4715,7 +5753,7 @@ class AntigravityMonitorEngine:
                 "red",
                 "T1",
                 f"T1 连续掉缓存{hist_head_tag} · {active_model}",
-                f"{hist_prefix}活跃会话已连续 {max_consec_miss} 步 cr=0，建议检查账号或切回主力号",
+                f"{hist_prefix}活跃会话已连续 {max_consec_miss} 步异常掉缓存，建议检查账号或切回主力号",
                 t2_recovering_warn or t2_recovered_info,
             )
         if severe_frequent_miss_conv is not None:
@@ -4724,7 +5762,7 @@ class AntigravityMonitorEngine:
                 "red",
                 "T1",
                 f"T1 频繁掉缓存{hist_head_tag} · {active_model}",
-                f"{hist_prefix}近 10 步异常归零 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
+                f"{hist_prefix}近 10 步异常掉缓存 {severe_frequent_miss_conv.abnormal_in_recent10}/{severe_frequent_miss_conv.cacheable_in_recent10} 步（有效命中仅 {pct}%），单步命中未恢复健康",
                 t2_recovering_warn or t2_recovered_info,
             )
         # Step thresholds are independent volume reminders and MUST NOT override
@@ -4766,9 +5804,9 @@ class AntigravityMonitorEngine:
             if max_consec_miss >= 2:
                 reasons.append(f"连续 {max_consec_miss} 步掉缓存(观察中)")
                 if any_single_miss:
-                    reasons.append("另含单步异常归零")
+                    reasons.append("另含单步异常掉缓存")
             elif any_single_miss:
-                reasons.append("单步异常归零")
+                reasons.append("单步异常掉缓存")
             elif unstable_recovery_conv is not None:
                 reasons.append(f"近10步 {unstable_recovery_conv.abnormal_in_recent10} 次掉缓存(观察恢复中)")
             if any_slow:
@@ -4864,14 +5902,14 @@ class AntigravityMonitorEngine:
                 if offending is not None:
                     key = f"t1:{offending.conversation_id}:{offending.consec_miss_start_step}"
                     candidates.append(
-                        (key, "Antigravity 疑似 T1 掉缓存", f"{offending.short_id} ({offending.model}) 已连续 {max_consec_miss} 步 cr=0")
+                        (key, "Antigravity 疑似 T1 掉缓存", f"{offending.short_id} ({offending.model}) 已连续 {max_consec_miss} 步异常掉缓存")
                     )
                 elif severe_frequent_miss_conv is not None:
                     c = severe_frequent_miss_conv
                     pct = int(round((c.recent10_hit_ratio or 0.0) * 100))
                     key = f"t1freq:{c.conversation_id}:{c.first_abnormal_step_in_recent10}"
                     candidates.append(
-                        (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步归零 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
+                        (key, "Antigravity 频繁掉缓存 (T1)", f"{c.short_id} 近 10 步异常掉缓存 {c.abnormal_in_recent10}/{c.cacheable_in_recent10} 步（有效命中仅 {pct}%）")
                     )
             else:
                 # Re-arm rolling-24h step alert only after dropping below 90% of limit or after a 6h cooldown (prevents 00:00 duplicate popups)
@@ -4921,17 +5959,19 @@ class AntigravityMonitorEngine:
         today_start: float,
         max_older: int = 16,
         hot_cutoff: Optional[float] = None,
-    ) -> List[Tuple[str, Path]]:
+    ) -> List[Tuple[str, Path, Tuple[int, int]]]:
         if not self.brain_dir.is_dir():
             return []
         eff_hot_cutoff = min(today_start, float(hot_cutoff)) if hot_cutoff is not None else today_start
-        today_items: List[Tuple[float, str, str]] = []
-        older_items: List[Tuple[float, str, str]] = []
+        today_items: List[Tuple[float, str, str, Tuple[int, int]]] = []
+        older_items: List[Tuple[float, str, str, Tuple[int, int]]] = []
         join = os.path.join
         stat = os.stat
         try:
             with os.scandir(self.brain_dir) as it:
-                for entry in it:
+                for idx_dir, entry in enumerate(it):
+                    if (idx_dir & 15) == 0:
+                        self._maybe_yield_for_ui()
                     if not entry.is_dir():
                         continue
                     tp_str = join(entry.path, ".system_generated", "logs", "transcript.jsonl")
@@ -4941,17 +5981,18 @@ class AntigravityMonitorEngine:
                         continue
                     if st.st_size <= 0 or st.st_mtime < lookback_cutoff:
                         continue
+                    stamp = (st.st_mtime_ns, st.st_size)
                     if st.st_mtime >= eff_hot_cutoff:
-                        today_items.append((st.st_mtime, entry.name, tp_str))
+                        today_items.append((st.st_mtime, entry.name, tp_str, stamp))
                     else:
-                        older_items.append((st.st_mtime, entry.name, tp_str))
+                        older_items.append((st.st_mtime, entry.name, tp_str, stamp))
         except OSError:
             return []
 
         today_items.sort(key=lambda item: item[0], reverse=True)
         older_items.sort(key=lambda item: item[0], reverse=True)
         merged = today_items + older_items[:max(16, int(max_older))]
-        return [(cid, Path(tp_str)) for _, cid, tp_str in merged]
+        return [(cid, Path(tp_str), stamp) for _, cid, tp_str, stamp in merged]
 
     def _get_local_media_size_cached(self, uri: str) -> int:
         """Resolve local media URI/path to regular-file byte size with bounded LRU (1024); strictly blocks UNC/null/devices."""
@@ -5006,230 +6047,517 @@ class AntigravityMonitorEngine:
             self._media_size_cache.popitem(last=False)
         return size_bytes
 
-    def _read_transcript_cached(self, conv_id: str, tp: Path) -> Tuple[List[Dict[str, Any]], bool, bool]:
-        try:
-            st = tp.stat()
-        except OSError:
-            self._transcript_cache.pop(conv_id, None)
-            self._transcript_error_ts.pop(conv_id, None)
-            self._transcript_tail_meta.pop(conv_id, None)
-            return [], False, False
+    def _read_transcript_cached(
+        self,
+        conv_id: str,
+        tp: Path,
+        prefetched_stamp: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[List[Any], bool, bool]:
+        if prefetched_stamp is not None:
+            stamp = prefetched_stamp
+            fallback_mtime = prefetched_stamp[0] / 1_000_000_000.0
+        else:
+            try:
+                st = tp.stat()
+            except OSError:
+                self._transcript_cache.pop(conv_id, None)
+                self._transcript_inc_state.pop(conv_id, None)
+                self._transcript_error_ts.pop(conv_id, None)
+                self._transcript_tail_meta.pop(conv_id, None)
+                return [], False, False
+            stamp = (st.st_mtime_ns, st.st_size)
+            fallback_mtime = st.st_mtime
 
-        stamp = (st.st_mtime_ns, st.st_size)
         cached = self._transcript_cache.get(conv_id)
         if cached is not None and cached[0] == stamp:
             self._transcript_cache.move_to_end(conv_id)
+            if conv_id in self._transcript_inc_state:
+                self._transcript_inc_state.move_to_end(conv_id)
             if conv_id in self._transcript_error_ts:
                 self._transcript_error_ts.move_to_end(conv_id)
             if conv_id in self._transcript_tail_meta:
                 self._transcript_tail_meta.move_to_end(conv_id)
             return cached[1], cached[2], cached[3]
 
-        parsed: List[Dict[str, Any]] = []
-        error_ts_list: List[Tuple[float, str, int, int, int]] = []
-        user_input_snaps: List[Tuple[float, int, int, int]] = []
-        has_user_explicit = False
-        has_subagent_marker = False
-        pending_checkpoint = False
-        pending_revert = False
-        seen_planner_idx: Optional[int] = None
-        max_step_ts: float = 0.0
-        last_known_ctx: int = 0
-        # Active multimodal attachments since last CHECKPOINT: list of (step_index, uri, size_bytes)
-        active_media: List[Tuple[int, str, int]] = []
-        active_media_keys: set[Tuple[int, str]] = set()
-        active_media_bytes_total: int = 0
+        def _parse_lines_into(
+            raw_lines: List[bytes],
+            state: Dict[str, Any],
+        ) -> bool:
+            parsed_l: List[Any] = state["parsed"]
+            error_l: List[Tuple[float, str, int, int, int]] = state["error_ts_list"]
+            u_snaps_l: List[Tuple[float, int, int, int]] = state["user_input_snaps"]
+            has_u: bool = state["has_user_explicit"]
+            has_sub: bool = state["has_subagent_marker"]
+            pend_cp: bool = state["pending_checkpoint"]
+            pend_cp_si: Optional[int] = state["pending_cp_si"]
+            pend_rev: bool = state["pending_revert"]
+            seen_pi: Optional[int] = state["seen_planner_idx"]
+            min_ts: float = state["min_step_ts"]
+            max_ts: float = state["max_step_ts"]
+            last_ctx: int = state["last_known_ctx"]
+            act_media: List[Tuple[int, str, int]] = state["active_media"]
+            act_media_keys: set[Tuple[int, str]] = state["active_media_keys"]
+            act_media_bytes: int = state["active_media_bytes_total"]
+            last_err_ts: float = state["last_error_ts"]
+            last_u_si: Optional[int] = state["last_user_si"]
+            did_revert = False
 
-        def _append_media_items(m_step_idx: int, media_list: Any) -> None:
-            nonlocal active_media_bytes_total
-            if not isinstance(media_list, list):
-                return
-            for m_item in media_list:
-                if not isinstance(m_item, dict):
-                    continue
-                uri = str(m_item.get("uri", "") or "").strip()
-                if not uri:
-                    continue
-                mkey = (m_step_idx, uri)
-                if mkey in active_media_keys:
-                    continue
-                active_media_keys.add(mkey)
-                sz = self._get_local_media_size_cached(uri)
-                active_media.append((m_step_idx, uri, sz))
-                active_media_bytes_total += sz
+            def _append_media_items(m_step_idx: int, media_list: Any) -> None:
+                nonlocal act_media_bytes
+                if not isinstance(media_list, list):
+                    return
+                for m_item in media_list:
+                    if not isinstance(m_item, dict):
+                        continue
+                    uri = str(m_item.get("uri", "") or "").strip()
+                    if not uri:
+                        continue
+                    mkey = (m_step_idx, uri)
+                    if mkey in act_media_keys:
+                        continue
+                    act_media_keys.add(mkey)
+                    sz = self._get_local_media_size_cached(uri)
+                    act_media.append((m_step_idx, uri, sz))
+                    act_media_bytes += sz
 
-        try:
-            with tp.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if not has_user_explicit and '"USER_EXPLICIT"' in line:
-                        has_user_explicit = True
-                    if not has_subagent_marker and (
-                        '"SUBAGENT"' in line or '"SWARM"' in line or "[swarm]" in line or '"source":"AGENT"' in line
-                    ):
-                        has_subagent_marker = True
-                    if '"ERROR_MESSAGE"' in line:
-                        try:
-                            err_obj = json.loads(line)
-                            if err_obj.get("type") == "ERROR_MESSAGE":
-                                ets = parse_iso_timestamp(str(err_obj.get("created_at", "") or ""))
-                                if ets is not None:
-                                    ec = str(err_obj.get("content", "") or "")[:160].lower()
-                                    # Point-in-time snapshot so later /compact NEVER erases historical heavy-media attribution
-                                    error_ts_list.append((ets, ec, len(active_media), active_media_bytes_total, last_known_ctx))
-                                continue
-                        except json.JSONDecodeError:
-                            pass
-                    if '"CHECKPOINT"' in line and '"PLANNER_RESPONSE"' not in line:
-                        try:
-                            chk_obj = json.loads(line)
-                            if chk_obj.get("type") == "CHECKPOINT":
-                                pending_checkpoint = True
-                                active_media.clear()
-                                active_media_keys.clear()
-                                active_media_bytes_total = 0
-                                last_known_ctx = 0
-                                continue
-                        except json.JSONDecodeError:
-                            pass
-                    if '"USER_INPUT"' in line and '"PLANNER_RESPONSE"' not in line:
-                        try:
-                            u_obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if u_obj.get("type") == "USER_INPUT":
-                            u_si = u_obj.get("step_index")
-                            u_ts = parse_iso_timestamp(str(u_obj.get("created_at", "") or ""))
-                            # Only treat regressed USER_INPUT as a real Undo/revert after at least one PLANNER_RESPONSE
-                            # has already completed (avoids false positives on first-turn 503 resend duplicates).
-                            if (
-                                isinstance(u_si, int)
-                                and seen_planner_idx is not None
-                                and u_ts is not None
-                                and u_si <= seen_planner_idx
-                                and (max_step_ts <= 0.0 or u_ts >= max_step_ts - 5.0)
-                            ):
-                                pending_revert = True
-                                seen_planner_idx = u_si
-                                if u_ts > max_step_ts:
-                                    max_step_ts = u_ts
-                                # Prune media from discarded branch BEFORE adding this new USER_INPUT's attachments
-                                active_media = [m for m in active_media if m[0] < u_si]
-                                active_media_keys = {(m[0], m[1]) for m in active_media}
-                                active_media_bytes_total = sum(m[2] for m in active_media)
-                                # Roll back last_known_ctx to the most recent surviving step before u_si
-                                prev_ctx = 0
-                                for prev_r in reversed(parsed):
-                                    p_si = prev_r.get("step_index")
-                                    if isinstance(p_si, int) and p_si < u_si:
-                                        prev_ctx = int(prev_r.get("input_tokens", 0) or 0) + int(prev_r.get("cache_read_tokens", 0) or 0)
-                                        break
-                                last_known_ctx = prev_ctx
-                            is_ooo_user_entry = (
-                                isinstance(u_si, int)
-                                and seen_planner_idx is not None
-                                and u_si < seen_planner_idx
-                                and u_ts is not None
-                                and max_step_ts > 0.0
-                                and u_ts < max_step_ts - 5.0
-                            )
-                            if u_obj.get("media") and not is_ooo_user_entry:
-                                _append_media_items(int(u_si) if isinstance(u_si, int) else (seen_planner_idx or 0), u_obj.get("media"))
-                            if u_ts is not None and not is_ooo_user_entry:
-                                user_input_snaps.append((u_ts, len(active_media), active_media_bytes_total, last_known_ctx))
-                            continue
-                    if '"PLANNER_RESPONSE"' not in line:
-                        # Lightweight multimodal attachment scan on non-PLANNER lines (e.g. GENERIC read_file images/audio/video)
-                        if '"media":' in line or '"media" :' in line:
-                            try:
-                                m_obj = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if m_obj.get("media"):
-                                m_si = m_obj.get("step_index")
-                                m_ts = parse_iso_timestamp(str(m_obj.get("created_at", "") or ""))
-                                # Skip delayed out-of-order historical GENERIC entries
-                                is_ooo_media = (
-                                    isinstance(m_si, int)
-                                    and seen_planner_idx is not None
-                                    and m_si < seen_planner_idx
-                                    and m_ts is not None
-                                    and max_step_ts > 0.0
-                                    and m_ts < max_step_ts - 5.0
-                                )
-                                if not is_ooo_media:
-                                    _append_media_items(int(m_si) if isinstance(m_si, int) else (seen_planner_idx or 0), m_obj.get("media"))
-                        continue
-                    if '"input_tokens"' not in line:
-                        continue
+            for raw_line in raw_lines:
+                if not raw_line:
+                    continue
+                if not has_u and b'"USER_EXPLICIT"' in raw_line:
+                    has_u = True
+                if not has_sub and (
+                    b'"SUBAGENT"' in raw_line
+                    or b'"SWARM"' in raw_line
+                    or b"[swarm]" in raw_line
+                    or b'"source":"AGENT"' in raw_line
+                    or b'"source": "AGENT"' in raw_line
+                ):
+                    has_sub = True
+
+                has_pr = b'"PLANNER_RESPONSE"' in raw_line
+                if b'"ERROR_MESSAGE"' in raw_line:
                     try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
+                        err_obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        if isinstance(err_obj, dict) and err_obj.get("type") == "ERROR_MESSAGE":
+                            ets = parse_iso_timestamp(str(err_obj.get("created_at", "") or ""))
+                            if ets is not None:
+                                ec = str(err_obj.get("content", "") or "")[:160].lower()
+                                error_l.append((ets, ec, len(act_media), act_media_bytes, last_ctx))
+                                if ets > last_err_ts:
+                                    last_err_ts = ets
+                            else:
+                                last_err_ts = max(last_err_ts, max_ts if max_ts > 0.0 else fallback_mtime)
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                if not has_pr and b'"CHECKPOINT"' in raw_line:
+                    try:
+                        chk_obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        if isinstance(chk_obj, dict) and chk_obj.get("type") == "CHECKPOINT":
+                            pend_cp = True
+                            chk_si = chk_obj.get("step_index")
+                            pend_cp_si = chk_si if isinstance(chk_si, int) else None
+                            pend_rev = False
+                            last_err_ts = 0.0
+                            act_media.clear()
+                            act_media_keys.clear()
+                            act_media_bytes = 0
+                            last_ctx = 0
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                if not has_pr and b'"USER_INPUT"' in raw_line:
+                    try:
+                        u_obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except (ValueError, TypeError):
                         continue
-                    if obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
-                        continue
-                    ts = parse_iso_timestamp(str(obj.get("created_at", "") or "")) or st.st_mtime
-                    raw_si = obj.get("step_index")
-                    is_rev = pending_revert
-                    if isinstance(raw_si, int):
-                        if is_rev:
-                            seen_planner_idx = raw_si
-                            if ts > max_step_ts:
-                                max_step_ts = ts
-                        elif (
-                            seen_planner_idx is not None
-                            and raw_si <= seen_planner_idx
-                            and (max_step_ts <= 0.0 or ts >= max_step_ts - 5.0)
+                    if isinstance(u_obj, dict) and u_obj.get("type") == "USER_INPUT":
+                        u_si = u_obj.get("step_index")
+                        u_ts = parse_iso_timestamp(str(u_obj.get("created_at", "") or ""))
+                        is_error_resend_user = (
+                            isinstance(u_si, int)
+                            and last_u_si is not None
+                            and u_si == last_u_si
+                            and last_err_ts > 0.0
+                            and (u_ts is None or (u_ts >= last_err_ts - 5.0 and (u_ts - last_err_ts) <= 30.0))
+                        )
+                        if (
+                            not is_error_resend_user
+                            and isinstance(u_si, int)
+                            and u_ts is not None
+                            and (max_ts <= 0.0 or u_ts >= max_ts - 5.0)
+                            and (
+                                (seen_pi is not None and u_si <= seen_pi)
+                                or (pend_cp and pend_cp_si is not None and u_si <= pend_cp_si)
+                            )
                         ):
-                            is_rev = True
-                            seen_planner_idx = raw_si
-                            if ts > max_step_ts:
-                                max_step_ts = ts
-                            active_media = [m for m in active_media if m[0] < raw_si]
-                            active_media_keys = {(m[0], m[1]) for m in active_media}
-                            active_media_bytes_total = sum(m[2] for m in active_media)
-                        elif seen_planner_idx is None or (raw_si > seen_planner_idx and ts >= max_step_ts - 60.0):
-                            seen_planner_idx = raw_si
-                            if ts > max_step_ts:
-                                max_step_ts = ts
-                    elif ts > max_step_ts:
-                        max_step_ts = ts
+                            pend_rev = True
+                            did_revert = True
+                            if pend_cp and (pend_cp_si is None or u_si <= pend_cp_si):
+                                pend_cp = False
+                                pend_cp_si = None
+                            seen_pi = u_si
+                            if u_ts > max_ts:
+                                max_ts = u_ts
+                            act_media = [m for m in act_media if m[0] < u_si]
+                            act_media_keys = {(m[0], m[1]) for m in act_media}
+                            act_media_bytes = sum(m[2] for m in act_media)
+                            prev_ctx = 0
+                            for prev_r in reversed(parsed_l):
+                                p_si = prev_r.step_index if isinstance(prev_r, _RawStepSlot) else prev_r.get("step_index")
+                                if isinstance(p_si, int) and p_si < u_si:
+                                    p_in = prev_r.input_tokens if isinstance(prev_r, _RawStepSlot) else int(prev_r.get("input_tokens", 0) or 0)
+                                    p_cr = prev_r.cache_read_tokens if isinstance(prev_r, _RawStepSlot) else int(prev_r.get("cache_read_tokens", 0) or 0)
+                                    prev_ctx = int(p_in) + int(p_cr)
+                                    break
+                            last_ctx = prev_ctx
+                        is_ooo_user_entry = (
+                            isinstance(u_si, int)
+                            and seen_pi is not None
+                            and u_si < seen_pi
+                            and u_ts is not None
+                            and max_ts > 0.0
+                            and u_ts < max_ts - 5.0
+                        )
+                        if not is_error_resend_user and not is_ooo_user_entry:
+                            last_err_ts = 0.0
+                        if isinstance(u_si, int) and not is_ooo_user_entry:
+                            last_u_si = u_si
+                        if u_obj.get("media") and not is_ooo_user_entry:
+                            _append_media_items(int(u_si) if isinstance(u_si, int) else (seen_pi or 0), u_obj.get("media"))
+                        if u_ts is not None and not is_ooo_user_entry:
+                            u_snaps_l.append((u_ts, len(act_media), act_media_bytes, last_ctx))
+                        continue
+
+                if not has_pr:
+                    if b'"media"' in raw_line:
+                        try:
+                            m_obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(m_obj, dict) and m_obj.get("media"):
+                            m_si = m_obj.get("step_index")
+                            m_ts = parse_iso_timestamp(str(m_obj.get("created_at", "") or ""))
+                            is_ooo_media = (
+                                isinstance(m_si, int)
+                                and seen_pi is not None
+                                and m_si < seen_pi
+                                and m_ts is not None
+                                and max_ts > 0.0
+                                and m_ts < max_ts - 5.0
+                            )
+                            if not is_ooo_media:
+                                _append_media_items(int(m_si) if isinstance(m_si, int) else (seen_pi or 0), m_obj.get("media"))
+                    continue
+
+                if b'"input_tokens"' not in raw_line:
+                    continue
+
+                # 640B scalar fast-path (mirrors history daily profile parser; skips 98%+ large JSON blobs)
+                fast_parsed = False
+                ts = fallback_mtime
+                raw_si: Any = None
+                inp_tok = 0
+                cr_tok = 0
+                out_tok = 0
+                model_str = ""
+                if b'"media"' not in raw_line:
+                    head_raw = raw_line[:640].decode("utf-8", errors="replace")
+                    head = self._extract_head_before_blobs(head_raw, 640)
+                    is_pr_head = ('"type":"PLANNER_RESPONSE"' in head) or ('"type": "PLANNER_RESPONSE"' in head)
+                    m_in = _FAST_IN_TOK_RE.search(head) if is_pr_head else None
+                    m_ts = _FAST_CREATED_AT_RE.search(head) if is_pr_head else None
+                    m_cr = _FAST_CR_TOK_RE.search(head) if (is_pr_head and m_in) else None
+                    m_out = _FAST_OUT_TOK_RE.search(head) if (is_pr_head and m_in) else None
+                    m_si = _FAST_STEP_IDX_RE.search(head) if (is_pr_head and m_in) else None
+                    m_mod = _FAST_MODEL_RE.search(head) if (is_pr_head and m_in) else None
+                    if (
+                        is_pr_head
+                        and (m_in is not None)
+                        and (m_ts is not None or b'"created_at"' not in raw_line)
+                        and (m_cr is not None or b'"cache_read_tokens"' not in raw_line)
+                        and (m_out is not None or b'"output_tokens"' not in raw_line)
+                        and (m_si is not None or b'"step_index"' not in raw_line)
+                        and (m_mod is not None or b'"model"' not in raw_line)
+                    ):
+                        ts = (parse_iso_timestamp(m_ts.group(1)) if m_ts is not None else None) or fallback_mtime
+                        raw_si = int(m_si.group(1)) if m_si is not None else None
+                        inp_tok = int(m_in.group(1))
+                        cr_tok = int(m_cr.group(1)) if m_cr is not None else 0
+                        out_tok = int(m_out.group(1)) if m_out is not None else 0
+                        model_str = m_mod.group(1) if m_mod is not None else ""
+                        fast_parsed = True
+
+                if not fast_parsed:
+                    try:
+                        obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("type") != "PLANNER_RESPONSE" or "input_tokens" not in obj:
+                        continue
+                    ts = parse_iso_timestamp(str(obj.get("created_at", "") or "")) or fallback_mtime
+                    raw_si = obj.get("step_index")
                     inp_tok = int(obj.get("input_tokens", 0) or 0)
                     cr_tok = int(obj.get("cache_read_tokens", 0) or 0)
-                    last_known_ctx = inp_tok + cr_tok
-                    parsed.append(
-                        {
-                            "step_index": raw_si if raw_si is not None else len(parsed),
-                            "timestamp": ts,
-                            "model": obj.get("model", ""),
-                            "input_tokens": inp_tok,
-                            "cache_read_tokens": cr_tok,
-                            "output_tokens": obj.get("output_tokens", 0),
-                            "after_checkpoint": pending_checkpoint,
-                            "after_revert": is_rev,
-                            "active_media_count": len(active_media),
-                            "active_media_bytes": active_media_bytes_total,
-                        }
+                    out_tok = int(obj.get("output_tokens", 0) or 0)
+                    model_str = str(obj.get("model", "") or "")
+
+                tot_tok = inp_tok + cr_tok
+                is_rev = pend_rev
+                is_err_retry_flag = False
+                if isinstance(raw_si, int):
+                    if is_rev:
+                        seen_pi = raw_si
+                        if ts > max_ts:
+                            max_ts = ts
+                    elif (
+                        seen_pi is not None
+                        and raw_si <= seen_pi
+                        and (max_ts <= 0.0 or ts >= max_ts - 5.0)
+                    ):
+                        is_ckpt_rebuild = pend_cp and (pend_cp_si is None or raw_si >= pend_cp_si)
+                        is_error_retry_pr = (
+                            raw_si == seen_pi
+                            and last_err_ts > 0.0
+                            and ts >= last_err_ts - 5.0
+                            and (ts - last_err_ts) <= 30.0
+                        )
+                        is_same_si_eq_ctx_cr = (
+                            raw_si == seen_pi
+                            and cr_tok > 0
+                            and last_ctx > 0
+                            and abs(tot_tok - last_ctx) <= max(2048, int(last_ctx * 0.02))
+                        )
+                        if is_ckpt_rebuild:
+                            seen_pi = raw_si
+                            if ts > max_ts:
+                                max_ts = ts
+                        elif is_error_retry_pr or is_same_si_eq_ctx_cr:
+                            is_err_retry_flag = bool(is_error_retry_pr)
+                            if ts > max_ts:
+                                max_ts = ts
+                        else:
+                            is_rev = True
+                            did_revert = True
+                            seen_pi = raw_si
+                            if ts > max_ts:
+                                max_ts = ts
+                            act_media = [m for m in act_media if m[0] < raw_si]
+                            act_media_keys = {(m[0], m[1]) for m in act_media}
+                            act_media_bytes = sum(m[2] for m in act_media)
+                    elif seen_pi is None or (raw_si > seen_pi and ts >= max_ts - 60.0):
+                        seen_pi = raw_si
+                        if ts > max_ts:
+                            max_ts = ts
+                elif ts > max_ts:
+                    max_ts = ts
+
+                if ts > 0.0:
+                    if min_ts <= 0.0 or ts < min_ts:
+                        min_ts = ts
+                    if ts > max_ts:
+                        max_ts = ts
+                last_ctx = tot_tok
+                parsed_l.append(
+                    _RawStepSlot(
+                        step_index=raw_si if raw_si is not None else len(parsed_l),
+                        timestamp=ts,
+                        model=model_str,
+                        input_tokens=inp_tok,
+                        cache_read_tokens=cr_tok,
+                        output_tokens=out_tok,
+                        after_checkpoint=pend_cp,
+                        after_revert=is_rev,
+                        active_media_count=len(act_media),
+                        active_media_bytes=act_media_bytes,
+                        is_error_retry=is_err_retry_flag,
                     )
-                    pending_checkpoint = False
-                    pending_revert = False
+                )
+                pend_cp = False
+                pend_cp_si = None
+                pend_rev = False
+                last_err_ts = 0.0
+
+            state["has_user_explicit"] = has_u
+            state["has_subagent_marker"] = has_sub
+            state["pending_checkpoint"] = pend_cp
+            state["pending_cp_si"] = pend_cp_si
+            state["pending_revert"] = pend_rev
+            state["seen_planner_idx"] = seen_pi
+            state["min_step_ts"] = min_ts
+            state["max_step_ts"] = max_ts
+            state["last_known_ctx"] = last_ctx
+            state["active_media"] = act_media
+            state["active_media_keys"] = act_media_keys
+            state["active_media_bytes_total"] = act_media_bytes
+            state["last_error_ts"] = last_err_ts
+            state["last_user_si"] = last_u_si
+            return did_revert
+
+        inc_state: Optional[Dict[str, Any]] = None
+        inc_done = False
+        new_offset = 0
+        new_tail_sig = b""
+        prev_inc = self._transcript_inc_state.get(conv_id)
+
+        try:
+            with tp.open("rb") as fh:
+                old_offset = int(prev_inc.get("parsed_offset", 0)) if prev_inc is not None else 0
+                prev_size = int(prev_inc.get("size", 0)) if prev_inc is not None else 0
+                prev_tail_sig: bytes = prev_inc.get("tail_sig", b"") if prev_inc is not None else b""
+                # Strictly require file growth past old_offset (or completion of a prior half-line) AND matching 64B tail_sig
+                # so same-size or variable-length full rewrites NEVER reuse stale cached steps!
+                if (
+                    cached is not None
+                    and prev_inc is not None
+                    and old_offset > 0
+                    and prev_tail_sig
+                    and stamp[1] > old_offset
+                    and (stamp[1] > prev_size or prev_size > old_offset)
+                ):
+                    sig_len = len(prev_tail_sig)
+                    try:
+                        fh.seek(max(0, old_offset - sig_len))
+                        actual_sig = fh.read(sig_len)
+                    except OSError:
+                        actual_sig = b""
+                    if actual_sig == prev_tail_sig and actual_sig.endswith(b"\n"):
+                        chunk = fh.read()
+                        last_nl = chunk.rfind(b"\n")
+                        if last_nl == -1:
+                            # Only a half-written line without trailing newline: NEVER consume half-line!
+                            self._transcript_cache[conv_id] = (stamp, cached[1], cached[2], cached[3])
+                            self._transcript_cache.move_to_end(conv_id)
+                            prev_inc["size"] = stamp[1]
+                            self._transcript_inc_state.move_to_end(conv_id)
+                            return cached[1], cached[2], cached[3]
+                        consumed = chunk[: last_nl + 1]
+                        temp_state: Dict[str, Any] = {
+                            "parsed": list(cached[1]),
+                            "error_ts_list": list(prev_inc["error_ts_list"]),
+                            "user_input_snaps": list(prev_inc["user_input_snaps"]),
+                            "has_user_explicit": bool(cached[2]),
+                            "has_subagent_marker": bool(cached[3]),
+                            "pending_checkpoint": bool(prev_inc["pending_checkpoint"]),
+                            "pending_cp_si": prev_inc["pending_cp_si"],
+                            "pending_revert": bool(prev_inc["pending_revert"]),
+                            "seen_planner_idx": prev_inc["seen_planner_idx"],
+                            "min_step_ts": float(prev_inc.get("min_step_ts", 0.0)),
+                            "max_step_ts": float(prev_inc["max_step_ts"]),
+                            "last_known_ctx": int(prev_inc["last_known_ctx"]),
+                            "active_media": list(prev_inc["active_media"]),
+                            "active_media_keys": set(prev_inc["active_media_keys"]),
+                            "active_media_bytes_total": int(prev_inc["active_media_bytes_total"]),
+                            "last_error_ts": float(prev_inc["last_error_ts"]),
+                            "last_user_si": prev_inc["last_user_si"],
+                        }
+                        try:
+                            did_rev = _parse_lines_into(consumed.splitlines(), temp_state)
+                        except Exception:
+                            did_rev = True
+                        if not did_rev:
+                            inc_state = temp_state
+                            new_offset = old_offset + len(consumed)
+                            new_tail_sig = (prev_tail_sig + consumed)[-64:]
+                            inc_done = True
+
+                if not inc_done:
+                    fh.seek(0)
+                    raw_bytes = fh.read()
+                    last_nl = raw_bytes.rfind(b"\n")
+                    if last_nl != -1:
+                        consumed = raw_bytes[: last_nl + 1]
+                        trailing = raw_bytes[last_nl + 1 :]
+                        new_offset = last_nl + 1
+                        new_tail_sig = consumed[-64:]
+                    else:
+                        consumed = b""
+                        trailing = raw_bytes
+                        new_offset = 0
+                        new_tail_sig = b""
+                    lines_to_parse = consumed.splitlines() if consumed else []
+                    if trailing:
+                        tr_strip = trailing.strip()
+                        # Only accept a complete trailing JSON object (legacy static files lacking final '\n');
+                        # never advance incremental offset past an unterminated line.
+                        if tr_strip.startswith(b"{") and tr_strip.endswith(b"}"):
+                            lines_to_parse.append(tr_strip)
+                            new_offset = 0
+                            new_tail_sig = b""
+                    full_state: Dict[str, Any] = {
+                        "parsed": [],
+                        "error_ts_list": [],
+                        "user_input_snaps": [],
+                        "has_user_explicit": False,
+                        "has_subagent_marker": False,
+                        "pending_checkpoint": False,
+                        "pending_cp_si": None,
+                        "pending_revert": False,
+                        "seen_planner_idx": None,
+                        "min_step_ts": 0.0,
+                        "max_step_ts": 0.0,
+                        "last_known_ctx": 0,
+                        "active_media": [],
+                        "active_media_keys": set(),
+                        "active_media_bytes_total": 0,
+                        "last_error_ts": 0.0,
+                        "last_user_si": None,
+                    }
+                    _parse_lines_into(lines_to_parse, full_state)
+                    inc_state = full_state
         except OSError:
             return (cached[1], cached[2], cached[3]) if cached is not None else ([], False, False)
 
+        assert inc_state is not None
+        parsed: List[Any] = inc_state["parsed"]
+        has_user_explicit: bool = inc_state["has_user_explicit"]
+        has_subagent_marker: bool = inc_state["has_subagent_marker"]
+        error_ts_list: List[Tuple[float, str, int, int, int]] = inc_state["error_ts_list"]
+        user_input_snaps: List[Tuple[float, int, int, int]] = inc_state["user_input_snaps"]
+        active_media: List[Tuple[int, str, int]] = inc_state["active_media"]
+        active_media_bytes_total: int = inc_state["active_media_bytes_total"]
+        last_known_ctx: int = inc_state["last_known_ctx"]
+
         self._transcript_cache[conv_id] = (stamp, parsed, has_user_explicit, has_subagent_marker)
         self._transcript_cache.move_to_end(conv_id)
-        while len(self._transcript_cache) > 512:
+        self._transcript_inc_state[conv_id] = {
+            "size": stamp[1],
+            "parsed_offset": new_offset,
+            "tail_sig": new_tail_sig,
+            "error_ts_list": error_ts_list[-16:],
+            "user_input_snaps": user_input_snaps[-16:],
+            "pending_checkpoint": inc_state["pending_checkpoint"],
+            "pending_cp_si": inc_state["pending_cp_si"],
+            "pending_revert": inc_state["pending_revert"],
+            "seen_planner_idx": inc_state["seen_planner_idx"],
+            "min_step_ts": inc_state["min_step_ts"],
+            "max_step_ts": inc_state["max_step_ts"],
+            "last_known_ctx": last_known_ctx,
+            "active_media": active_media,
+            "active_media_keys": inc_state["active_media_keys"],
+            "active_media_bytes_total": active_media_bytes_total,
+            "last_error_ts": inc_state["last_error_ts"],
+            "last_user_si": inc_state["last_user_si"],
+        }
+        self._transcript_inc_state.move_to_end(conv_id)
+        while len(self._transcript_cache) > 320:
             # Evict strictly by oldest file mtime_ns (prevents descending-order scan LRU inversion from dropping the hottest conv!)
             evicted_cid = min(
                 self._transcript_cache.keys(),
                 key=lambda k: self._transcript_cache[k][0][0],
             )
             self._transcript_cache.pop(evicted_cid, None)
+            self._transcript_inc_state.pop(evicted_cid, None)
             self._transcript_error_ts.pop(evicted_cid, None)
             self._transcript_tail_meta.pop(evicted_cid, None)
+        while len(self._transcript_inc_state) > 320:
+            self._transcript_inc_state.popitem(last=False)
         if error_ts_list:
             self._transcript_error_ts[conv_id] = error_ts_list[-16:]
             self._transcript_error_ts.move_to_end(conv_id)
-            while len(self._transcript_error_ts) > 512:
+            while len(self._transcript_error_ts) > 320:
                 # Evict by oldest latest error timestamp rather than insertion order (prevents descending-scan LRU inversion)
                 oldest_ecid = min(
                     self._transcript_error_ts.keys(),
@@ -5246,7 +6574,7 @@ class AntigravityMonitorEngine:
                 last_known_ctx,
             )
             self._transcript_tail_meta.move_to_end(conv_id)
-            while len(self._transcript_tail_meta) > 512:
+            while len(self._transcript_tail_meta) > 320:
                 oldest_tcid = min(
                     self._transcript_tail_meta.keys(),
                     key=lambda k: self._transcript_tail_meta[k][0][-1][0] if self._transcript_tail_meta[k][0] else 0.0,
@@ -5447,6 +6775,11 @@ class AntigravityMonitorEngine:
             exp_cold_steps = sum(1 for s in steps if s.classification == "expected_cold")
             cacheable_total = hit_steps + abn_steps
             overall_ratio = (hit_steps / cacheable_total) if cacheable_total > 0 else None
+            cacheable_cr_sum = sum(s.cache_read_tokens for s in steps if s.classification in ("hit", "abnormal_miss"))
+            cacheable_tok_sum = sum(s.total_tokens for s in steps if s.classification in ("hit", "abnormal_miss"))
+            cacheable_token_hit_ratio: Optional[float] = (
+                (cacheable_cr_sum / cacheable_tok_sum) * 100.0 if cacheable_tok_sum > 0 else None
+            )
 
             ttfts = sorted(p.ttft_sec for p in points if p.ttft_sec is not None)
             avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
@@ -5476,7 +6809,7 @@ class AntigravityMonitorEngine:
                 age = now - latest.timestamp
                 if age <= self.config["freshness_window_sec"] + 300:
                     if latest.classification == "abnormal_miss":
-                        fresh_invalid = f"无热缓存 (连掉 {consec_miss} 步)" if consec_miss >= 2 else "本步 cr=0 无热缓存"
+                        fresh_invalid = _format_freshness_invalid_reason(consec_miss, latest.reason)
                     else:
                         fresh_rem = int(self.config["freshness_window_sec"] - age)
 
@@ -5512,6 +6845,7 @@ class AntigravityMonitorEngine:
                 revert_count=revert_count,
                 scope_label=scope_label,
                 consec_miss=consec_miss,
+                cacheable_token_hit_ratio=cacheable_token_hit_ratio,
             )
 
     def _poll_hub_titles(self, port: int, token: str) -> None:
@@ -5526,7 +6860,7 @@ class AntigravityMonitorEngine:
                     "Connect-Protocol-Version": "1",
                 },
             )
-            with urllib.request.urlopen(req, timeout=1.2) as resp:
+            with _open_localhost_url(req, timeout=1.2) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             summaries = data.get("trajectorySummaries") or {}
             if isinstance(summaries, dict):
@@ -5536,12 +6870,18 @@ class AntigravityMonitorEngine:
                     summary = str(entry.get("summary") or "").strip()
                     if summary:
                         self._conv_titles[str(cid)] = summary
-        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError):
             pass
 
     def _load_vscdb_titles_cached(self) -> Dict[str, str]:
         """Read-only offline fallback for conversation titles from Antigravity state.vscdb."""
-        if self.vscdb_path is None or not self.vscdb_path.is_file():
+        if self.vscdb_path is None:
+            return self._vscdb_titles_cache
+        if self._in_poll and self._vscdb_last_stat_poll_seq == self._poll_seq:
+            return self._vscdb_titles_cache
+        if self._in_poll:
+            self._vscdb_last_stat_poll_seq = self._poll_seq
+        if not self.vscdb_path.is_file():
             return self._vscdb_titles_cache
         try:
             st = self.vscdb_path.stat()
@@ -5669,208 +7009,503 @@ class AntigravityMonitorEngine:
             info.five_hour_reset_at = chosen.five_hour_reset_at
             info.weekly_reset_at = chosen.weekly_reset_at
 
+    @staticmethod
+    def _sanitize_rpc_error(exc: BaseException) -> str:
+        if isinstance(exc, urllib.error.HTTPError):
+            return f"HTTPError({exc.code})"
+        if isinstance(exc, urllib.error.URLError):
+            reason = getattr(exc, "reason", None)
+            rname = type(reason).__name__ if reason is not None else "URLError"
+            return f"URLError({rname})"
+        return type(exc).__name__
+
     def _poll_account_and_quota(self, now: float, active_family: str = "gemini") -> AccountQuotaInfo:
         info = AccountQuotaInfo(observed_at=now, quota_family=active_family)
-        self._active_hub_pid = 0
-        self._active_hub_port = 0
-        self._active_hub_token = ""
         live_email = ""
-        if self.daemon_dir.is_dir():
-            try:
-                hub_files = sorted(
-                    self.daemon_dir.glob("hub_*.json"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-            except OSError:
-                hub_files = []
+        prev_active_pid = self._active_hub_pid
+        prev_active_port = self._active_hub_port
+        prev_active_token = self._active_hub_token
+        prev_active_cft = self._active_hub_creation_ft
 
-            for hp in hub_files[:40]:
+        any_hub_pid_alive = False
+        max_http_probes = 8
+        http_probes_used = 0
+        probed_endpoints: set[Tuple[int, int, str]] = set()
+        last_err_kind = ""
+        last_err_port = 0
+        hub_file_count = 0
+
+        def _try_hub_endpoint(
+            pid: int,
+            port: int,
+            token: str,
+            *,
+            allow_alive_fallback: bool,
+            timeout: float = 1.5,
+            record_error: bool = True,
+        ) -> bool:
+            nonlocal live_email, any_hub_pid_alive, http_probes_used, last_err_kind, last_err_port
+            if not (1 <= port <= 65535) or not token or ("\r" in token) or ("\n" in token):
+                return False
+            ep = (pid, port, token)
+            if ep in probed_endpoints:
+                return False
+            probed_endpoints.add(ep)
+            http_probes_used += 1
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                    data=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-codeium-csrf-token": token,
+                        "Connect-Protocol-Version": "1",
+                    },
+                )
+                with _open_localhost_url(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid GetUserStatus JSON payload")
+                status = payload.get("userStatus") or {}
+                if not isinstance(status, dict):
+                    status = {}
+                live_email = str(status.get("email", "") or "")
+                info.email_masked = mask_email(live_email)
+                info.short_label = short_email_label(live_email)
+                info.tier = str((status.get("userTier") or {}).get("id", "") or "")
+                plan_info = (status.get("planStatus") or {}).get("planInfo") or {}
+                plan_name = str(plan_info.get("planName", "") or "").strip()
+                teams_tier = str(plan_info.get("teamsTier", "") or "").strip()
+                if plan_name and teams_tier and teams_tier.lower() not in plan_name.lower():
+                    info.plan_status = f"{plan_name} ({teams_tier})"
+                else:
+                    info.plan_status = plan_name or teams_tier
+                info.online = True
+                any_hub_pid_alive = True
+                self._active_hub_pid = pid
+                self._active_hub_port = port
+                self._active_hub_token = token
+                self._active_hub_creation_ft = _get_windows_pid_creation_ft(pid)
+
+                configs = (status.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
+                pools: Dict[str, QuotaPoolInfo] = {}
+                for cfg in configs:
+                    if not isinstance(cfg, dict):
+                        continue
+                    lbl = str(cfg.get("label", "") or "")
+                    mid = str((cfg.get("modelOrAlias") or {}).get("model", "") or "")
+                    if mid and lbl:
+                        mkey = mid.strip().upper()
+                        self._model_enum_map[mkey] = lbl.strip()
+                        self._model_enum_map.move_to_end(mkey)
+                        while len(self._model_enum_map) > 256:
+                            self._model_enum_map.popitem(last=False)
+                    qinfo = cfg.get("quotaInfo") or {}
+                    frac = qinfo.get("remainingFraction")
+                    reset_raw = qinfo.get("resetTime")
+                    if frac is None and not reset_raw:
+                        continue
+                    pool_name = self._classify_model_pool(lbl, mid)
+                    pool = pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
+                    pool.model_count += 1
+                    if frac is not None:
+                        pct_val = round(float(frac) * 100.0, 2)
+                        if pool.five_hour_pct is None or pct_val < pool.five_hour_pct:
+                            pool.five_hour_pct = pct_val
+                    norm_reset = _normalize_reset_time(reset_raw)
+                    if norm_reset and not pool.five_hour_reset_at:
+                        pool.five_hour_reset_at = norm_reset
+
+                info.pools = pools
+                self._sync_account_active_pool(info, active_family)
+                email_changed = live_email.lower() != self._last_weekly_email.lower()
+                if email_changed or (now - self._last_titles_poll_ts >= 15.0):
+                    self._poll_hub_titles(port, token)
+                    self._last_titles_poll_ts = now
+                return True
+            except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError) as exc:
+                if record_error:
+                    last_err_kind = self._sanitize_rpc_error(exc)
+                    last_err_port = port
+                if (
+                    allow_alive_fallback
+                    and not any_hub_pid_alive
+                    and _is_hub_language_server_pid(
+                        pid,
+                        expected_active_pid=prev_active_pid,
+                        expected_creation_ft=prev_active_cft,
+                    )
+                ):
+                    any_hub_pid_alive = True
+                return False
+
+        # 1. Fast path: probe cached active Hub first if its PID is still the exact same live process
+        if (
+            prev_active_pid > 0
+            and prev_active_port > 0
+            and prev_active_token
+            and self._is_cached_hub_still_same_process()
+        ):
+            _try_hub_endpoint(
+                prev_active_pid,
+                prev_active_port,
+                prev_active_token,
+                allow_alive_fallback=True,
+            )
+
+        # 2. Race-safe full scan of daemon_dir/hub_*.json (no [:40] truncation, bounded by max_http_probes)
+        if not info.online and self.daemon_dir.is_dir():
+            try:
+                raw_hub_files = list(self.daemon_dir.glob("hub_*.json"))
+            except OSError:
+                raw_hub_files = []
+            hub_entries: List[Tuple[float, Path]] = []
+            for hp in raw_hub_files:
+                try:
+                    hub_entries.append((hp.stat().st_mtime, hp))
+                except OSError:
+                    continue
+            hub_entries.sort(key=lambda item: item[0], reverse=True)
+            hub_file_count = len(hub_entries)
+
+            fallback_alive_hubs: List[Tuple[int, int, str]] = []
+            for _mtime, hp in hub_entries:
                 try:
                     hub = json.loads(hp.read_text(encoding="utf-8"))
+                    if not isinstance(hub, dict):
+                        continue
                     pid = int(hub.get("pid", 0) or 0)
                     port = int(hub.get("httpPort", 0) or 0)
                     token = str(hub.get("csrfToken", "") or "")
-                    if not (pid and port and token and _is_windows_pid_alive(pid)):
-                        continue
-                    req = urllib.request.Request(
-                        f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus",
-                        data=b"{}",
-                        headers={
-                            "Content-Type": "application/json",
-                            "x-codeium-csrf-token": token,
-                            "Connect-Protocol-Version": "1",
-                        },
-                    )
-                    with urllib.request.urlopen(req, timeout=1.5) as resp:
-                        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-                    status = payload.get("userStatus") or {}
-                    live_email = str(status.get("email", "") or "")
-                    info.email_masked = mask_email(live_email)
-                    info.short_label = short_email_label(live_email)
-                    info.tier = str((status.get("userTier") or {}).get("id", "") or "")
-                    plan_info = (status.get("planStatus") or {}).get("planInfo") or {}
-                    plan_name = str(plan_info.get("planName", "") or "").strip()
-                    teams_tier = str(plan_info.get("teamsTier", "") or "").strip()
-                    if plan_name and teams_tier and teams_tier.lower() not in plan_name.lower():
-                        info.plan_status = f"{plan_name} ({teams_tier})"
-                    else:
-                        info.plan_status = plan_name or teams_tier
-                    info.online = True
-                    self._active_hub_pid = pid
-                    self._active_hub_port = port
-                    self._active_hub_token = token
-
-                    configs = (status.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
-                    pools: Dict[str, QuotaPoolInfo] = {}
-                    for cfg in configs:
-                        if not isinstance(cfg, dict):
-                            continue
-                        lbl = str(cfg.get("label", "") or "")
-                        mid = str((cfg.get("modelOrAlias") or {}).get("model", "") or "")
-                        if mid and lbl:
-                            mkey = mid.strip().upper()
-                            self._model_enum_map[mkey] = lbl.strip()
-                            self._model_enum_map.move_to_end(mkey)
-                            while len(self._model_enum_map) > 256:
-                                self._model_enum_map.popitem(last=False)
-                        qinfo = cfg.get("quotaInfo") or {}
-                        frac = qinfo.get("remainingFraction")
-                        reset_raw = qinfo.get("resetTime")
-                        if frac is None and not reset_raw:
-                            continue
-                        pool_name = self._classify_model_pool(lbl, mid)
-                        pool = pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
-                        pool.model_count += 1
-                        if frac is not None:
-                            pct_val = round(float(frac) * 100.0, 2)
-                            if pool.five_hour_pct is None or pct_val < pool.five_hour_pct:
-                                pool.five_hour_pct = pct_val
-                        norm_reset = _normalize_reset_time(reset_raw)
-                        if norm_reset and not pool.five_hour_reset_at:
-                            pool.five_hour_reset_at = norm_reset
-
-                    info.pools = pools
-                    self._sync_account_active_pool(info, active_family)
-                    email_changed = live_email.lower() != self._last_weekly_email.lower()
-                    if email_changed or (now - self._last_titles_poll_ts >= 15.0):
-                        self._poll_hub_titles(port, token)
-                        self._last_titles_poll_ts = now
-                    break
-                except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     continue
+                if not (pid > 0 and 1 <= port <= 65535 and token):
+                    continue
+                if os.name == "nt":
+                    pid_alive, exe_name, creation_ft = _inspect_windows_pid(pid)
+                    if not pid_alive:
+                        continue
+                    is_ls_proc = bool(
+                        (exe_name and ("language_server" in exe_name or exe_name in ("antigravity.exe", "antigravity")))
+                        or (
+                            prev_active_pid > 0
+                            and pid == prev_active_pid
+                            and (
+                                (prev_active_cft > 0 and creation_ft > 0 and creation_ft == prev_active_cft)
+                                or (prev_active_cft <= 0 and not exe_name)
+                            )
+                        )
+                    )
+                    allow_fallback_probe = bool((not is_ls_proc) and (pid == os.getpid() or not exe_name))
+                else:
+                    if not _is_windows_pid_alive(pid):
+                        continue
+                    is_ls_proc = bool(prev_active_pid > 0 and pid == prev_active_pid)
+                    allow_fallback_probe = not is_ls_proc
+                if is_ls_proc:
+                    any_hub_pid_alive = True
+                    if http_probes_used < max_http_probes:
+                        if _try_hub_endpoint(pid, port, token, allow_alive_fallback=True):
+                            break
+                    else:
+                        break
+                elif allow_fallback_probe and len(fallback_alive_hubs) < max_http_probes:
+                    fallback_alive_hubs.append((pid, port, token))
 
-        # Only enrich from Cockpit when live Antigravity session is online and email matches strictly
-        # Throttle Cockpit SQLite opens to 15s while reusing same-email weekly cache (always refresh immediately on switch)
-        if info.online and live_email and self.cockpit_quota_db.is_file():
+            # 3. Fallback HTTP probe ONLY for same-PID test servers or access-denied unnamed PIDs:
+            #    Uses short timeout & never pollutes last_err_kind or sets any_hub_pid_alive=True on failure.
+            if not info.online:
+                for pid, port, token in fallback_alive_hubs:
+                    if http_probes_used >= max_http_probes:
+                        break
+                    if _try_hub_endpoint(
+                        pid,
+                        port,
+                        token,
+                        allow_alive_fallback=False,
+                        timeout=0.25,
+                        record_error=False,
+                    ):
+                        break
+
+        # Enrich weekly quota: prefer official live Hub RetrieveUserQuotaSummary (~7ms local RPC,
+        # matches official View Usage popup in real time without depending on Cockpit); fall back to
+        # read-only Cockpit SQLite ONLY when older Antigravity builds lack the RPC or return no weekly pool.
+        if info.online and live_email:
             email_low = live_email.lower()
-            if email_low != self._last_weekly_email.lower() or (now - self._last_weekly_poll_ts >= 15.0):
-                self._enrich_weekly_from_cockpit(info, live_email, now)
+            if email_low != self._last_weekly_email.lower() or (now - self._last_weekly_poll_ts >= 30.0):
+                got_live_weekly = False
+                if self._active_hub_port > 0 and self._active_hub_token:
+                    got_live_weekly = self._poll_live_quota_summary(
+                        self._active_hub_port,
+                        self._active_hub_token,
+                        info,
+                    )
+                if not got_live_weekly and self.cockpit_quota_db.is_file():
+                    self._enrich_weekly_from_cockpit(info, live_email, now)
                 self._last_weekly_email = email_low
                 self._last_weekly_poll_ts = now
                 self._last_weekly_pools = {
-                    pn: (pl.weekly_pct, pl.weekly_reset_at)
+                    pn: (pl.weekly_pct, pl.weekly_reset_at, pl.five_hour_pct, pl.five_hour_reset_at)
                     for pn, pl in info.pools.items()
                 }
             else:
-                for pn, (wk_pct, wk_rst) in self._last_weekly_pools.items():
+                for pn, (wk_pct, wk_rst, fh_pct, fh_rst) in self._last_weekly_pools.items():
                     pool = info.pools.get(pn)
+                    if pool is None and (wk_pct is not None or fh_pct is not None):
+                        pool = info.pools.setdefault(pn, QuotaPoolInfo(name=pn))
                     if pool is not None:
                         if wk_pct is not None:
                             pool.weekly_pct = wk_pct
                         if wk_rst:
                             pool.weekly_reset_at = wk_rst
+                        if pool.five_hour_pct is None and fh_pct is not None:
+                            pool.five_hour_pct = fh_pct
+                        if not pool.five_hour_reset_at and fh_rst:
+                            pool.five_hour_reset_at = fh_rst
             self._sync_account_active_pool(info, active_family)
-        elif not info.online:
-            self._last_weekly_email = ""
-            self._last_weekly_pools = {}
+
+        self._last_probe_any_hub_pid_alive = bool(info.online or any_hub_pid_alive)
+        self._last_probe_seq += 1
+        self._last_probe_diag = {
+            "err": "" if info.online else last_err_kind,
+            "port": self._active_hub_port if info.online else last_err_port,
+            "probes": http_probes_used,
+            "files": hub_file_count,
+            "any_alive": self._last_probe_any_hub_pid_alive,
+        }
         return info
+
+    def _poll_live_quota_summary(
+        self,
+        port: int,
+        token: str,
+        info: AccountQuotaInfo,
+        *,
+        timeout: float = 1.5,
+    ) -> bool:
+        """Query Antigravity's native localhost RetrieveUserQuotaSummary RPC for live weekly/5h pools."""
+        if not (1 <= port <= 65535) or not token or ("\r" in token) or ("\n" in token):
+            return False
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-codeium-csrf-token": token,
+                    "Connect-Protocol-Version": "1",
+                },
+            )
+            with _open_localhost_url(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        root = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+        groups = root.get("groups")
+        if not isinstance(groups, list):
+            return False
+        got_weekly = False
+        for grp in groups:
+            if not isinstance(grp, dict):
+                continue
+            g_name = str(grp.get("displayName", "") or "").lower()
+            buckets = grp.get("buckets")
+            if not isinstance(buckets, list):
+                continue
+            for bkt in buckets:
+                if not isinstance(bkt, dict):
+                    continue
+                bid = str(bkt.get("bucketId", "") or "").lower()
+                win = str(bkt.get("window", "") or "").lower()
+                pool_name = ""
+                if "gemini" in bid or "gemini" in g_name:
+                    pool_name = "gemini"
+                elif "3p" in bid or "claude" in g_name or "gpt" in g_name:
+                    pool_name = "3p"
+                if not pool_name:
+                    continue
+                is_weekly = (win == "weekly") or ("weekly" in bid)
+                is_5h = (win == "5h") or ("5h" in bid)
+                if not is_weekly and not is_5h:
+                    continue
+                frac = bkt.get("remainingFraction")
+                pct_val: Optional[float] = None
+                if isinstance(frac, (int, float)) and not isinstance(frac, bool):
+                    fval = float(frac)
+                    if math.isfinite(fval):
+                        pct_val = round(max(0.0, min(100.0, fval * 100.0)), 2)
+                reset_iso = _normalize_reset_time(bkt.get("resetTime"))
+                if pct_val is None and not reset_iso:
+                    continue
+                pool = info.pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
+                if is_weekly:
+                    if pct_val is not None:
+                        pool.weekly_pct = pct_val
+                        got_weekly = True
+                    if reset_iso:
+                        pool.weekly_reset_at = reset_iso
+                elif is_5h:
+                    if pool.five_hour_pct is None and pct_val is not None:
+                        pool.five_hour_pct = pct_val
+                    if reset_iso and not pool.five_hour_reset_at:
+                        pool.five_hour_reset_at = reset_iso
+        return got_weekly
+
+    @staticmethod
+    def _file_stamp_3(p: Path) -> Tuple[int, int, int]:
+        try:
+            st = p.stat()
+            return (int(st.st_ino), int(st.st_size), int(st.st_mtime_ns))
+        except OSError:
+            return (0, 0, 0)
 
     def _enrich_weekly_from_cockpit(self, info: AccountQuotaInfo, raw_email: str, now: float) -> None:
         cockpit_dir = self.cockpit_quota_db.parent
-        bound_acc_id = ""
-
-        # 1. Exact email match in Cockpit's read-only antigravity_accounts.sqlite
         acc_db = cockpit_dir / "antigravity_accounts.sqlite"
-        if acc_db.is_file():
-            try:
-                resolved_adb = acc_db.resolve().as_posix()
-                enc_adb = urllib.parse.quote(resolved_adb, safe="/:")
-                uri_adb = f"file:///{enc_adb}?mode=ro" if not enc_adb.startswith("/") else f"file://{enc_adb}?mode=ro"
-                aconn = sqlite3.connect(uri_adb, uri=True, timeout=0.3)
-                try:
-                    row = aconn.execute(
-                        "SELECT account_id FROM summaries WHERE LOWER(email) = LOWER(?) LIMIT 1",
-                        (raw_email,),
-                    ).fetchone()
-                    if row and row[0]:
-                        bound_acc_id = str(row[0])
-                finally:
-                    aconn.close()
-            except sqlite3.Error:
-                pass
-
-        # 2. Exact email match in Cockpit accounts.json
         accounts_json = cockpit_dir / "accounts.json"
-        if not bound_acc_id and accounts_json.is_file():
-            try:
-                data = json.loads(accounts_json.read_text(encoding="utf-8"))
-                for acc in data.get("accounts") or []:
-                    if isinstance(acc, dict) and str(acc.get("email", "")).lower() == raw_email.lower():
-                        bound_acc_id = str(acc.get("id") or acc.get("account_id") or "")
-                        if bound_acc_id:
-                            break
-            except (OSError, json.JSONDecodeError):
-                pass
+        cockpit_wal = Path(str(self.cockpit_quota_db) + "-wal")
+        acc_wal = Path(str(acc_db) + "-wal")
+        email_low = (raw_email or "").lower()
 
-        # Never fall back to unrelated bindAccountId when email doesn't match (prevents cross-account pollution)
-        if not bound_acc_id:
-            return
+        cache_key = (
+            email_low,
+            self._file_stamp_3(self.cockpit_quota_db),
+            self._file_stamp_3(cockpit_wal),
+            self._file_stamp_3(acc_db),
+            self._file_stamp_3(acc_wal),
+            self._file_stamp_3(accounts_json),
+        )
+
+        if self._cockpit_weekly_cache_key == cache_key:
+            first_rows = self._cockpit_weekly_cache_rows
+        else:
+            bound_acc_id = ""
+            acc_db_err = False
+            # 1. Exact email match in Cockpit's read-only antigravity_accounts.sqlite
+            if acc_db.is_file():
+                try:
+                    resolved_adb = acc_db.resolve().as_posix()
+                    enc_adb = urllib.parse.quote(resolved_adb, safe="/:")
+                    uri_adb = f"file:///{enc_adb}?mode=ro" if not enc_adb.startswith("/") else f"file://{enc_adb}?mode=ro"
+                    aconn = sqlite3.connect(uri_adb, uri=True, timeout=0.3)
+                    try:
+                        row = aconn.execute(
+                            "SELECT account_id FROM summaries WHERE LOWER(email) = LOWER(?) LIMIT 1",
+                            (raw_email,),
+                        ).fetchone()
+                        if row and row[0]:
+                            bound_acc_id = str(row[0])
+                    finally:
+                        aconn.close()
+                except sqlite3.Error:
+                    acc_db_err = True
+
+            # 2. Exact email match in Cockpit accounts.json
+            if not bound_acc_id and accounts_json.is_file():
+                try:
+                    data = json.loads(accounts_json.read_text(encoding="utf-8"))
+                    for acc in data.get("accounts") or []:
+                        if isinstance(acc, dict) and str(acc.get("email", "")).lower() == email_low:
+                            bound_acc_id = str(acc.get("id") or acc.get("account_id") or "")
+                            if bound_acc_id:
+                                break
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            first_rows = {}
+            db_ok = not (acc_db_err and not bound_acc_id)
+            # Never fall back to unrelated bindAccountId when email doesn't match (prevents cross-account pollution)
+            if bound_acc_id:
+                try:
+                    resolved = self.cockpit_quota_db.resolve().as_posix()
+                    encoded = urllib.parse.quote(resolved, safe="/:")
+                    uri = f"file:///{encoded}?mode=ro" if not encoded.startswith("/") else f"file://{encoded}?mode=ro"
+                    conn = sqlite3.connect(uri, uri=True, timeout=0.3)
+                    try:
+                        cur = conn.cursor()
+                        cols = {str(r[1]).lower() for r in cur.execute("PRAGMA table_info(quota_observations)").fetchall()}
+                        has_reset_col = "reset_at" in cols
+                        has_pk_prefix = ("platform" in cols) and ("account_created_at" in cols)
+                        metrics_4 = ("gemini-weekly", "gemini-5h", "3p-weekly", "3p-5h")
+                        reset_expr = "reset_at" if has_reset_col else "NULL"
+
+                        def _safe_obs_float(v: Any) -> float:
+                            try:
+                                return float(v or 0.0)
+                            except (ValueError, TypeError):
+                                return 0.0
+
+                        if has_pk_prefix:
+                            # Fast PK full-prefix path (WITHOUT ROWID native Cockpit schema: ~15ms vs ~400ms scan)
+                            created_rows = [
+                                r[0]
+                                for r in cur.execute(
+                                    "SELECT DISTINCT account_created_at FROM quota_observations "
+                                    "WHERE platform = 'antigravity' AND account_id = ?",
+                                    (bound_acc_id,),
+                                ).fetchall()
+                            ]
+                            pk_sql = (
+                                f"SELECT remaining, observed_at, {reset_expr} FROM quota_observations "
+                                "WHERE platform = 'antigravity' AND account_id = ? AND account_created_at = ? AND metric = ? "
+                                "ORDER BY observed_at DESC LIMIT 1"
+                            )
+                            for m_name in metrics_4:
+                                best_row: Optional[Tuple[Any, float, Any]] = None
+                                for ca in created_rows:
+                                    r = cur.execute(pk_sql, (bound_acc_id, ca, m_name)).fetchone()
+                                    if r is not None:
+                                        obs_f = _safe_obs_float(r[1])
+                                        if best_row is None or obs_f > best_row[1]:
+                                            best_row = (r[0], obs_f, r[2])
+                                if best_row is not None:
+                                    first_rows[m_name] = best_row
+                        else:
+                            # Legacy / simplified test schema fallback (WITHOUT ROWID safe: never reference rowid)
+                            sel_sql = (
+                                f"SELECT metric, remaining, observed_at, {reset_expr} FROM quota_observations "
+                                "WHERE account_id = ? AND metric IN ('gemini-weekly','gemini-5h','3p-weekly','3p-5h') "
+                                "ORDER BY observed_at DESC"
+                            )
+                            for row in cur.execute(sel_sql, (bound_acc_id,)):
+                                m_name = str(row[0] or "")
+                                if m_name and m_name not in first_rows:
+                                    first_rows[m_name] = (row[1], _safe_obs_float(row[2]), row[3])
+                                    if len(first_rows) >= 4:
+                                        break
+                    finally:
+                        conn.close()
+                except sqlite3.Error:
+                    db_ok = False
+            if db_ok:
+                self._cockpit_weekly_cache_key = cache_key
+                self._cockpit_weekly_cache_rows = first_rows
 
         stale_cutoff_sec = now - 7 * 86400
-
-        try:
-            resolved = self.cockpit_quota_db.resolve().as_posix()
-            encoded = urllib.parse.quote(resolved, safe="/:")
-            uri = f"file:///{encoded}?mode=ro" if not encoded.startswith("/") else f"file://{encoded}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=0.3)
-            try:
-                cur = conn.cursor()
-                cols = {str(r[1]).lower() for r in cur.execute("PRAGMA table_info(quota_observations)").fetchall()}
-                has_reset_col = "reset_at" in cols
-                sel_sql = (
-                    "SELECT remaining, observed_at, reset_at FROM quota_observations "
-                    "WHERE account_id = ? AND metric = ? ORDER BY observed_at DESC LIMIT 1"
-                    if has_reset_col
-                    else "SELECT remaining, observed_at, NULL FROM quota_observations "
-                    "WHERE account_id = ? AND metric = ? ORDER BY observed_at DESC LIMIT 1"
-                )
-                for pool_name in ("gemini", "3p"):
-                    for kind in ("weekly", "5h"):
-                        metric = f"{pool_name}-{kind}"
-                        row = cur.execute(sel_sql, (bound_acc_id, metric)).fetchone()
-                        if not row or row[0] is None:
-                            continue
-                        obs_raw = float(row[1] or 0)
-                        obs_sec = obs_raw / 1000.0 if obs_raw > 1e11 else obs_raw
-                        if obs_sec and obs_sec < stale_cutoff_sec:
-                            continue
-                        val = round(float(row[0]), 2)
-                        reset_iso = _normalize_reset_time(row[2])
-                        pool = info.pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
-                        if kind == "weekly":
-                            pool.weekly_pct = val
-                            if reset_iso:
-                                pool.weekly_reset_at = reset_iso
-                        else:
-                            if pool.five_hour_pct is None:
-                                pool.five_hour_pct = val
-                            if reset_iso and not pool.five_hour_reset_at:
-                                pool.five_hour_reset_at = reset_iso
-            finally:
-                conn.close()
-        except sqlite3.Error:
-            pass
+        for pool_name in ("gemini", "3p"):
+            for kind in ("weekly", "5h"):
+                row = first_rows.get(f"{pool_name}-{kind}")
+                if row is None or row[0] is None:
+                    continue
+                obs_raw = float(row[1] or 0.0)
+                obs_sec = obs_raw / 1000.0 if obs_raw > 1e11 else obs_raw
+                if obs_sec and obs_sec < stale_cutoff_sec:
+                    continue
+                val = round(float(row[0]), 2)
+                reset_iso = _normalize_reset_time(row[2])
+                pool = info.pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
+                if kind == "weekly":
+                    pool.weekly_pct = val
+                    if reset_iso:
+                        pool.weekly_reset_at = reset_iso
+                else:
+                    if pool.five_hour_pct is None:
+                        pool.five_hour_pct = val
+                    if reset_iso and not pool.five_hour_reset_at:
+                        pool.five_hour_reset_at = reset_iso
 
 
 def _align_steps_with_gen_history(
@@ -6040,6 +7675,7 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "short_label": snap.account.short_label,
             "email_masked": snap.account.email_masked,
             "online": snap.account.online,
+            "hub_pid_alive": bool(getattr(snap, "hub_pid_alive", False)),
             "tier": snap.account.tier,
             "plan_status": snap.account.plan_status,
             "quota_family": snap.account.quota_family,
@@ -6099,6 +7735,8 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "primary_hit_rate": round(snap.primary_hit_rate, 2) if snap.primary_hit_rate is not None else None,
             "primary_hit_classification": snap.primary_hit_classification,
             "primary_hit_reason": snap.primary_hit_reason,
+            "primary_hit_is_compact": getattr(snap, "primary_hit_is_compact", False),
+            "primary_hit_is_revert": getattr(snap, "primary_hit_is_revert", False),
             "consec_miss": snap.max_consec_miss,
             "t1_consec_threshold": T1_CONSEC_MISS_THRESHOLD,
             "max_abnormal_recent10": snap.max_abnormal_recent10,
@@ -6228,11 +7866,16 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
     title_part = f"{report.title} ({report.short_id})" if report.title else report.short_id
     scope_part = f" · 视角 {report.scope_label}" if getattr(report, "scope_label", "") else ""
     rev_s = f" | 回溯 {report.revert_count} 次" if report.revert_count > 0 else ""
+    tok_hit_part = (
+        f" | Token命中 {report.cacheable_token_hit_ratio:.1f}%"
+        if getattr(report, "cacheable_token_hit_ratio", None) is not None
+        else ""
+    )
     lines = [
         f"Antigravity 单对话长线体检 ({title_part} · {role} · {model_overview}{scope_part})",
         f"步数概况: 总计 {report.total_steps} 步 (今日 {report.today_steps} 步) | 压缩 {report.compact_count} 次{rev_s}",
         f"请求体规模: 当前 {format_tokens(report.latest_context_tokens)} ({format_delta_tokens(report.latest_context_delta)}) | 峰值 {format_tokens(report.peak_context_tokens)}",
-        f"缓存统计: 有效命中率 {hit_ratio} (命中 {report.cache_hit_steps} / 异常归零 {report.abnormal_miss_steps} / 正常冷启 {report.expected_cold_steps})",
+        f"缓存统计: 有效命中率 {hit_ratio}{tok_hit_part} (命中 {report.cache_hit_steps} / 异常掉缓存 {report.abnormal_miss_steps} / 正常冷启 {report.expected_cold_steps})",
         f"速度统计: TTFT 均 {avg_t} / P95 {p95_t} / 峰 {max_t} | 平均吞吐 {avg_p}",
     ]
     cur_mc = report.points[-1].active_media_count if report.points else 0
@@ -6254,14 +7897,18 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f}t/s" if pt.tps is not None else "—"
-        if pt.is_revert and pt.reason == "cached":
-            r_tag = "回溯·命中"
-        elif getattr(pt, "is_compact", False) and pt.reason == "cached":
-            r_tag = "压缩·命中"
-        elif getattr(pt, "is_account_switch", False) and pt.reason == "cached":
-            r_tag = "换号·命中"
+        base_tag = CACHE_REASON_CN_MAP.get(pt.reason, pt.reason)
+        if pt.reason in ("cached", "cached_diluted"):
+            if pt.is_revert:
+                r_tag = f"回溯·{base_tag}"
+            elif getattr(pt, "is_compact", False):
+                r_tag = f"压缩·{base_tag}"
+            elif getattr(pt, "is_account_switch", False):
+                r_tag = f"换号·{base_tag}"
+            else:
+                r_tag = base_tag
         else:
-            r_tag = CACHE_REASON_CN_MAP.get(pt.reason, pt.reason)
+            r_tag = base_tag
         m_part = f" │ 图{pt.active_media_count}({format_media_size(pt.active_media_bytes)})" if pt.active_media_count > 0 else ""
         lines.append(
             f"  #{pt.step_index:<4} {hm} │ [{pt.model}] │ {format_tokens(pt.total_tokens):>6} ({format_delta_tokens(pt.context_delta):>7}){m_part} "
@@ -6270,12 +7917,23 @@ def format_detail_text_report(report: ConversationDetailReport) -> str:
     return mask_email("\n".join(lines))
 
 
-def _format_hit_with_cold_badge(hit_rate: Optional[float], classification: str, reason: str) -> str:
+def _format_hit_with_cold_badge(
+    hit_rate: Optional[float],
+    classification: str,
+    reason: str,
+    *,
+    is_compact: bool = False,
+) -> str:
     if hit_rate is None:
         return "—"
-    if classification == "expected_cold" and hit_rate < 0.05:
+    if classification == "expected_cold":
         badge = COLD_SHORT_BADGE_MAP.get(reason, "冷启")
         return f"{hit_rate:.1f}%({badge})"
+    if classification == "abnormal_miss" and reason == "partial_miss":
+        badge = COLD_SHORT_BADGE_MAP.get(reason, "部分失")
+        return f"{hit_rate:.1f}%({badge})"
+    if is_compact and classification == "hit":
+        return f"{hit_rate:.1f}%(压缩)"
     return f"{hit_rate:.1f}%"
 
 
@@ -6286,6 +7944,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         snap.primary_hit_rate,
         snap.primary_hit_classification,
         getattr(snap, "primary_hit_reason", ""),
+        is_compact=bool(getattr(snap, "primary_hit_is_compact", False)),
     )
     tps_str = f"{snap.primary_tps:.1f} tok/s" if snap.primary_tps is not None else "—"
     ttft_str = f"{snap.primary_ttft:.1f}s" if snap.primary_ttft is not None else "—"
@@ -6385,8 +8044,14 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         for c in ordered:
             tag = "[子]" if c.is_subagent else "[主]"
             bar = "".join(
-                "█" if s.classification == "hit"
-                else ("◇" if s.reason == "compact_reset" else ("▒" if s.classification == "expected_cold" else "×"))
+                "!" if (s.classification == "abnormal_miss" and s.reason == "partial_miss")
+                else (
+                    "×" if s.classification == "abnormal_miss"
+                    else (
+                        "◇" if ((s.is_compact or s.reason == "compact_reset") and not s.is_revert)
+                        else ("▒" if (s.is_revert or s.classification == "expected_cold") else "█")
+                    )
+                )
                 for s in c.recent_steps
             )
             delta_s = f"({format_delta_tokens(c.latest_context_delta)})" if c.latest_context_delta != 0 else ""
@@ -6400,6 +8065,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
                 c.latest_hit_rate,
                 last_st.classification if last_st is not None else "",
                 c.latest_cache_reason or (last_st.reason if last_st is not None else ""),
+                is_compact=bool(last_st.is_compact) if last_st is not None else False,
             )
             title_s = f" {truncate_display_width(c.title, 20)}" if c.title else ""
             lines.append(
@@ -6414,6 +8080,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
                 tc.latest_hit_rate,
                 tc_last.classification if tc_last is not None else "",
                 tc.latest_cache_reason or (tc_last.reason if tc_last is not None else ""),
+                is_compact=bool(tc_last.is_compact) if tc_last is not None else False,
             )
             tc_media_s = f" | 多模态 图{tc.active_media_count}({format_media_size(tc.active_media_bytes)})" if tc.active_media_count > 0 else ""
             lines.append(
@@ -6423,7 +8090,7 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         else:
             lines.append(f"定向对话 ({snap.target_conversation_query}): 未找到匹配记录")
     if snap.wasted_cold_tokens_total > 0 and (snap.max_consec_miss >= 1 or snap.max_abnormal_recent10 >= 2):
-        lines.append(f"冷算提醒: 近 10 步异常归零累计多耗约 {format_tokens(snap.wasted_cold_tokens_total)} Token")
+        lines.append(f"冷算提醒: 近 10 步异常掉缓存累计多耗约 {format_tokens(snap.wasted_cold_tokens_total)} Token")
     return mask_email("\n".join(lines))
 
 

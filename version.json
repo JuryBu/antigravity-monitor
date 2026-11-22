@@ -1,8 +1,8 @@
 {
-  "version": "7.2.3",
+  "version": "7.2.5",
   "channel": "main",
-  "released_at": "2026-11-22",
+  "released_at": "2026-11-23",
   "repo": "JuryBu/antigravity-monitor",
   "branch": "main",
-  "summary": "主步数进度条升级动态滚动24小时滑窗、历史自适应升级为小时桶24h沉淀峰值，并将T1连续掉缓存门槛升至3步"
+  "summary": "根治无代理直连/受限重启/物理分窗与Win32内核原生拖拽；接入官方实时周额直连；对齐14天历史缓存边界并全面压降内存与CPU"
 }

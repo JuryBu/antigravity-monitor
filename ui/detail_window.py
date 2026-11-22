@@ -20,6 +20,31 @@ from core.log_monitor import (
     is_severe_freshness_invalid,
     truncate_display_width,
 )
+try:
+    from core.log_monitor import resolve_cache_visual_tier
+except ImportError:
+    def resolve_cache_visual_tier(
+        classification: str,
+        reason: str = "",
+        *,
+        is_compact: bool = False,
+        is_revert: bool = False,
+    ) -> str:
+        """Return canonical visual color tier: 'red' | 'purple' | 'orange' | 'green'."""
+        if classification == "abnormal_miss":
+            return "red"
+        if (is_compact or reason == "compact_reset") and not is_revert:
+            return "purple"
+        if is_revert or classification == "expected_cold":
+            return "orange"
+        return "green"
+
+from ui.window_drag import SmoothWindowDragger
+
+_CACHE_REASON_CN_FALLBACK: Dict[str, str] = {
+    "partial_miss": "部分失效",
+    "cached_diluted": "命中·新输入稀释",
+}
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
@@ -85,6 +110,7 @@ def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any
             "abnormal_miss_steps": 0,
             "expected_cold_steps": 0,
             "cacheable_hit_ratio": None,
+            "cacheable_token_hit_ratio": None,
             "avg_ttft_sec": None,
             "p95_ttft_sec": None,
             "max_ttft_sec": None,
@@ -97,17 +123,24 @@ def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any
         1
         for p in pts
         if (not getattr(p, "is_revert", False) and p.reason != "revert_reset")
-        and (
-            getattr(p, "is_compact", False)
-            or p.reason == "compact_reset"
-            or (p.context_delta <= -32000 and p.total_tokens < (p.total_tokens - p.context_delta) * 0.75)
-        )
+        and (getattr(p, "is_compact", False) or p.reason == "compact_reset")
     )
     hit_steps = sum(1 for p in pts if p.classification == "hit")
     abn_steps = sum(1 for p in pts if p.classification == "abnormal_miss")
     exp_cold_steps = sum(1 for p in pts if p.classification == "expected_cold")
     cacheable_total = hit_steps + abn_steps
     hit_ratio = (hit_steps / cacheable_total) if cacheable_total > 0 else None
+    cacheable_cr_sum = sum(
+        int(p.cache_read_tokens)
+        for p in pts
+        if p.classification in ("hit", "abnormal_miss")
+    )
+    cacheable_tok_sum = sum(
+        int(p.total_tokens)
+        for p in pts
+        if p.classification in ("hit", "abnormal_miss")
+    )
+    token_hit_ratio = (cacheable_cr_sum / float(cacheable_tok_sum) * 100.0) if cacheable_tok_sum > 0 else None
 
     ttfts = sorted(p.ttft_sec for p in pts if p.ttft_sec is not None)
     avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
@@ -134,6 +167,7 @@ def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any
         "abnormal_miss_steps": abn_steps,
         "expected_cold_steps": exp_cold_steps,
         "cacheable_hit_ratio": hit_ratio,
+        "cacheable_token_hit_ratio": token_hit_ratio,
         "avg_ttft_sec": avg_ttft,
         "p95_ttft_sec": p95_ttft,
         "max_ttft_sec": max_ttft,
@@ -178,10 +212,8 @@ class ConversationDetailWindow:
         self._hovering_chart: bool = False
         self._locked_size: Optional[Tuple[int, int]] = None
         self._last_canvas_sizes: Dict[str, Tuple[int, int]] = {}
-        self._drag_ox: int = 0
-        self._drag_oy: int = 0
-        self._win_ox: int = 0
-        self._win_oy: int = 0
+        self._dragging: bool = False
+        self._pending_sync_snap: Optional[MonitorSnapshot] = None
         self._closed: bool = False
         self._after_ids: List[str] = []
 
@@ -192,7 +224,16 @@ class ConversationDetailWindow:
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.97)
         self.win.bind("<Escape>", lambda _e: self.close())
+        self.win.bind("<FocusOut>", self._on_focus_out)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._dragger: Optional[SmoothWindowDragger] = SmoothWindowDragger(
+            self.win,
+            move_threshold=0,
+            on_drag_start=self._on_dragger_started,
+            on_drag_end=self._on_dragger_ended,
+            on_drag_cancel=self._on_dragger_cancelled,
+            size_provider=self._lock_window_size,
+        )
 
         self._outer = tk.Frame(self.win, padx=1, pady=1)
         self._outer.pack(fill="both", expand=True)
@@ -233,6 +274,7 @@ class ConversationDetailWindow:
         for w in (self._hdr, self._lbl_role, self._lbl_title, self._lbl_sub):
             w.bind("<ButtonPress-1>", self._on_drag_start)
             w.bind("<B1-Motion>", self._on_drag_move)
+            w.bind("<ButtonRelease-1>", self._on_drag_end)
 
         # 4-column KPI cards
         self._kpi_row = tk.Frame(self._surface)
@@ -409,6 +451,9 @@ class ConversationDetailWindow:
     ) -> None:
         if self._closed:
             return
+        self._pending_sync_snap = None
+        if self._dragger is not None:
+            self._dragger.finish_or_cancel(commit=self._dragger.moved)
         self._conv_id = conv_id
         self._last_sync_sig = None
         self._hovering_chart = False
@@ -453,6 +498,9 @@ class ConversationDetailWindow:
     def sync_from_snapshot(self, snap: MonitorSnapshot) -> None:
         """Keep the open detail modal dynamically in sync with the main 2.5s poll loop."""
         if self._closed or not self._conv_id:
+            return
+        if self._dragging:
+            self._pending_sync_snap = snap
             return
         conv = next((c for c in snap.active_conversations if c.conversation_id == self._conv_id), None)
         if conv is None:
@@ -515,17 +563,41 @@ class ConversationDetailWindow:
         y = max(vy + 12, min(vb - h - 48, py))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _on_focus_out(self, _event: tk.Event) -> None:
+        if self._dragger is not None:
+            self._dragger.finish_or_cancel(commit=self._dragger.moved)
+
     def _on_drag_start(self, event: tk.Event) -> None:
-        self._drag_ox = event.x_root
-        self._drag_oy = event.y_root
-        self._win_ox = self.win.winfo_x()
-        self._win_oy = self.win.winfo_y()
+        if self._dragger is not None:
+            self._dragger.on_start(event)
 
     def _on_drag_move(self, event: tk.Event) -> None:
-        nx = self._win_ox + (event.x_root - self._drag_ox)
-        ny = self._win_oy + (event.y_root - self._drag_oy)
-        w, h = self._lock_window_size()
-        self.win.geometry(f"{w}x{h}+{nx}+{ny}")
+        if self._dragger is not None:
+            self._dragger.on_move(event)
+
+    def _on_drag_end(self, event: tk.Event) -> None:
+        if self._dragger is not None:
+            self._dragger.on_end(event)
+
+    def _on_dragger_started(self) -> None:
+        self._dragging = True
+
+    def _flush_pending_sync(self) -> None:
+        self._dragging = False
+        pending = self._pending_sync_snap
+        self._pending_sync_snap = None
+        if pending is not None and not self._closed:
+            self.sync_from_snapshot(pending)
+
+    def _on_dragger_ended(self, _moved: bool) -> None:
+        self._flush_pending_sync()
+
+    def _on_dragger_cancelled(self) -> None:
+        self._flush_pending_sync()
+
+    def check_drag_watchdog(self) -> None:
+        if not self._closed and self._dragger is not None:
+            self._dragger.check_release_watchdog()
 
     def _set_window_mode(self, mode: str) -> None:
         if mode not in ("60", "all"):
@@ -685,10 +757,17 @@ class ConversationDetailWindow:
             if (abn >= 4 or (hit_ratio is not None and hit_ratio < 0.85 and abn > 0))
             else (t["orange"] if abn > 0 else t["text_secondary"])
         )
-        self._kpi_cards[1]["sub"].configure(
-            text=f"命中 {wstats['cache_hit_steps']} · 异常 {abn} · 冷 {wstats['expected_cold_steps']}",
-            fg=sub_col,
-        )
+        tok_pct = wstats.get("cacheable_token_hit_ratio")
+        if tok_pct is None and not is_sliced_60:
+            rep_tok = getattr(rep, "cacheable_token_hit_ratio", None)
+            if rep_tok is not None:
+                tok_pct = float(rep_tok)
+        if tok_pct is not None:
+            kpi2_sub = f"中{wstats['cache_hit_steps']} 异{abn} 冷{wstats['expected_cold_steps']} · Token {tok_pct:.1f}%"
+            self._kpi_cards[1]["sub"].configure(text=kpi2_sub, fg=sub_col, font=(UI_FONT, 7))
+        else:
+            kpi2_sub = f"命中 {wstats['cache_hit_steps']} · 异常 {abn} · 冷 {wstats['expected_cold_steps']}"
+            self._kpi_cards[1]["sub"].configure(text=kpi2_sub, fg=sub_col, font=(UI_FONT, 8))
 
         # KPI 3: TTFT (mean colored strictly by mean on unified 4-tier scale; tail P95/max colored separately)
         avg_ttft = wstats["avg_ttft_sec"]
@@ -1009,25 +1088,33 @@ class ConversationDetailWindow:
         y_base = pad_t + plot_h
         # Draw in priority order when very dense so red misses & purple compactions stay crisp on top
         bar_w = max(2.0, min(9.0, (plot_w / float(max(1, n))) * 0.78))
-        order = sorted(
-            range(n),
-            key=lambda i: 3 if pts[i].classification == "abnormal_miss" else (2 if pts[i].reason == "compact_reset" else (1 if pts[i].classification == "expected_cold" else 0)),
-        )
+        tier_priority = {"red": 3, "purple": 2, "orange": 1, "green": 0}
+        pt_tiers = [
+            resolve_cache_visual_tier(
+                pt.classification,
+                pt.reason,
+                is_compact=bool(getattr(pt, "is_compact", False)),
+                is_revert=bool(getattr(pt, "is_revert", False)),
+            )
+            for pt in pts
+        ]
+        order = sorted(range(n), key=lambda i: tier_priority.get(pt_tiers[i], 0))
         for idx in order:
             pt = pts[idx]
+            tier = pt_tiers[idx]
             x = self._x_for_idx(idx, n, pad_l, plot_w)
-            if pt.classification == "hit":
-                col = t["green"]
-                ratio = max(0.2, min(1.0, pt.hit_rate / 100.0))
-            elif pt.reason == "compact_reset":
-                col = t["purple"]
+            col = t[tier]
+            has_cache_read = (int(getattr(pt, "cache_read_tokens", 0) or 0) > 0) or (pt.hit_rate > 0.05)
+            if has_cache_read:
+                ratio = max(0.16, min(1.0, pt.hit_rate / 100.0))
+            elif tier == "red":
+                ratio = 1.0
+            elif tier == "purple":
                 ratio = 0.74
-            elif pt.classification == "expected_cold":
-                col = t["orange"]
+            elif tier == "orange":
                 ratio = 0.56
             else:
-                col = t["red"]
-                ratio = 1.0
+                ratio = max(0.16, min(1.0, pt.hit_rate / 100.0))
             yy = y_base - plot_h * ratio
             cv.create_rectangle(x - bar_w / 2.0, yy, x + bar_w / 2.0, y_base, fill=col, outline="")
 
@@ -1095,14 +1182,22 @@ class ConversationDetailWindow:
         hm = datetime.datetime.fromtimestamp(pt.timestamp).strftime("%m-%d %H:%M:%S") if pt.timestamp > 0 else "-- --:--:--"
         t_s = f"{pt.ttft_sec:.1f}s" if pt.ttft_sec is not None else "—"
         p_s = f"{pt.tps:.0f} t/s" if pt.tps is not None else "—"
-        if getattr(pt, "is_revert", False) and pt.reason == "cached":
-            tag = "回溯·命中"
-        elif getattr(pt, "is_compact", False) and pt.reason == "cached":
-            tag = "压缩·命中"
-        elif getattr(pt, "is_account_switch", False) and pt.reason == "cached":
-            tag = "换号·命中"
+        is_rev = bool(getattr(pt, "is_revert", False))
+        is_cmp = bool(getattr(pt, "is_compact", False))
+        is_acc_sw = bool(getattr(pt, "is_account_switch", False))
+        base_tag = CACHE_REASON_CN_MAP.get(pt.reason, _CACHE_REASON_CN_FALLBACK.get(pt.reason, pt.reason))
+        if pt.reason in ("cached", "cached_diluted"):
+            hit_label = "命中" if pt.reason == "cached" else "稀释命中"
+            if is_rev:
+                tag = f"回溯·{hit_label}"
+            elif is_cmp:
+                tag = f"压缩·{hit_label}"
+            elif is_acc_sw:
+                tag = f"换号·{hit_label}"
+            else:
+                tag = base_tag
         else:
-            tag = CACHE_REASON_CN_MAP.get(pt.reason, pt.reason)
+            tag = base_tag
         mod_s = truncate_display_width(pt.model or "未知模型", 14)
         disp_prefix = "选定" if prefix == "选定步" else ("最新" if prefix == "最新步" else prefix)
         m_cnt = int(getattr(pt, "active_media_count", 0) or 0)
@@ -1113,41 +1208,69 @@ class ConversationDetailWindow:
             f"({format_delta_tokens(pt.context_delta)}){m_seg} │ {pt.hit_rate:.1f}% [{tag}] │ 首字 {t_s} │ {p_s}"
         )
         t = self.theme
-        fg = (
-            t["red"]
-            if pt.classification == "abnormal_miss"
-            else (
-                t["orange"]
-                if (getattr(pt, "is_revert", False) or pt.reason == "revert_reset")
-                else (
-                    t["purple"]
-                    if (getattr(pt, "is_compact", False) or pt.reason == "compact_reset")
-                    else (
-                        t["cyan"]
-                        if (getattr(pt, "is_account_switch", False) or pt.reason == "account_switch")
-                        else (t["orange"] if pt.classification == "expected_cold" else t["text_primary"])
-                    )
-                )
-            )
+        tier = resolve_cache_visual_tier(
+            pt.classification,
+            pt.reason,
+            is_compact=is_cmp,
+            is_revert=is_rev,
         )
+        if tier == "green":
+            fg = t["cyan"] if (is_acc_sw or pt.reason == "account_switch") else t["green"]
+        else:
+            fg = t[tier]
         self._lbl_readout.configure(text=msg, fg=fg)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._dragging = False
+        self._pending_sync_snap = None
+        dragger = self._dragger
+        self._dragger = None
+        if dragger is not None:
+            dragger.cancel()
+            dragger._on_drag_start = None
+            dragger._on_drag_end = None
+            dragger._on_drag_cancel = None
+            dragger._size_provider = None
+            dragger._win = None  # type: ignore[assignment]
         for aid in list(self._after_ids):
             try:
                 self.win.after_cancel(aid)
             except tk.TclError:
                 pass
         self._after_ids.clear()
+        for ch in self._charts.values():
+            cv = ch.get("canvas")
+            if cv is not None:
+                try:
+                    cv.delete("all")
+                except tk.TclError:
+                    pass
+        self._charts.clear()
+        self._kpi_cards.clear()
+        self._range_btns.clear()
+        self._act_btns.clear()
+        self._report = None
+        self._display_points.clear()
+        self._chart_meta.clear()
+        self._current_wstats.clear()
+        self._last_canvas_sizes.clear()
+        self._last_sync_sig = None
         try:
             self.win.destroy()
         except tk.TclError:
             pass
-        if self._on_closed is not None:
+        cb = self._on_closed
+        self._on_closed = None
+        if cb is not None:
             try:
-                self._on_closed()
+                cb()
             except Exception:
                 pass
+        self._load_report = None  # type: ignore[assignment]
+        self._on_toggle_pin = None  # type: ignore[assignment]
+        self._is_pinned_fn = None  # type: ignore[assignment]
+        self._apply_rounding_fn = None
+        self._screen_bounds_fn = None

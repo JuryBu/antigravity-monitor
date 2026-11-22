@@ -20,14 +20,16 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tarfile
 import threading
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 MIN_PROTECT_AGE_MIN: int = 30
 DEFAULT_SLOT_CAP: int = 500
@@ -128,23 +130,52 @@ def _parse_summary_timestamp_conservative(raw: Any, now_ts: float) -> Optional[f
     return min(ts_utc, ts_local)
 
 
-def _dir_tree_bytes(root_dir: Path, max_files: int = 4000) -> int:
+def _dir_tree_bytes(root_dir: Union[Path, str], max_files: int = 4000) -> int:
     total = 0
     seen = 0
+    is_nt = os.name == "nt"
+    root_str = os.fspath(root_dir)
     try:
-        if not root_dir.is_dir() or root_dir.is_symlink():
-            return 0
-        for dp, _dns, fns in os.walk(root_dir):
-            for fn in fns:
-                seen += 1
-                if seen > max_files:
-                    return total
-                try:
-                    total += os.lstat(os.path.join(dp, fn)).st_size
-                except OSError:
-                    pass
+        root_st = os.lstat(root_str)
     except OSError:
-        return total
+        return 0
+    if not stat.S_ISDIR(root_st.st_mode):
+        return 0
+    if is_nt and (getattr(root_st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT):
+        return 0
+
+    stack: List[str] = [root_str]
+    while stack:
+        cur_dir = stack.pop()
+        try:
+            with os.scandir(cur_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if is_nt:
+                            st = entry.stat(follow_symlinks=False)
+                            if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                seen += 1
+                                if seen > max_files:
+                                    return total
+                                total += st.st_size
+                        else:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                seen += 1
+                                if seen > max_files:
+                                    return total
+                                total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total
 
 
@@ -423,12 +454,72 @@ class SlotInventoryScanner:
         self._cached_snap: Optional[SlotInventorySnapshot] = None
         self._cached_key: Optional[Tuple[Any, ...]] = None
         self._cached_at: float = 0.0
+        self._dir_size_lock = threading.Lock()
+        self._dir_size_cache: OrderedDict[str, Tuple[float, int, int, int]] = OrderedDict()
+        self._dir_size_cache_max: int = 512
+        self._dir_size_cache_ttl_sec: float = 300.0
+        self._dir_size_epoch: int = 0
 
     def invalidate_cache(self) -> None:
         with self._lock:
             self._cached_snap = None
             self._cached_key = None
             self._cached_at = 0.0
+        with self._dir_size_lock:
+            self._dir_size_epoch += 1
+            self._dir_size_cache.clear()
+
+    def _get_brain_dir_bytes(
+        self,
+        cid: str,
+        brain_dir_str: str,
+        disk_age_min: float,
+        transcript_mtime_ns: int,
+    ) -> int:
+        try:
+            dir_st = os.lstat(brain_dir_str)
+        except OSError:
+            with self._dir_size_lock:
+                self._dir_size_cache.pop(cid, None)
+            return 0
+
+        if not stat.S_ISDIR(dir_st.st_mode) or (
+            os.name == "nt" and (getattr(dir_st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+        ):
+            with self._dir_size_lock:
+                self._dir_size_cache.pop(cid, None)
+            return 0
+
+        # Active (< 30m) directories may write into deep subdirs without updating root mtime:
+        # always scan live and evict any stale cache entry.
+        if disk_age_min < float(MIN_PROTECT_AGE_MIN):
+            with self._dir_size_lock:
+                self._dir_size_cache.pop(cid, None)
+            return _dir_tree_bytes(brain_dir_str)
+
+        dir_mt_ns = int(dir_st.st_mtime_ns)
+        mono_now = time.monotonic()
+        with self._dir_size_lock:
+            epoch = self._dir_size_epoch
+            cached = self._dir_size_cache.get(cid)
+            if (
+                cached is not None
+                and cached[1] == dir_mt_ns
+                and cached[2] == transcript_mtime_ns
+                and (mono_now - cached[0]) < self._dir_size_cache_ttl_sec
+            ):
+                self._dir_size_cache.move_to_end(cid)
+                return cached[3]
+
+        total = _dir_tree_bytes(brain_dir_str)
+        mono_done = time.monotonic()
+        with self._dir_size_lock:
+            if self._dir_size_epoch == epoch:
+                self._dir_size_cache[cid] = (mono_done, dir_mt_ns, transcript_mtime_ns, total)
+                self._dir_size_cache.move_to_end(cid)
+                while len(self._dir_size_cache) > self._dir_size_cache_max:
+                    self._dir_size_cache.popitem(last=False)
+        return total
 
     def _read_summaries_ro(self) -> Tuple[bool, Dict[str, Dict[str, Any]]]:
         if not self.summaries_db_path.is_file():
@@ -602,7 +693,12 @@ class SlotInventoryScanner:
             disk_age_min = max(0.0, (now - real_mt) / 60.0)
             est_bytes = db_sz + wal_sz + tr_sz
             if include_items:
-                brain_bytes = _dir_tree_bytes(self.brain_dir / cid)
+                brain_bytes = self._get_brain_dir_bytes(
+                    cid,
+                    join(brain_root_str, cid),
+                    disk_age_min,
+                    tr_mt_ns,
+                )
                 est_bytes = db_sz + wal_sz + brain_bytes
             total_bytes += est_bytes
 

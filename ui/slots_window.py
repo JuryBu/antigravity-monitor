@@ -16,6 +16,7 @@ from core.slot_manager import (
     SlotInventorySnapshot,
     format_bytes_human,
 )
+from ui.window_drag import SmoothWindowDragger
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
@@ -59,10 +60,9 @@ class ConversationSlotsWindow:
         self._cleaning_busy: bool = False
         self._closed: bool = False
         self._after_ids: List[str] = []
-        self._drag_ox: int = 0
-        self._drag_oy: int = 0
-        self._win_ox: int = 0
-        self._win_oy: int = 0
+        self._dragging: bool = False
+        self._pending_sync_summary: Optional[SlotInventorySnapshot] = None
+        self._pending_loaded_snapshot: Optional[SlotInventorySnapshot] = None
         self._scroll_drag_origin_y: int = 0
         self._scroll_drag_origin_top: float = 0.0
 
@@ -73,7 +73,15 @@ class ConversationSlotsWindow:
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.97)
         self.win.bind("<Escape>", lambda _e: self.close())
+        self.win.bind("<FocusOut>", self._on_focus_out)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._dragger: Optional[SmoothWindowDragger] = SmoothWindowDragger(
+            self.win,
+            move_threshold=0,
+            on_drag_start=self._on_dragger_started,
+            on_drag_end=self._on_dragger_ended,
+            on_drag_cancel=self._on_dragger_cancelled,
+        )
 
         self._outer = tk.Frame(self.win, padx=1, pady=1)
         self._outer.pack(fill="both", expand=True)
@@ -106,6 +114,7 @@ class ConversationSlotsWindow:
         for w in (self._hdr, self._lbl_badge, self._lbl_title, self._lbl_sub):
             w.bind("<ButtonPress-1>", self._on_drag_start)
             w.bind("<B1-Motion>", self._on_drag_move)
+            w.bind("<ButtonRelease-1>", self._on_drag_end)
 
         # Red/orange risk alert banner (packed dynamically when warn/danger/main_at_risk)
         self._risk_frame = tk.Frame(self._surface, padx=9, pady=6, highlightthickness=1)
@@ -234,6 +243,8 @@ class ConversationSlotsWindow:
     def show(self, place_near_parent: bool = True) -> None:
         if self._closed:
             return
+        if self._dragger is not None:
+            self._dragger.finish_or_cancel(commit=self._dragger.moved)
         self.win.deiconify()
         self.win.lift()
         self.refresh()
@@ -266,16 +277,47 @@ class ConversationSlotsWindow:
         y = max(vy + 12, min(vb - h - 48, py))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _on_focus_out(self, _event: tk.Event) -> None:
+        if self._dragger is not None:
+            self._dragger.finish_or_cancel(commit=self._dragger.moved)
+
     def _on_drag_start(self, event: tk.Event) -> None:
-        self._drag_ox = event.x_root
-        self._drag_oy = event.y_root
-        self._win_ox = self.win.winfo_x()
-        self._win_oy = self.win.winfo_y()
+        if self._dragger is not None:
+            self._dragger.on_start(event)
 
     def _on_drag_move(self, event: tk.Event) -> None:
-        nx = self._win_ox + (event.x_root - self._drag_ox)
-        ny = self._win_oy + (event.y_root - self._drag_oy)
-        self.win.geometry(f"+{nx}+{ny}")
+        if self._dragger is not None:
+            self._dragger.on_move(event)
+
+    def _on_drag_end(self, event: tk.Event) -> None:
+        if self._dragger is not None:
+            self._dragger.on_end(event)
+
+    def _on_dragger_started(self) -> None:
+        self._dragging = True
+
+    def _flush_pending_sync(self) -> None:
+        self._dragging = False
+        pending_loaded = self._pending_loaded_snapshot
+        self._pending_loaded_snapshot = None
+        pending_summary = self._pending_sync_summary
+        self._pending_sync_summary = None
+        if self._closed:
+            return
+        if pending_loaded is not None:
+            self._apply_loaded_snapshot(pending_loaded)
+        if pending_summary is not None:
+            self.sync_from_summary(pending_summary)
+
+    def _on_dragger_ended(self, _moved: bool) -> None:
+        self._flush_pending_sync()
+
+    def _on_dragger_cancelled(self) -> None:
+        self._flush_pending_sync()
+
+    def check_drag_watchdog(self) -> None:
+        if not self._closed and self._dragger is not None:
+            self._dragger.check_release_watchdog()
 
     def _sync_auto_button(self) -> None:
         t = self.theme
@@ -333,6 +375,9 @@ class ConversationSlotsWindow:
     def _apply_loaded_snapshot(self, inv: SlotInventorySnapshot) -> None:
         if self._closed:
             return
+        if self._dragging:
+            self._pending_loaded_snapshot = inv
+            return
         self._snapshot = inv
         self._last_summary_sig = (
             inv.total_db,
@@ -350,9 +395,12 @@ class ConversationSlotsWindow:
     def refresh(self, blocking: Optional[bool] = None) -> None:
         if self._closed:
             return
+        loader = self._load_inventory
+        if loader is None:
+            return
         use_async = (not blocking) if blocking is not None else self._async_refresh
         if not use_async:
-            self._apply_loaded_snapshot(self._load_inventory())
+            self._apply_loaded_snapshot(loader())
             return
         if self._refresh_busy:
             return
@@ -364,7 +412,7 @@ class ConversationSlotsWindow:
             loaded: Optional[SlotInventorySnapshot] = None
             err = ""
             try:
-                loaded = self._load_inventory()
+                loaded = loader()
             except Exception as exc:
                 err = str(exc)
 
@@ -387,6 +435,9 @@ class ConversationSlotsWindow:
 
     def sync_from_summary(self, inv: Optional[SlotInventorySnapshot]) -> None:
         if self._closed or inv is None:
+            return
+        if self._dragging:
+            self._pending_sync_summary = inv
             return
         self._sync_auto_button()
         sig = (
@@ -638,6 +689,20 @@ class ConversationSlotsWindow:
         if self._closed:
             return
         self._closed = True
+        self._dragging = False
+        self._snapshot = None
+        self._pending_sync_summary = None
+        self._pending_loaded_snapshot = None
+        self._last_summary_sig = None
+        dragger = self._dragger
+        self._dragger = None
+        if dragger is not None:
+            dragger.cancel()
+            dragger._on_drag_start = None
+            dragger._on_drag_end = None
+            dragger._on_drag_cancel = None
+            dragger._size_provider = None
+            dragger._win = None  # type: ignore[assignment]
         for aid in list(self._after_ids):
             try:
                 self.win.after_cancel(aid)
@@ -645,11 +710,34 @@ class ConversationSlotsWindow:
                 pass
         self._after_ids.clear()
         try:
+            for child in self._table.winfo_children():
+                child.destroy()
+        except tk.TclError:
+            pass
+        for cv in (self._viewport, self._scrollbar):
+            try:
+                cv.delete("all")
+            except tk.TclError:
+                pass
+        self._kpi_cards.clear()
+        self._tab_btns.clear()
+        self._act_btns.clear()
+        try:
             self.win.destroy()
         except tk.TclError:
             pass
-        if self._on_closed is not None:
+        cb = self._on_closed
+        self._on_closed = None
+        self._load_inventory = None  # type: ignore[assignment]
+        self._on_clean_now = None  # type: ignore[assignment]
+        self._is_auto_clean_enabled = None  # type: ignore[assignment]
+        self._on_toggle_auto_clean = None  # type: ignore[assignment]
+        self._get_protect_age_min = None  # type: ignore[assignment]
+        self._get_clean_mode = None  # type: ignore[assignment]
+        self._apply_rounding_fn = None
+        self._screen_bounds_fn = None
+        if cb is not None:
             try:
-                self._on_closed()
+                cb()
             except Exception:
                 pass

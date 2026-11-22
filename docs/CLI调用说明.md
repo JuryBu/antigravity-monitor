@@ -86,7 +86,7 @@ python -B main.py --json --readonly --conversation-id <id>
 | `online` | 本地 Language Server Hub 进程与 `GetUserStatus` 是否在线 |
 | `tier` / `plan_status` | 账号订阅档位 ID（`userTier.id`）与套餐说明（来自 `planStatus.planInfo`） |
 | `quota_family` | 当前主活跃模型归属池：`gemini` 或 `3p` |
-| `five_hour_pct` / `weekly_pct` | 当前主用池 5h 剩余百分比（Hub 实时）与周剩余百分比（可选本机 Cockpit 只读补全） |
+| `five_hour_pct` / `weekly_pct` | 当前主用池 5h 剩余百分比（Hub `GetUserStatus` 实时）与周剩余百分比（优先 Hub `RetrieveUserQuotaSummary` 官方实时，旧版客户端缺失时自动回退本机 Cockpit 同邮箱只读历史库） |
 | `five_hour_reset_at` / `weekly_reset_at` | 当前主用池原生重置时间（ISO-8601 UTC 字符串，无则为 `null`） |
 | `pools.gemini` / `pools.3p` | 分池详情对象，均含 `five_hour_pct`、`weekly_pct`、`five_hour_reset_at`、`weekly_reset_at`、`model_count`（完整遍历全部 `clientModelConfigs`，不截断） |
 
@@ -115,7 +115,7 @@ python -B main.py --json --readonly --conversation-id <id>
 
 ### 3. `cache`、`perf`、`errors_30m`、`errors_today`、`alerts`
 
-- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `rule_change` / `abnormal_zero`）、`consec_miss`（近窗最大连续异常归零步数）、`t1_consec_threshold`（固定 `3`，触发红灯 `T1 连续掉缓存` 所需连续异常归零步数；连续 `2` 步归橙色 `WARN` 高留意观察）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
+- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `cached_diluted` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `rule_change` / `partial_miss` / `abnormal_zero`）、`primary_hit_is_compact`、`primary_hit_is_revert`、`consec_miss`（近窗最大连续异常掉缓存步数，含 `abnormal_zero` 与严重部分失效 `partial_miss`）、`t1_consec_threshold`（固定 `3`，触发红灯 `T1 连续掉缓存` 所需连续异常掉缓存步数；连续 `2` 步归橙色 `WARN` 高留意观察）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
 - **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`；已排除极短输出 `<0.15s` 假 TPS 与高 TPS / 多模态原图上传耗时误判）。
 - **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，按 `ERROR_MESSAGE ±6s` 与 `USER_INPUT` 瞬时快照两阶段反查出事对话并自动分流重图大包上传超时 `heavy_media_timeout` 免误升 T2）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数，以及 `errors_30m` 可选字段 `heavy_media_timeout`、`proxy_outage`、`proxy_outage_note`（跨接口 60s 爆发代理断流计数与说明，离线/历史视图不误升 `WARN`）、`window_min` 与 `t2_recovery_note`（`errors_today` 另附 `machine_*` 全机今日累计）；仅非重图服务端 `503 + timeout >= 2` 才升级红 `T2`，事后按主对话模型结合大上下文（`>=300K`）弹性校准与重图满速豁免评估恢复，严格保留真实 TTFT 展示且需 `>=2` 步常规步才回绿 `T0`。
 - **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
@@ -137,5 +137,5 @@ python -B main.py --json --readonly --conversation-id <id>
 1. **严格零写盘与并发安全**：`--cli`、`--json` 及 `--readonly` 均跳过 `account_ledger.json` 持久化写盘，多对话、多子代理并发调用不会触发 Windows `os.replace` `PermissionError` 竞态。
 2. **上下文压缩重热识别**：系统通过 `transcript.jsonl` 中的 `CHECKPOINT` 事件结合上下文真实缩水（`< 0.85×`），或无事件时的上下文骤降（`< 0.75×`）识别压缩重热（`reason = "compact_reset"`, `classification = "expected_cold"`），既保证压缩耗时超过 180s 也不误判，也避免正文提及压缩关键词时产生假阳性。
 3. **规则文件修改触发的前缀重置**：全局 `GEMINI.md` 规则文件修改触发的首步 `cr=0` 已自动识别为正常冷启（`reason = "rule_change"`, `classification = "expected_cold"`，短标 `规则冷`）；若是工作区级规则文件（如 `AGENTS.md`）修改触发的前缀重置，仍按单步轻量 `WARN`（`pressure = "warn"`）提示并在下一步恢复（连续 `2` 步归橙色 `WARN` 高留意观察，需连续 `>= 3` 步或近 10 步高频异常才会判定为 `T1 / degraded`）。
-4. **周额度与重置时间来源**：5h 额度及原生 `resetTime` 直接来自本机在线 Antigravity Language Server Hub（最多扫描最近 40 个 `hub_*.json` 并先校验 PID 存活）；周额度与周重置时间在安装了第三方工具 Antigravity Cockpit 且**严格同邮箱匹配**时只读补全，未安装或离线时保持 `null`，绝不跨账号混用。
+4. **周额度与重置时间来源**：5h 额度及原生 `resetTime` 直接来自本机在线 Antigravity Language Server Hub 的 `GetUserStatus`（全量扫描存活 `hub_*.json` 并校验 PID 与进程创建时间）；周额度与周重置时间优先直接调用本机 Hub 原生 `RetrieveUserQuotaSummary` 实时获取（无需依赖第三方插件），仅在旧版客户端未提供该接口时自动降级读取本机 Antigravity Cockpit（**严格同邮箱匹配**），未安装或离线时保持 `null`，绝不跨账号混用。
 5. **全链路自动脱敏**：所有输出均对邮箱及账号标识执行首尾掩码处理，绝不读取、打印或持久化任何认证 Token。

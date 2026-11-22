@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 APP_ROOT = Path(__file__).resolve().parent
 if str(APP_ROOT) not in sys.path:
@@ -160,24 +163,389 @@ class SingleInstanceGuard:
             self.mutex_handle = None
 
 
-def _spawn_restarted_self(no_tray: bool = False, minimized: bool = False, readonly: bool = False) -> None:
-    """Relaunch using the current interpreter's pythonw.exe to preserve active venv dependencies and launch flags."""
+JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS = 2
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+RESTART_ERROR_LOG_MAX_BYTES = 64 * 1024
+_WMI_RESULT_RE = re.compile(r"(?m)^\s*RV=(-?\d+);PID=(\d*)\s*$")
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    """Win32 JOBOBJECT_BASIC_LIMIT_INFORMATION (64 bytes on x64, 48 bytes on x86)."""
+
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _USEROBJECTFLAGS(ctypes.Structure):
+    _fields_ = [
+        ("fInherit", wintypes.BOOL),
+        ("fReserved", wintypes.BOOL),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+@dataclass(frozen=True)
+class JobLimitInfo:
+    in_job: bool = False
+    kill_on_close: bool = False
+    breakaway_ok: bool = False
+    query_failed: bool = False
+
+
+def _inspect_current_job_limits() -> JobLimitInfo:
+    """Inspect whether the current process is inside a Win32 Job Object and its breakaway/kill flags."""
+    if os.name != "nt":
+        return JobLimitInfo(in_job=False, kill_on_close=False, breakaway_ok=False, query_failed=False)
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.argtypes = []
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+        k32.IsProcessInJob.restype = wintypes.BOOL
+        k32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k32.QueryInformationJobObject.restype = wintypes.BOOL
+
+        in_job = wintypes.BOOL(0)
+        if not k32.IsProcessInJob(k32.GetCurrentProcess(), None, ctypes.byref(in_job)):
+            return JobLimitInfo(in_job=False, kill_on_close=False, breakaway_ok=False, query_failed=True)
+        if not bool(in_job.value):
+            return JobLimitInfo(in_job=False, kill_on_close=False, breakaway_ok=False, query_failed=False)
+    except Exception:
+        return JobLimitInfo(in_job=False, kill_on_close=False, breakaway_ok=False, query_failed=True)
+
+    try:
+        info = _JOBOBJECT_BASIC_LIMIT_INFORMATION()
+        ret_len = wintypes.DWORD(0)
+        ok = k32.QueryInformationJobObject(
+            None,
+            JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            ctypes.byref(ret_len),
+        )
+        if not ok:
+            return JobLimitInfo(in_job=True, kill_on_close=True, breakaway_ok=False, query_failed=True)
+        limit_flags = int(info.LimitFlags)
+        kill_on_close = bool(limit_flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        breakaway_ok = bool(
+            limit_flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+        )
+        return JobLimitInfo(
+            in_job=True,
+            kill_on_close=kill_on_close,
+            breakaway_ok=breakaway_ok,
+            query_failed=False,
+        )
+    except Exception:
+        return JobLimitInfo(in_job=True, kill_on_close=True, breakaway_ok=False, query_failed=True)
+
+
+def _ps_quote(s: str) -> str:
+    """Escape a string as a PowerShell single-quoted literal (including PS 5.1 Unicode smart-quote delimiters)."""
+    out = str(s)
+    for ch in ("'", "\u2018", "\u2019", "\u201a", "\u201b"):
+        if ch in out:
+            out = out.replace(ch, ch + ch)
+    return "'" + out + "'"
+
+
+def _decode_process_output(data: Any) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    raw = bytes(data)
+    for enc in ("utf-8", "mbcs"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _spawn_via_wmi(cmd: list[str], cwd: Path, timeout_sec: float = 8.0) -> Tuple[bool, str]:
+    """Spawn a detached process outside a strict KILL_ON_JOB_CLOSE Job Object via Win32_Process.Create."""
+    sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+    ps_candidate = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    ps_exe = str(ps_candidate) if ps_candidate.is_file() else "powershell.exe"
+
+    cmdline = subprocess.list2cmdline(cmd)
+    cwd_str = str(cwd)
+    ps_script = "\n".join(
+        [
+            "$ProgressPreference = 'SilentlyContinue'",
+            "$ErrorActionPreference = 'Stop'",
+            "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }",
+            (
+                "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ "
+                f"CommandLine = {_ps_quote(cmdline)}; "
+                f"CurrentDirectory = {_ps_quote(cwd_str)}; "
+                "ProcessStartupInformation = $si }"
+            ),
+            'Write-Output "RV=$($r.ReturnValue);PID=$($r.ProcessId)"',
+        ]
+    )
+    encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+    ps_cmd = [
+        ps_exe,
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        encoded,
+    ]
+
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    proc: Optional[subprocess.Popen[Any]] = None
+    try:
+        proc = subprocess.Popen(ps_cmd, **popen_kwargs)
+        stdout_raw, stderr_raw = proc.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        return False, f"WMI spawn timed out after {timeout_sec:.1f}s"
+    except Exception as exc:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        return False, f"WMI helper launch failed: {exc}"
+    finally:
+        if proc is not None:
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+    stdout_text = _decode_process_output(stdout_raw)
+    stderr_text = _decode_process_output(stderr_raw).strip()
+    if proc.returncode != 0:
+        detail = stderr_text or stdout_text.strip() or f"exit_code={proc.returncode}"
+        return False, f"PowerShell exited with code {proc.returncode}: {detail}"
+
+    match = _WMI_RESULT_RE.search(stdout_text)
+    if match is None:
+        detail = stderr_text or stdout_text.strip() or "empty stdout"
+        return False, f"Unexpected WMI output: {detail}"
+
+    rv = int(match.group(1))
+    pid_str = match.group(2)
+    pid = int(pid_str) if pid_str.isdigit() else 0
+    if rv != 0 or pid <= 0:
+        return False, f"Win32_Process.Create failed (RV={rv}, PID={pid_str or 'none'})"
+    return True, f"RV=0;PID={pid}"
+
+
+def _append_restart_error_log(message: str, max_bytes: int = RESTART_ERROR_LOG_MAX_BYTES) -> None:
+    """Append a timestamped restart error entry to logs/restart_error.log capped at max_bytes."""
+    log_path = APP_ROOT / "logs" / "restart_error.log"
+    tmp_path = log_path.with_name(f".{log_path.name}.{os.getpid()}.tmp")
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        clean_msg = " ".join(str(message).splitlines()).strip()
+        entry_bytes = f"[{ts}] {clean_msg}\n".encode("utf-8", errors="replace")
+        existing = log_path.read_bytes() if log_path.is_file() else b""
+        combined = existing + entry_bytes
+        if len(combined) > max_bytes:
+            tail = combined[-max_bytes:]
+            if len(entry_bytes) < max_bytes:
+                nl = tail.find(b"\n")
+                if 0 <= nl < len(tail) - len(entry_bytes):
+                    tail = tail[nl + 1 :]
+            tail = tail.decode("utf-8", errors="ignore").encode("utf-8")
+            combined = tail[-max_bytes:]
+        tmp_path.write_bytes(combined)
+        os.replace(tmp_path, log_path)
+    except Exception:
+        pass
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def _is_windows_interactive_session() -> bool:
+    """Return False when running in a non-interactive Windows station (e.g. Session 0 service)."""
+    if os.name != "nt":
+        return False
+    try:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetProcessWindowStation.argtypes = []
+        u32.GetProcessWindowStation.restype = wintypes.HANDLE
+        u32.GetUserObjectInformationW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        u32.GetUserObjectInformationW.restype = wintypes.BOOL
+        hwinsta = u32.GetProcessWindowStation()
+        if not hwinsta:
+            return True
+        flags = _USEROBJECTFLAGS()
+        needed = wintypes.DWORD(0)
+        UOI_FLAGS = 1
+        WSF_VISIBLE = 0x0001
+        if u32.GetUserObjectInformationW(hwinsta, UOI_FLAGS, ctypes.byref(flags), ctypes.sizeof(flags), ctypes.byref(needed)):
+            return bool(flags.dwFlags & WSF_VISIBLE)
+    except Exception:
+        pass
+    return True
+
+
+def _default_restart_alert(msg: str) -> None:
+    """Show a native Win32 error box on restart failure when running interactively."""
+    if os.name != "nt" or not _is_windows_interactive_session():
+        return
+    try:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+        u32.MessageBoxW.restype = ctypes.c_int
+        MB_OK = 0x00000000
+        MB_ICONERROR = 0x00000010
+        MB_TOPMOST = 0x00040000
+        u32.MessageBoxW(None, msg, "Antigravity 监控器 - 重启失败", MB_OK | MB_ICONERROR | MB_TOPMOST)
+    except Exception:
+        pass
+
+
+_RESTART_ALERT_FN: Optional[Callable[[str], None]] = _default_restart_alert
+
+
+def _notify_restart_failure(msg: str) -> None:
+    """Invoke the injectable restart failure alert hook without raising."""
+    fn = _RESTART_ALERT_FN
+    if fn is None:
+        return
+    try:
+        fn(msg)
+    except Exception:
+        pass
+
+
+def _job_flag(job_info: Any, key: str, default: bool = False) -> bool:
+    if isinstance(job_info, dict):
+        return bool(job_info.get(key, default))
+    return bool(getattr(job_info, key, default))
+
+
+def _build_restart_popen_kwargs(env: dict[str, str], creationflags: int) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "cwd": str(APP_ROOT),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = creationflags
+    return kwargs
+
+
+def _spawn_restarted_self(no_tray: bool = False, minimized: bool = False, readonly: bool = False) -> bool:
+    """Relaunch the monitor robustly across normal desktop, breakaway Job, and strict KILL_ON_JOB_CLOSE Job environments."""
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
     launcher = str(pyw) if os.name == "nt" and pyw.is_file() else str(exe)
-    cmd = [launcher, str(APP_ROOT / "main.py"), "--restarting"]
+
+    cmd: list[str] = [launcher]
+    if sys.version_info < (3, 10):
+        cmd.extend(["-X", "utf8=0"])
+    cmd.extend([str(APP_ROOT / "main.py"), "--restarting"])
     if no_tray:
         cmd.append("--no-tray")
     if minimized:
         cmd.append("--minimized")
     if readonly:
         cmd.append("--readonly")
+
     env = os.environ.copy()
     env.pop("PYTHONUTF8", None)
-    flags = 0
+
+    base_flags = 0
     if os.name == "nt":
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen(cmd, cwd=str(APP_ROOT), env=env, creationflags=flags)
+        base_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    job_info = _inspect_current_job_limits()
+    kill_on_close = _job_flag(job_info, "kill_on_close")
+    breakaway_ok = _job_flag(job_info, "breakaway_ok")
+
+    errors: list[str] = []
+
+    if not kill_on_close:
+        # Branch A: normal desktop / VBS / non-KILL_ON_JOB_CLOSE launch.
+        try:
+            subprocess.Popen(cmd, **_build_restart_popen_kwargs(env, base_flags))
+            return True
+        except Exception as exc:
+            errors.append(f"direct Popen failed: {exc}")
+    else:
+        if breakaway_ok:
+            # Branch B: KILL_ON_JOB_CLOSE with breakaway allowed; fall through to Branch C on OSError/PermissionError.
+            try:
+                subprocess.Popen(cmd, **_build_restart_popen_kwargs(env, base_flags | CREATE_BREAKAWAY_FROM_JOB))
+                return True
+            except (PermissionError, OSError) as exc:
+                errors.append(f"breakaway Popen failed: {exc}")
+            except Exception as exc:
+                errors.append(f"breakaway Popen unexpected error: {exc}")
+
+        # Branch C: strict non-breakaway KILL_ON_JOB_CLOSE Job (or Branch B fallback).
+        ok, detail = _spawn_via_wmi(cmd, APP_ROOT)
+        if ok:
+            return True
+        errors.append(f"WMI escape failed: {detail}")
+
+    err_summary = "; ".join(errors) if errors else "unknown restart error"
+    err_msg = f"自动重启 Antigravity 监控器失败，请手动重新启动。\n原因: {err_summary}"
+    if not readonly:
+        _append_restart_error_log(err_summary)
+    _notify_restart_failure(err_msg)
+    return False
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -366,7 +734,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     _enable_high_dpi()
     guard = SingleInstanceGuard()
-    if not guard.acquire(wait_timeout_sec=3.0 if args.restarting else 0.0):
+    if not guard.acquire(wait_timeout_sec=12.0 if args.restarting else 0.0):
         return 0
 
     from core.updater import UpdateManager
@@ -385,7 +753,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config_store=config_store,
         engine=engine,
         enable_tray=not args.no_tray,
-        start_minimized_override=True if args.minimized else None,
+        start_minimized_override=(True if args.minimized else (False if args.restarting else None)),
         on_restart=_mark_restart,
         update_manager=updater,
     )
@@ -393,7 +761,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         app.run()
     finally:
-        restart_minimized = bool(args.minimized or (not args.no_tray and not app._visible))
+        restart_minimized = bool((not args.no_tray) and (not app._visible))
         wake_stop.set()
         guard.signal_stop()
         if wake_thread is not None and wake_thread.is_alive():
