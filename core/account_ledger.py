@@ -10,9 +10,11 @@ from __future__ import annotations
 import bisect
 import datetime
 import json
+import math
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -82,6 +84,7 @@ class AccountSwitchLedger:
         self.read_only: bool = bool(read_only)
         self._own_events: List[Tuple[float, str]] = []
         self._daily_step_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._rule_change_timestamps: List[float] = []
         self._cockpit_cache: Dict[str, Tuple[Tuple[int, int], List[Tuple[float, str]]]] = {}
         self._load_own()
 
@@ -186,6 +189,26 @@ class AccountSwitchLedger:
             trimmed[lbl] = {dk: dmap[dk] for dk in sorted(dmap.keys())[-30:]}
         self._daily_step_profiles = trimmed
 
+        parsed_rules: List[float] = []
+        raw_rule_ts = data.get("rule_change_timestamps")
+        if isinstance(raw_rule_ts, list):
+            for x in raw_rule_ts:
+                if not isinstance(x, (int, float)) or isinstance(x, bool):
+                    continue
+                try:
+                    val = float(x)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(val) and 946684800.0 <= val <= 4102444800.0:
+                    parsed_rules.append(val)
+        parsed_rules.sort()
+        dedup_rules: List[float] = []
+        for val in parsed_rules:
+            if dedup_rules and (val - dedup_rules[-1]) <= 1.0:
+                continue
+            dedup_rules.append(val)
+        self._rule_change_timestamps = dedup_rules[-64:]
+
     def _save_own(self) -> None:
         if self.read_only or self.ledger_path is None:
             return
@@ -209,6 +232,8 @@ class AccountSwitchLedger:
                     keep_days = sorted(dmap.keys())[-30:]
                     trimmed_profiles[lbl] = {dk: dmap[dk] for dk in keep_days}
                 out_obj["daily_step_profiles"] = trimmed_profiles
+            if self._rule_change_timestamps:
+                out_obj["rule_change_timestamps"] = [round(ts, 3) for ts in self._rule_change_timestamps[-64:]]
             payload = json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
             tmp = self.ledger_path.with_name(f"{self.ledger_path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
             tmp.write_text(payload, encoding="utf-8")
@@ -220,6 +245,47 @@ class AccountSwitchLedger:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def record_rule_change(self, mtime_ts: float, now_ts: Optional[float] = None) -> bool:
+        """Record a global rule-file modification timestamp (updates memory even when read_only)."""
+        if isinstance(mtime_ts, bool):
+            return False
+        try:
+            val = float(mtime_ts)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(val):
+            return False
+        if now_ts is None:
+            now = time.time()
+        else:
+            if isinstance(now_ts, bool):
+                return False
+            try:
+                now = float(now_ts)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(now):
+                return False
+        cutoff = now - 14.0 * 86400.0
+        if val <= 0.0 or val < cutoff or val > (now + 300.0) or val < 946684800.0 or val > 4102444800.0:
+            return False
+        if any(abs(t - val) <= 1.0 for t in self._rule_change_timestamps):
+            return False
+        updated = [t for t in self._rule_change_timestamps if t >= cutoff]
+        updated.append(val)
+        updated.sort()
+        updated = updated[-64:]
+        if val not in updated:
+            return False
+        self._rule_change_timestamps = updated
+        if not self.read_only:
+            self._save_own()
+        return True
+
+    def get_rule_change_timestamps(self, since_ts: float = 0.0) -> List[float]:
+        """Return a sorted copy of recorded rule-change timestamps at or after ``since_ts``."""
+        return sorted(t for t in self._rule_change_timestamps if t >= since_ts)
 
     def get_account_daily_profiles(self, short_label: str) -> Dict[str, Dict[str, Any]]:
         """Return a shallow copy of stored per-day step stats for a masked account label."""

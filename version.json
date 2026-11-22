@@ -1,8 +1,8 @@
 {
-  "version": "7.2.1",
+  "version": "7.2.2",
   "channel": "main",
   "released_at": "2026-11-22",
   "repo": "JuryBu/antigravity-monitor",
   "branch": "main",
-  "summary": "多图超时免误判 T2、代理全线断流识别、大上下文 TTFT 校准、账号级自适应保护线与默认后台下载更新"
+  "summary": "已恢复掉缓存预警自动销账、识别全局改规则冷启与后台子代理单步瞬抖降噪"
 }

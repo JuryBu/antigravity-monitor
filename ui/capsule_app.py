@@ -2568,6 +2568,7 @@ class AntigravityCapsuleApp:
             "first_cacheable": "提示: 本步首次跨过 32K 门槛正在建缓，属于正常冷启，下一步起命中缓存。",
             "account_switch": "提示: 换号后服务端缓存按账号隔离，本步为新号首次建缓，下一步起命中缓存。",
             "model_switch": "提示: 切换模型后缓存按模型独立重建，本步为正常冷启，下一步起命中缓存。",
+            "rule_change": "提示: 检测到全局 GEMINI.md 规则变更触发前缀重热，本步为正常冷启，下一步起恢复命中。",
         }.get(latest_r, "")
         if cold_explain:
             lines.append(cold_explain)

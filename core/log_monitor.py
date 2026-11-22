@@ -11,6 +11,7 @@ Reads only local files and localhost Language Server status endpoints:
 from __future__ import annotations
 
 import base64
+import bisect
 import ctypes
 from ctypes import wintypes
 import datetime
@@ -305,6 +306,7 @@ CACHE_REASON_CN_MAP: Dict[str, str] = {
     "model_switch": "切模冷启",
     "small_ctx": "<32K免缓",
     "first_cacheable": "入32K首建",
+    "rule_change": "改规冷启",
     "abnormal_zero": "异常掉缓存",
 }
 
@@ -317,6 +319,7 @@ COLD_SHORT_BADGE_MAP: Dict[str, str] = {
     "revert_reset": "回溯冷",
     "first_turn": "首轮冷",
     "idle_rewarm": "闲置冷",
+    "rule_change": "规则冷",
 }
 
 _NORM_MODEL_RE = re.compile(r"[^a-z0-9]+")
@@ -542,7 +545,7 @@ class StepRecord:
     total_tokens: int
     hit_rate: float
     classification: str  # "hit" | "expected_cold" | "abnormal_miss"
-    reason: str          # "cached" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "revert_reset" | "small_ctx" | "first_cacheable" | "abnormal_zero"
+    reason: str          # "cached" | "first_turn" | "idle_rewarm" | "model_switch" | "compact_reset" | "revert_reset" | "small_ctx" | "first_cacheable" | "rule_change" | "abnormal_zero"
     context_delta: int = 0
     is_revert: bool = False
     is_compact: bool = False
@@ -595,6 +598,8 @@ class ConversationSummary:
     media_ttft_exempted: bool = False
     is_carryover_preview: bool = False
     large_ctx_ttft_allowance_sec: float = 0.0
+    tail_consec_hits_after_abnormal: int = 0
+    last_abnormal_ts: float = 0.0
     _scoped_steps_all: List[StepRecord] = field(default_factory=list, repr=False, compare=False)
     _scoped_gens_all: List[Optional[Any]] = field(default_factory=list, repr=False, compare=False)
 
@@ -874,6 +879,7 @@ def default_antigravity_paths() -> Dict[str, Path]:
         "cockpit_logs_dir": home / ".antigravity_cockpit" / "logs",
         "ledger_path": Path(__file__).resolve().parent.parent / "account_ledger.json",
         "vscdb_path": appdata / "Antigravity" / "User" / "globalStorage" / "state.vscdb",
+        "global_rules_path": home / ".gemini" / "GEMINI.md",
     }
 
 
@@ -928,6 +934,7 @@ def classify_steps(
     idle_rewarm_sec: int = 180,
     min_cacheable_tokens: int = 32000,
     account_switches: Optional[List[float]] = None,
+    rule_change_timestamps: Optional[List[float]] = None,
 ) -> List[StepRecord]:
     """Classify consecutive PLANNER_RESPONSE steps, filtering normal zero-cache causes."""
     classified: List[StepRecord] = []
@@ -935,7 +942,21 @@ def classify_steps(
     prev_model: Optional[str] = None
     prev_total: Optional[int] = None
     prev_step_idx: Optional[int] = None
+    prev_cls: str = ""
+    prev_reason: str = ""
+    first_non_ooo_ts: Optional[float] = None
+    consumed_rule_watermark: float = 0.0
+    non_ooo_hit_ts: List[float] = []
     switches = sorted(account_switches) if account_switches else []
+    rule_ts = (
+        sorted(
+            float(t)
+            for t in rule_change_timestamps
+            if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(float(t)) and float(t) > 0.0
+        )
+        if rule_change_timestamps
+        else []
+    )
 
     for idx, item in enumerate(raw_steps):
         inp = max(0, int(item.get("input_tokens", 0) or 0))
@@ -950,12 +971,21 @@ def classify_steps(
         step_idx = int(raw_si) if raw_si is not None else idx
         hit_rate = (cr / total) * 100.0
 
+        # Identify delayed out-of-order steps BEFORE classification so they never trigger rule_change or pollute state
+        is_delayed_ooo = prev_ts is not None and ts > 0.0 and prev_ts > 0.0 and ts < prev_ts - 5.0
+
         crossed_switch = False
         if prev_ts is not None and ts > prev_ts and switches:
             for sw_ts in switches:
                 if prev_ts < sw_ts <= ts + 2.0:
                     crossed_switch = True
                     break
+
+        latest_t_rule: Optional[float] = None
+        if rule_ts and ts > 0.0:
+            r_idx = bisect.bisect_right(rule_ts, ts + 2.0)
+            if r_idx > 0:
+                latest_t_rule = rule_ts[r_idx - 1]
 
         after_revert = bool(item.get("after_revert", False))
         if (
@@ -993,6 +1023,20 @@ def classify_steps(
         elif prev_total is not None and prev_total < min_cacheable_tokens:
             # First turn crossing the >=32K implicit cache threshold cannot have a prior warm prefix yet
             cls, reason = "expected_cold", "first_cacheable"
+        elif (
+            not is_delayed_ooo
+            and latest_t_rule is not None
+            and latest_t_rule > consumed_rule_watermark
+            and ts <= latest_t_rule + 600.0
+            and first_non_ooo_ts is not None
+            and first_non_ooo_ts < latest_t_rule
+            and prev_cls != "abnormal_miss"
+            and prev_reason != "rule_change"
+            and prev_ts <= latest_t_rule + 90.0
+            and (len(non_ooo_hit_ts) - bisect.bisect_left(non_ooo_hit_ts, latest_t_rule)) <= 1
+        ):
+            # Global GEMINI.md rule edit invalidates prompt prefix once per conversation; monotonic watermark blocks multi-step whitewashing
+            cls, reason = "expected_cold", "rule_change"
         else:
             cls, reason = "abnormal_miss", "abnormal_zero"
 
@@ -1017,13 +1061,25 @@ def classify_steps(
                 active_media_bytes=int(item.get("active_media_bytes", 0) or 0),
             )
         )
-        # Do not let an out-of-order delayed historical step clobber the forward cursor
-        is_delayed_ooo = prev_ts is not None and ts > 0.0 and prev_ts > 0.0 and ts < prev_ts - 5.0
+        # Do not let an out-of-order delayed historical step clobber the forward cursor or rule watermark
         if not is_delayed_ooo:
-            prev_ts = ts
+            if latest_t_rule is not None and latest_t_rule > consumed_rule_watermark:
+                # Advance monotonic watermark on ANY expected_cold after t_rule (including <32K)
+                # OR when an abnormal_miss was explicitly blocked from reusing t_rule by an ongoing miss/rule_change chain
+                if cls == "expected_cold" or (
+                    cls == "abnormal_miss" and (prev_cls == "abnormal_miss" or prev_reason == "rule_change")
+                ):
+                    consumed_rule_watermark = latest_t_rule
+            if cls == "hit" and ts > 0.0:
+                bisect.insort(non_ooo_hit_ts, ts)
+            if first_non_ooo_ts is None and ts > 0.0:
+                first_non_ooo_ts = ts
+            prev_ts = ts if (prev_ts is None or ts <= 0.0) else max(prev_ts, ts)
             prev_model = model
             prev_total = total
             prev_step_idx = step_idx
+            prev_cls = cls
+            prev_reason = reason
 
     return classified
 
@@ -1634,8 +1690,9 @@ class AntigravityMonitorEngine:
         ledger_path = base_paths.get("ledger_path")
         vscdb_path = base_paths.get("vscdb_path")
         annotations_dir = base_paths.get("annotations_dir")
-        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path/annotations_dir,
-        # avoid reading the host's real Cockpit logs, VSCode state DB, annotations, or polluting the real local ledger file.
+        global_rules_path = base_paths.get("global_rules_path")
+        # In isolated test harnesses where daemon_dir is overridden without explicit ledger_path/cockpit_logs_dir/vscdb_path/annotations_dir/global_rules_path,
+        # avoid reading the host's real Cockpit logs, VSCode state DB, annotations, GEMINI.md, or polluting the real local ledger file.
         if paths and "ledger_path" not in paths:
             ledger_path = None
         if paths and "cockpit_logs_dir" not in paths:
@@ -1644,9 +1701,13 @@ class AntigravityMonitorEngine:
             vscdb_path = None
         if paths and "annotations_dir" not in paths:
             annotations_dir = None
+        if paths and "global_rules_path" not in paths:
+            global_rules_path = None
 
         self.vscdb_path: Optional[Path] = Path(vscdb_path) if vscdb_path is not None else None
         self.annotations_dir: Optional[Path] = Path(annotations_dir) if annotations_dir is not None else None
+        self.global_rules_path: Optional[Path] = Path(global_rules_path) if global_rules_path is not None else None
+        self._last_observed_rules_mtime_ns: int = -1
         summaries_db_path = base_paths.get("summaries_db_path")
         if paths and "summaries_db_path" not in paths:
             summaries_db_path = self.conversations_dir.parent / "conversation_summaries.db"
@@ -1655,10 +1716,10 @@ class AntigravityMonitorEngine:
         self._transcript_cache: "OrderedDict[str, Tuple[Tuple[int, int], List[Dict[str, Any]], bool, bool]]" = OrderedDict()
         self._transcript_error_ts: "OrderedDict[str, List[Tuple[float, str, int, int, int]]]" = OrderedDict()
         self._transcript_tail_meta: "OrderedDict[str, Tuple[List[Tuple[float, int, int, int]], int, int, int]]" = OrderedDict()
-        self._hist_daily_profiles_cache_key: Tuple[str, int] = ("", -1)
+        self._hist_daily_profiles_cache_key: Tuple[Any, ...] = ()
         self._hist_daily_profiles_cache_ts: float = 0.0
         self._hist_daily_profiles_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
+        self._classified_cache: "OrderedDict[Tuple[str, Tuple[int, int], Tuple[float, ...], Tuple[float, ...], int], List[StepRecord]]" = OrderedDict()
         self._full_align_cache: "OrderedDict[Tuple[str, Tuple[int, int], int, int], List[Optional[Any]]]" = OrderedDict()
         self._subagent_hint_cache: "OrderedDict[str, Tuple[int, bool]]" = OrderedDict()
         self._conv_titles: Dict[str, str] = {}
@@ -1885,17 +1946,34 @@ class AntigravityMonitorEngine:
         with self._lock:
             self.config = sanitize_config(config)
 
+    def _observe_and_get_rule_timestamps(self, now: float, since_ts: float = 0.0) -> List[float]:
+        """Lightweight O(1) stat() check on global GEMINI.md mtime, merged into ledger rule-change history."""
+        if self.global_rules_path is not None:
+            try:
+                st = self.global_rules_path.stat()
+                if st.st_mtime_ns != self._last_observed_rules_mtime_ns:
+                    self._ledger.record_rule_change(st.st_mtime, now_ts=now)
+                    # Only cache mtime_ns when not rejected as future-relative to a historical now_ts call
+                    if st.st_mtime <= now + 300.0:
+                        self._last_observed_rules_mtime_ns = st.st_mtime_ns
+            except OSError:
+                pass
+        return self._ledger.get_rule_change_timestamps(since_ts)
+
     def _classify_steps_cached(
         self,
         conv_id: str,
         raw_steps: List[Dict[str, Any]],
         switch_timestamps: List[float],
+        rule_change_timestamps: Optional[List[float]] = None,
     ) -> List[StepRecord]:
         t_entry = self._transcript_cache.get(conv_id)
         t_stamp = t_entry[0] if t_entry is not None else (0, len(raw_steps))
         sw_sig = tuple(round(t, 1) for t in switch_timestamps[-24:])
+        rule_ts = rule_change_timestamps or []
+        rule_sig = tuple(round(t, 1) for t in rule_ts[-64:])
         idle_sec = int(self.config["idle_rewarm_sec"])
-        key = (conv_id, t_stamp, sw_sig, idle_sec)
+        key = (conv_id, t_stamp, sw_sig, rule_sig, idle_sec)
         cached = self._classified_cache.get(key)
         if cached is not None:
             self._classified_cache.move_to_end(key)
@@ -1904,6 +1982,7 @@ class AntigravityMonitorEngine:
             raw_steps,
             idle_rewarm_sec=idle_sec,
             account_switches=switch_timestamps,
+            rule_change_timestamps=rule_ts,
         )
         self._classified_cache[key] = steps
         self._classified_cache.move_to_end(key)
@@ -1930,11 +2009,11 @@ class AntigravityMonitorEngine:
         return hint
 
     @staticmethod
-    def _recompute_conv_eval_stats(c: ConversationSummary, eval_since_ts: float) -> None:
-        """Restrict a conversation's miss/hit health counters to steps at or after ``eval_since_ts``."""
-        src_steps = c._scoped_steps_all or c.recent_steps
-        eval_steps = [s for s in src_steps if s.timestamp >= eval_since_ts - 2.0]
-        eval_recent10 = [s for s in c.recent_steps if s.timestamp >= eval_since_ts - 2.0]
+    def _compute_eval_window_stats(
+        eval_steps: List[StepRecord],
+        eval_recent10: List[StepRecord],
+    ) -> Dict[str, Any]:
+        """Single source of truth for miss/hit/recovery counters shared by initial build & eval-floor recompute."""
         consec_miss = 0
         consec_start_step = eval_steps[-1].step_index if eval_steps else 0
         for s in reversed(eval_steps):
@@ -1947,14 +2026,210 @@ class AntigravityMonitorEngine:
         abnormal_r10 = len(abnormal_steps_r10)
         hits_r10 = sum(1 for s in eval_recent10 if s.classification == "hit")
         cacheable_r10 = abnormal_r10 + hits_r10
-        c.consec_miss = consec_miss
-        c.consec_miss_start_step = consec_start_step
-        c.single_miss = consec_miss == 1
-        c.wasted_cold_tokens = sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss")
-        c.abnormal_in_recent10 = abnormal_r10
-        c.cacheable_in_recent10 = cacheable_r10
-        c.recent10_hit_ratio = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
-        c.first_abnormal_step_in_recent10 = abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0
+        hit_ratio_r10 = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
+        last_abnormal_ts = max((s.timestamp for s in abnormal_steps_r10), default=0.0)
+        # Count recovered hits after the latest abnormal_miss in eval_recent10 (skipping valid expected_cold steps)
+        tail_hits_after_abn = 0
+        if abnormal_r10 > 0 and consec_miss == 0:
+            for s in reversed(eval_recent10):
+                if s.classification == "abnormal_miss":
+                    break
+                if s.classification == "hit":
+                    tail_hits_after_abn += 1
+        return {
+            "consec_miss": consec_miss,
+            "consec_miss_start_step": consec_start_step,
+            "single_miss": consec_miss == 1,
+            "wasted_cold_tokens": sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss"),
+            "abnormal_in_recent10": abnormal_r10,
+            "cacheable_in_recent10": cacheable_r10,
+            "recent10_hit_ratio": hit_ratio_r10,
+            "first_abnormal_step_in_recent10": abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0,
+            "tail_consec_hits_after_abnormal": tail_hits_after_abn,
+            "last_abnormal_ts": last_abnormal_ts,
+        }
+
+    @staticmethod
+    def _recompute_conv_eval_stats(c: ConversationSummary, eval_since_ts: float) -> None:
+        """Restrict a conversation's miss/hit health counters to steps at or after ``eval_since_ts``."""
+        src_steps = c._scoped_steps_all or c.recent_steps
+        eval_steps = [s for s in src_steps if s.timestamp >= eval_since_ts - 2.0]
+        eval_recent10 = [s for s in c.recent_steps if s.timestamp >= eval_since_ts - 2.0]
+        st = AntigravityMonitorEngine._compute_eval_window_stats(eval_steps, eval_recent10)
+        c.consec_miss = st["consec_miss"]
+        c.consec_miss_start_step = st["consec_miss_start_step"]
+        c.single_miss = st["single_miss"]
+        c.wasted_cold_tokens = st["wasted_cold_tokens"]
+        c.abnormal_in_recent10 = st["abnormal_in_recent10"]
+        c.cacheable_in_recent10 = st["cacheable_in_recent10"]
+        c.recent10_hit_ratio = st["recent10_hit_ratio"]
+        c.first_abnormal_step_in_recent10 = st["first_abnormal_step_in_recent10"]
+        c.tail_consec_hits_after_abnormal = st["tail_consec_hits_after_abnormal"]
+        c.last_abnormal_ts = st["last_abnormal_ts"]
+
+    @staticmethod
+    def _count_steps_in_window(c: ConversationSummary, lo_ts: float, hi_ts: float) -> Tuple[int, int]:
+        """Scan conversation steps within [lo_ts, hi_ts] without early break so tail-appended OOO steps never truncate."""
+        src = c._scoped_steps_all or c.recent_steps
+        hits = 0
+        abns = 0
+        for s in src:
+            if lo_ts <= s.timestamp <= hi_ts:
+                if s.classification == "hit":
+                    hits += 1
+                elif s.classification == "abnormal_miss":
+                    abns += 1
+        return hits, abns
+
+    @classmethod
+    def _select_cache_health_signals(
+        cls,
+        recent_active: List[ConversationSummary],
+        *,
+        now_ts: float,
+        eval_cutoff_ts: float,
+        eval_end_ts: float,
+        is_historical_rating: bool,
+        hr_key: str,
+        is_custom_account_view: bool,
+        is_all_accounts_mixed: bool = False,
+    ) -> Tuple[int, bool, Optional[ConversationSummary], Optional[ConversationSummary]]:
+        """Derive cache T1/WARN health signals with recovery clearance, 10m aging, and subagent single-step jitter denoising."""
+        max_consec_miss = max((c.consec_miss for c in recent_active), default=0)
+        severe_frequent_miss_conv = next(
+            (
+                c
+                for c in recent_active
+                if c.abnormal_in_recent10 >= 4
+                and c.cacheable_in_recent10 >= 4
+                and (c.recent10_hit_ratio is not None and c.recent10_hit_ratio < 0.5)
+            ),
+            None,
+        )
+
+        anchor_ts = eval_end_ts if eval_end_ts > 0.0 else now_ts
+        win10_lo = max(anchor_ts - 600.0, eval_cutoff_ts - 2.0)
+        win10_hi = anchor_ts + 2.0
+        is_live_aging = (not is_historical_rating) and (hr_key == "30m") and (not is_custom_account_view)
+
+        eval_mains = [c for c in recent_active if not c.is_subagent]
+        eval_subs = [c for c in recent_active if c.is_subagent]
+
+        win10_stats: Dict[str, Tuple[int, int]] = {
+            c.conversation_id: cls._count_steps_in_window(c, win10_lo, win10_hi)
+            for c in recent_active
+        }
+
+        def _other_pool_health(pool: List[ConversationSummary], exclude_cid: str) -> Tuple[int, int]:
+            th, ta = 0, 0
+            for other in pool:
+                if other.conversation_id == exclude_cid:
+                    continue
+                oh, oa = win10_stats.get(other.conversation_id, (0, 0))
+                th += oh
+                ta += oa
+            return th, ta
+
+        has_verified_healthy_main = False
+        for m in eval_mains:
+            if m.abnormal_in_recent10 != 0:
+                continue
+            if not is_historical_rating:
+                if win10_stats.get(m.conversation_id, (0, 0))[0] >= 1:
+                    has_verified_healthy_main = True
+                    break
+            else:
+                # m.abnormal_in_recent10 == 0 is already guaranteed; cacheable_in_recent10 >= 1 proves >=1 in-window hit!
+                if m.cacheable_in_recent10 >= 1:
+                    has_verified_healthy_main = True
+                    break
+
+        all_mains_zero_abn = bool(eval_mains) and all(m.abnormal_in_recent10 == 0 for m in eval_mains)
+        all_mains_win10_abn = sum(win10_stats.get(m.conversation_id, (0, 0))[1] for m in eval_mains)
+        mains_fully_healthy = has_verified_healthy_main and all_mains_zero_abn and (all_mains_win10_abn == 0)
+        allow_sub_single_denoise = mains_fully_healthy and (not is_all_accounts_mixed)
+
+        def _is_single_miss_aged_out(c: ConversationSummary, pool: List[ConversationSummary]) -> bool:
+            if not is_live_aging:
+                return False
+            if c.last_abnormal_ts <= 0.0 or (anchor_ts - c.last_abnormal_ts) < 600.0:
+                return False
+            other_hits, other_abns = _other_pool_health(pool, c.conversation_id)
+            if other_hits >= 2 and other_abns == 0:
+                return True
+            # For stale (>10m) subagent single_miss, verified fully-healthy mains also prove recovery
+            if c.is_subagent and allow_sub_single_denoise:
+                main_hits = sum(win10_stats.get(m.conversation_id, (0, 0))[0] for m in eval_mains)
+                if main_hits >= 2:
+                    return True
+            return False
+
+        active_main_single = any(
+            c.single_miss and not _is_single_miss_aged_out(c, eval_mains)
+            for c in eval_mains
+        )
+        active_sub_single_convs = [
+            c
+            for c in eval_subs
+            if c.single_miss and not _is_single_miss_aged_out(c, eval_subs)
+        ]
+        # Concurrent subagent burst check counts distinct subagents with recent (<10m) single_miss
+        recent_sub_single_count = sum(
+            1
+            for c in active_sub_single_convs
+            if c.last_abnormal_ts <= 0.0 or (anchor_ts - c.last_abnormal_ts) < 600.0
+        )
+        if active_main_single:
+            any_single_miss = True
+        elif recent_sub_single_count >= 2:
+            any_single_miss = True
+        elif active_sub_single_convs and not allow_sub_single_denoise:
+            any_single_miss = True
+        else:
+            any_single_miss = False
+
+        unstable_candidates: List[ConversationSummary] = []
+        for c in recent_active:
+            if c.abnormal_in_recent10 < 2:
+                continue
+            if c.abnormal_in_recent10 >= 4 or c.consec_miss >= 1:
+                unstable_candidates.append(c)
+                continue
+            # Both main and subagent conversations with 2..3 abnormal misses MUST satisfy recovery clearance (never silently bypassed!)
+            need_hits = 3 if c.abnormal_in_recent10 == 2 else 4
+            if is_historical_rating and hr_key != "30m":
+                if c.last_abnormal_ts > 0.0:
+                    c_lo = max(c.last_abnormal_ts - 600.0, eval_cutoff_ts - 2.0)
+                    c_hi = min(c.last_abnormal_ts + 600.0, anchor_ts + 2.0)
+                    other_main_abns = sum(
+                        cls._count_steps_in_window(m, c_lo, c_hi)[1]
+                        for m in eval_mains
+                        if m.conversation_id != c.conversation_id
+                    )
+                else:
+                    other_main_abns = 1
+            else:
+                _oh_m, other_main_abns = _other_pool_health(eval_mains, c.conversation_id)
+            if c.tail_consec_hits_after_abnormal >= need_hits and other_main_abns == 0:
+                continue
+            if (
+                is_live_aging
+                and c.last_abnormal_ts > 0.0
+                and (anchor_ts - c.last_abnormal_ts) >= 600.0
+                and c.tail_consec_hits_after_abnormal >= 1
+                and all_mains_win10_abn == 0
+            ):
+                continue
+            unstable_candidates.append(c)
+
+        unstable_recovery_conv: Optional[ConversationSummary] = None
+        if unstable_candidates:
+            unstable_candidates.sort(
+                key=lambda c: (0 if not c.is_subagent else 1, -c.abnormal_in_recent10, -c.latest_timestamp)
+            )
+            unstable_recovery_conv = unstable_candidates[0]
+
+        return max_consec_miss, any_single_miss, severe_frequent_miss_conv, unstable_recovery_conv
 
     def _build_conversation_summary(
         self,
@@ -1967,8 +2242,14 @@ class AntigravityMonitorEngine:
         current_acct_since_ts: float = 0.0,
         account_filter_fn: Optional[Callable[[float], bool]] = None,
         range_start_ts: float = 0.0,
+        rule_change_timestamps: Optional[List[float]] = None,
     ) -> Optional[Tuple[ConversationSummary, List[StepRecord], List[int]]]:
-        all_steps = self._classify_steps_cached(conv_id, raw_steps, switch_timestamps)
+        all_steps = self._classify_steps_cached(
+            conv_id,
+            raw_steps,
+            switch_timestamps,
+            rule_change_timestamps=rule_change_timestamps,
+        )
         if not all_steps:
             return None
 
@@ -1993,22 +2274,17 @@ class AntigravityMonitorEngine:
             eval_steps = scoped_steps
             eval_recent10 = recent10
 
-        consec_miss = 0
-        consec_start_step = latest.step_index
-        for s in reversed(eval_steps):
-            if s.classification == "abnormal_miss":
-                consec_miss += 1
-                consec_start_step = s.step_index
-            else:
-                break
-        single_miss = consec_miss == 1
-        wasted_cold = sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss")
-        abnormal_steps_r10 = [s for s in eval_recent10 if s.classification == "abnormal_miss"]
-        abnormal_r10 = len(abnormal_steps_r10)
-        hits_r10 = sum(1 for s in eval_recent10 if s.classification == "hit")
-        cacheable_r10 = abnormal_r10 + hits_r10
-        hit_ratio_r10 = (hits_r10 / cacheable_r10) if cacheable_r10 > 0 else None
-        first_abn_step_r10 = abnormal_steps_r10[0].step_index if abnormal_steps_r10 else 0
+        st = self._compute_eval_window_stats(eval_steps, eval_recent10)
+        consec_miss = st["consec_miss"]
+        consec_start_step = st["consec_miss_start_step"]
+        single_miss = st["single_miss"]
+        wasted_cold = st["wasted_cold_tokens"]
+        abnormal_r10 = st["abnormal_in_recent10"]
+        cacheable_r10 = st["cacheable_in_recent10"]
+        hit_ratio_r10 = st["recent10_hit_ratio"]
+        first_abn_step_r10 = st["first_abnormal_step_in_recent10"]
+        tail_hits_after_abn = st["tail_consec_hits_after_abnormal"]
+        last_abn_ts = st["last_abnormal_ts"]
 
         fresh_rem: Optional[int] = None
         fresh_invalid = ""
@@ -2059,6 +2335,8 @@ class AntigravityMonitorEngine:
             latest_cache_reason=latest.reason,
             active_media_count=latest.active_media_count,
             active_media_bytes=latest.active_media_bytes,
+            tail_consec_hits_after_abnormal=tail_hits_after_abn,
+            last_abnormal_ts=last_abn_ts,
             _scoped_steps_all=scoped_steps,
         )
         return summary, all_steps, scoped_indices
@@ -2478,6 +2756,7 @@ class AntigravityMonitorEngine:
                 max_older_convs = 48
 
         switch_timestamps = self._ledger.get_switch_timestamps(lookback_cutoff)
+        rule_timestamps = self._observe_and_get_rule_timestamps(now, since_ts=0.0)
         current_acct_since_ts = timeline[-1][0] if (resolved_account and not is_custom_account_view and len(timeline) >= 2) else 0.0
 
         target_query = (target_conversation_id or "").strip()
@@ -2575,6 +2854,7 @@ class AntigravityMonitorEngine:
                 current_acct_since_ts=0.0 if acct_filter_fn is not None else current_acct_since_ts,
                 account_filter_fn=acct_filter_fn,
                 range_start_ts=range_start_ts,
+                rule_change_timestamps=rule_timestamps,
             )
             if built is None:
                 if want_carryover and (not is_sub_conv) and (now - last_raw_ts) <= 600.0:
@@ -2611,6 +2891,7 @@ class AntigravityMonitorEngine:
                         current_acct_since_ts=0.0,
                         account_filter_fn=None,
                         range_start_ts=0.0,
+                        rule_change_timestamps=rule_timestamps,
                     )
 
         convs_bundle.sort(key=lambda b: b[0].latest_timestamp, reverse=True)
@@ -2895,6 +3176,7 @@ class AntigravityMonitorEngine:
                     current_acct_since_ts=0.0,
                     account_filter_fn=None,
                     range_start_ts=0.0,
+                    rule_change_timestamps=rule_timestamps,
                 )
                 if co_built is not None:
                     co_c = co_built[0]
@@ -2906,25 +3188,21 @@ class AntigravityMonitorEngine:
                     if len(carryover_convs) >= 2:
                         break
 
-        max_consec_miss = max((c.consec_miss for c in recent_active), default=0)
-        any_single_miss = any(c.single_miss for c in recent_active)
+        max_consec_miss, any_single_miss, severe_frequent_miss_conv, unstable_recovery_conv = (
+            self._select_cache_health_signals(
+                recent_active,
+                now_ts=now,
+                eval_cutoff_ts=eval_cutoff_ts,
+                eval_end_ts=eval_end_ts,
+                is_historical_rating=is_historical_rating,
+                hr_key=hr_key,
+                is_custom_account_view=is_custom_account_view,
+                is_all_accounts_mixed=(raw_view == "__all__"),
+            )
+        )
         any_slow = any(c.speed_status == "slow" for c in recent_active[:2])
         wasted_total = sum(c.wasted_cold_tokens for c in recent_active)
         max_abnormal_r10 = max((c.abnormal_in_recent10 for c in recent_active), default=0)
-        severe_frequent_miss_conv = next(
-            (
-                c
-                for c in recent_active
-                if c.abnormal_in_recent10 >= 4
-                and c.cacheable_in_recent10 >= 4
-                and (c.recent10_hit_ratio is not None and c.recent10_hit_ratio < 0.5)
-            ),
-            None,
-        )
-        unstable_recovery_conv = next(
-            (c for c in recent_active if c.abnormal_in_recent10 >= 2),
-            None,
-        )
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
@@ -3216,8 +3494,11 @@ class AntigravityMonitorEngine:
         fallback_label: str = "",
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Low-frequency (10m TTL) read-only scan of completed prior-day steps per account across recent transcripts."""
+        hist_cutoff = today_start - 14 * 86400.0
+        hist_rules = self._observe_and_get_rule_timestamps(now, since_ts=hist_cutoff)
+        hist_rule_sig = tuple(round(t, 1) for t in hist_rules[-64:])
         last_tl = timeline[-1] if timeline else None
-        cache_key = (today_str, len(timeline), last_tl, (fallback_label or "").lower())
+        cache_key = (today_str, len(timeline), last_tl, (fallback_label or "").lower(), hist_rule_sig)
         if (
             self._hist_daily_profiles_cache_key == cache_key
             and 0.0 <= (now - self._hist_daily_profiles_cache_ts) < 600.0
@@ -3231,7 +3512,6 @@ class AntigravityMonitorEngine:
             self._hist_daily_profiles_cache = profiles
             return profiles
 
-        hist_cutoff = today_start - 14 * 86400.0
         hist_timeline = self._ledger.get_timeline(hist_cutoff)
         if not hist_timeline:
             hist_timeline = timeline
@@ -3340,6 +3620,7 @@ class AntigravityMonitorEngine:
                 idle_rewarm_sec=idle_sec,
                 min_cacheable_tokens=min_cache_tok,
                 account_switches=hist_switches,
+                rule_change_timestamps=hist_rules,
             )
             consec = 0
             for st_rec in steps:
@@ -4591,8 +4872,14 @@ class AntigravityMonitorEngine:
             first_ts = float(raw_steps[0].get("timestamp", 0.0) or 0.0)
             tl_since = min(today_start - 3600.0, first_ts or (now - 7 * 86400.0))
             switch_timestamps = self._ledger.get_switch_timestamps(tl_since)
+            rule_timestamps = self._observe_and_get_rule_timestamps(now, since_ts=0.0)
 
-            all_steps = self._classify_steps_cached(conv_id, raw_steps, switch_timestamps)
+            all_steps = self._classify_steps_cached(
+                conv_id,
+                raw_steps,
+                switch_timestamps,
+                rule_change_timestamps=rule_timestamps,
+            )
             if not all_steps:
                 return None
 

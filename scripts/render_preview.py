@@ -250,8 +250,9 @@ def _build_demo_detail_report() -> ConversationDetailReport:
         (8, "Carbon High", 264100, 35200, 0.0, "expected_cold", "account_switch", 24.1, 151.0, 4.2, False, False, True, 3, 4_850_000),
         (9, "Carbon High", 385600, 31500, 99.1, "hit", "cached", 14.2, 165.0, 5.1, False, False, False, 3, 4_850_000),
         (10, "Carbon High", 218400, -167200, 0.0, "expected_cold", "compact_reset", 18.0, 171.0, 3.8, False, True, False, 0, 0),
-        (11, "Carbon High", 342000, 123600, 98.7, "hit", "cached", 19.1, 174.0, 4.1, False, False, False, 1, 2_100_000),
-        (12, "Neon XHigh", 473800, 131800, 99.2, "hit", "cached", 48.2, 168.0, 5.6, False, False, False, 4, 6_400_000),
+        (11, "Carbon High", 252600, 34200, 0.0, "expected_cold", "rule_change", 17.6, 170.0, 4.0, False, False, False, 1, 1_200_000),
+        (12, "Carbon High", 342000, 89400, 98.7, "hit", "cached", 19.1, 174.0, 4.1, False, False, False, 1, 2_100_000),
+        (13, "Neon XHigh", 473800, 131800, 99.2, "hit", "cached", 48.2, 168.0, 5.6, False, False, False, 4, 6_400_000),
     ]
     for idx, (sidx, mod, tot, dlt, hr, cls, rsn, ttft, tps, strm, rev, cmp_, acc_sw, mc, mb) in enumerate(specs):
         cached = int(tot * (hr / 100.0))
@@ -279,7 +280,7 @@ def _build_demo_detail_report() -> ConversationDetailReport:
             )
         )
     return ConversationDetailReport(
-        conversation_id="demo-detail-v721-0000-000000000001",
+        conversation_id="demo-detail-v722-0000-000000000001",
         short_id="demo72",
         is_subagent=False,
         model="Neon XHigh",
@@ -288,24 +289,24 @@ def _build_demo_detail_report() -> ConversationDetailReport:
         today_steps=len(pts),
         peak_context_tokens=473800,
         latest_context_tokens=473800,
-        latest_context_delta=32600,
+        latest_context_delta=131800,
         max_context_tokens=512000,
         compact_count=1,
         cache_hit_steps=7,
         abnormal_miss_steps=0,
-        expected_cold_steps=5,
+        expected_cold_steps=6,
         overall_cacheable_hit_ratio=1.0,
-        avg_ttft_sec=19.8,
+        avg_ttft_sec=20.1,
         p95_ttft_sec=48.2,
         max_ttft_sec=48.2,
-        avg_tps=161.2,
+        avg_tps=161.8,
         latest_tps=168.0,
         latest_ttft_sec=48.2,
         freshness_remaining_sec=175,
         freshness_invalid_reason="",
         freshness_window_sec=210,
         points=pts,
-        title="v7.2.1 跨号多图与大窗校准演示",
+        title="v7.2.2 跨号改规冷启与大窗校准演示",
         revert_count=0,
     )
 
@@ -346,6 +347,39 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         large_ctx_ttft_allowance_sec=28.9,
         title="超大上下文与并发告警演示",
     )
+    c_rule = ConversationSummary(
+        conversation_id="demo7220-0000-0000-0000-000000000002",
+        short_id="demo72",
+        model="Neon XHigh",
+        model_raw="gemini-4-neon-xhigh",
+        context_tokens=142800,
+        max_context_tokens=512000,
+        latest_hit_rate=0.0,
+        latest_cached_in=0,
+        latest_uncached_in=142800,
+        latest_timestamp=now - 19,
+        recent_steps=[
+            StepRecord(1, now - 75, "gemini-4-neon-xhigh", 2800, 121000, 580, 123800, 97.7, "hit", "cached"),
+            StepRecord(2, now - 19, "gemini-4-neon-xhigh", 142800, 0, 460, 142800, 0.0, "expected_cold", "rule_change"),
+        ],
+        consec_miss=0,
+        consec_miss_start_step=0,
+        single_miss=False,
+        wasted_cold_tokens=0,
+        freshness_remaining_sec=None,
+        freshness_invalid_reason="",
+        ttft_sec=14.6,
+        streaming_sec=3.2,
+        tps=164.0,
+        shard_tag="dm72",
+        speed_status="ok",
+        recent_ttfts=[11.4, 14.6],
+        recent_tps_list=[168.0, 164.0],
+        ttft_avg_sec=13.0,
+        ttft_max_sec=14.6,
+        latest_cache_reason="rule_change",
+        title="全局改规冷启演示",
+    )
     return MonitorSnapshot(
         generated_at=now,
         level="orange",
@@ -365,7 +399,7 @@ def _build_demo_v721_warn_snapshot() -> MonitorSnapshot:
         today_steps=1180,
         daily_steps_warn=1280,
         daily_steps_alert=1600,
-        active_conversations=[c_big],
+        active_conversations=[c_big, c_rule],
         large_freshness_list=[c_big],
         recent_503=0,
         today_503=0,
@@ -452,10 +486,10 @@ def main() -> int:
             app._on_update_check_result(
                 UpdateCheckResult(
                     checked_at=time.time(),
-                    local_version="7.2.1",
+                    local_version="7.2.2",
                     remote_version="7.3.0",
                     has_update=True,
-                    summary="多图超时免误判 T2、代理断流识别与自适应保护线",
+                    summary="已恢复掉缓存预警自动销账、识别全局改规则冷启与后台子代理单步瞬抖降噪",
                     released_at="2026-11-22",
                     install_mode="zip",
                     is_manual=True,
@@ -463,7 +497,7 @@ def main() -> int:
             )
             _capture_widget(app.root, out_dir / "shot_6_update_banner_midnight.png")
 
-            # 8. v7.2.1 concurrent heavy-media timeout + proxy outage WARN + adaptive steps preview
+            # 8. v7.2.2 concurrent heavy-media timeout + proxy outage WARN + rule_change + adaptive steps preview
             app._hide_update_banner()
             warn_v721 = _build_demo_v721_warn_snapshot()
             app.render_snapshot(warn_v721)

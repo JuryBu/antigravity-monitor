@@ -54,7 +54,7 @@ python -B main.py --json --readonly --conversation-id <id>
 | 退出码 | 对应 `pressure` | 含义与判定条件 |
 |---|---|---|
 | `0` | `normal` | 健康正常或在线新号待采样：`grade` 为 `T0` 或在线无异常 `WAIT`，且当前口径今日步数低于参考黄线（初始默认 `960`，可随账号历史实绩自适应调整） |
-| `1` | `warn` / `red` / `degraded` | 需留意或存在异常：触及今日步数参考黄线（`warn`）或参考红线（`red`，**仅作容量参考提醒，不等于账号实际降权；自动化策略应以持续性的 `grade`/`cache`/`perf`/`account` 实际状态为准，不凭瞬时波动或纯步数硬停**）、单步异常掉缓存/疑似暗限速/偶发 1 次 503/重图上传超时/代理断流（`WARN`），或持续掉缓存与服务端限流封禁（`T1` / `T2` / `T3`，`degraded`） |
+| `1` | `warn` / `red` / `degraded` | 需留意或存在异常：触及今日步数参考黄线（`warn`）或参考红线（`red`，**仅作容量参考提醒，不等于账号实际降权；自动化策略应以持续性的 `grade`/`cache`/`perf`/`account` 实际状态为准，不凭瞬时波动或纯步数硬停**）、未恢复/未老化的异常掉缓存（主对话全绿时后台子代理偶发单步瞬抖自动降噪，不误拉黄主态）/疑似暗限速/偶发 1 次 503/重图上传超时/代理断流（`WARN`），或持续掉缓存与服务端限流封禁（`T1` / `T2` / `T3`，`degraded`） |
 | `2` | `offline_unknown` | 离线、证据不足或参数/采集失败：`grade == "IDLE"`（客户端未在线且无近 2 分钟实时轨迹）、离线指定无记录账号，或命令行参数错误、运行期读取异常（此时 `--json` 仍保证输出合法 JSON，含 `"ok": false` 与 `"error"`） |
 
 ---
@@ -108,7 +108,7 @@ python -B main.py --json --readonly --conversation-id <id>
 
 ### 3. `cache`、`perf`、`errors_30m`、`errors_today`、`alerts`
 
-- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `abnormal_zero`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
+- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `rule_change` / `abnormal_zero`）、`consec_miss`（近窗最大连续异常归零步数）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
 - **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`；已排除极短输出 `<0.15s` 假 TPS 与高 TPS / 多模态原图上传耗时误判）。
 - **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，按 `ERROR_MESSAGE ±6s` 与 `USER_INPUT` 瞬时快照两阶段反查出事对话并自动分流重图大包上传超时 `heavy_media_timeout` 免误升 T2）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数，以及 `errors_30m` 可选字段 `heavy_media_timeout`、`proxy_outage`、`proxy_outage_note`（跨接口 60s 爆发代理断流计数与说明，离线/历史视图不误升 `WARN`）、`window_min` 与 `t2_recovery_note`（`errors_today` 另附 `machine_*` 全机今日累计）；仅非重图服务端 `503 + timeout >= 2` 才升级红 `T2`，事后按主对话模型结合大上下文（`>=300K`）弹性校准与重图满速豁免评估恢复，严格保留真实 TTFT 展示且需 `>=2` 步常规步才回绿 `T0`。
 - **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
@@ -129,6 +129,6 @@ python -B main.py --json --readonly --conversation-id <id>
 
 1. **严格零写盘与并发安全**：`--cli`、`--json` 及 `--readonly` 均跳过 `account_ledger.json` 持久化写盘，多对话、多子代理并发调用不会触发 Windows `os.replace` `PermissionError` 竞态。
 2. **上下文压缩重热识别**：系统通过 `transcript.jsonl` 中的 `CHECKPOINT` 事件结合上下文真实缩水（`< 0.85×`），或无事件时的上下文骤降（`< 0.75×`）识别压缩重热（`reason = "compact_reset"`, `classification = "expected_cold"`），既保证压缩耗时超过 180s 也不误判，也避免正文提及压缩关键词时产生假阳性。
-3. **规则文件修改触发的前缀重置**：若对话中途修改了注入到系统提示词中的规则文件，下一拍可能出现单步 `cr=0` 重热（随后立即恢复 98%+ 命中）；单步归零仅触发轻量 `WARN`（`pressure = "warn"`），需连续 `>= 2` 步或近 10 步高频异常才会判定为 `T1 / degraded`。
+3. **规则文件修改触发的前缀重置**：全局 `GEMINI.md` 规则文件修改触发的首步 `cr=0` 已自动识别为正常冷启（`reason = "rule_change"`, `classification = "expected_cold"`，短标 `规则冷`）；若是工作区级规则文件（如 `AGENTS.md`）修改触发的前缀重置，仍按单步轻量 `WARN`（`pressure = "warn"`）提示并在下一步恢复（需连续 `>= 2` 步或近 10 步高频异常才会判定为 `T1 / degraded`）。
 4. **周额度与重置时间来源**：5h 额度及原生 `resetTime` 直接来自本机在线 Antigravity Language Server Hub（最多扫描最近 40 个 `hub_*.json` 并先校验 PID 存活）；周额度与周重置时间在安装了第三方工具 Antigravity Cockpit 且**严格同邮箱匹配**时只读补全，未安装或离线时保持 `null`，绝不跨账号混用。
 5. **全链路自动脱敏**：所有输出均对邮箱及账号标识执行首尾掩码处理，绝不读取、打印或持久化任何认证 Token。

@@ -4696,6 +4696,425 @@ class TestShortcutsAndIcons(unittest.TestCase):
                     dw.close()
                 app.shutdown()
 
+    def test_v722_rule_change_classification_anti_whitewash_and_ledger_persistence(self) -> None:
+        """v7.2.2 Module 2: GEMINI.md rule_change monotonic watermark anti-whitewash, >14d anti-storm ledger, read_only in-memory support, main/detail parity & readout width lock."""
+        import math
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            CACHE_REASON_CN_MAP,
+            COLD_SHORT_BADGE_MAP,
+            ConversationDetailPoint,
+            ConversationDetailReport,
+            classify_steps,
+        )
+        from ui.capsule_app import AntigravityCapsuleApp
+        from ui.detail_window import ConversationDetailWindow
+        from ui.themes import THEMES
+
+        self.assertEqual(CACHE_REASON_CN_MAP.get("rule_change"), "改规冷启")
+        self.assertEqual(COLD_SHORT_BADGE_MAP.get("rule_change"), "规则冷")
+
+        # 1. Ledger persistence: reject bool/NaN/Inf/out-of-range/>14d old mtime (zero write storm), read_only updates memory only
+        with tempfile.TemporaryDirectory() as td:
+            lp = Path(td) / "ledger.json"
+            now = 1_795_000_000.0
+            lp.write_text(
+                json.dumps({
+                    "version": 1,
+                    "events": [],
+                    "rule_change_timestamps": [True, False, "bad", -1, 100.0, now - 100.0, now - 99.6, now - 50.0],
+                }),
+                encoding="utf-8",
+            )
+            lgr_ro = AccountSwitchLedger(ledger_path=lp, read_only=True)
+            self.assertEqual(len(lgr_ro.get_rule_change_timestamps()), 2)  # -100 & -50 (deduped -99.6)
+            mtime_before = lp.stat().st_mtime_ns
+            # read_only=True updates in-memory list for immediate CLI classification without touching disk
+            self.assertTrue(lgr_ro.record_rule_change(now - 10.0, now_ts=now))
+            self.assertEqual(len(lgr_ro.get_rule_change_timestamps()), 3)
+            self.assertEqual(lp.stat().st_mtime_ns, mtime_before)
+
+            lgr = AccountSwitchLedger(ledger_path=lp, read_only=False)
+            self.assertFalse(lgr.record_rule_change(True, now_ts=now))  # type: ignore[arg-type]
+            self.assertFalse(lgr.record_rule_change(float("nan"), now_ts=now))
+            self.assertFalse(lgr.record_rule_change(float("inf"), now_ts=now))
+            self.assertFalse(lgr.record_rule_change(now - 15 * 86400.0, now_ts=now))  # >14d stale mtime MUST NOT trigger write storm!
+            self.assertFalse(lgr.record_rule_change(now + 600.0, now_ts=now))  # far future blocked
+            self.assertEqual(lp.stat().st_mtime_ns, mtime_before)
+            self.assertTrue(lgr.record_rule_change(now - 5.0, now_ts=now))
+            self.assertFalse(lgr.record_rule_change(now - 4.5, now_ts=now))  # <=1s dedup
+            lgr_reload = AccountSwitchLedger(ledger_path=lp, read_only=True)
+            self.assertEqual(len(lgr_reload.get_rule_change_timestamps()), 3)
+            # 64-entry cap: inserting an older timestamp when full MUST return False and NOT write disk!
+            lgr_cap = AccountSwitchLedger(ledger_path=Path(td) / "cap_ledger.json", read_only=False)
+            for k in range(64):
+                self.assertTrue(lgr_cap.record_rule_change(now - 2000.0 + k * 10.0, now_ts=now))
+            cap_mt = (Path(td) / "cap_ledger.json").stat().st_mtime_ns
+            self.assertFalse(lgr_cap.record_rule_change(now - 5000.0, now_ts=now))
+            self.assertEqual((Path(td) / "cap_ledger.json").stat().st_mtime_ns, cap_mt)
+
+        # 2. classify_steps six anti-whitewash guards
+        t0 = 1_795_000_000.0
+        def _mk(si: int, dt: float, cr: int, inp: int = 2000, tot_base: int = 120000, **extra):
+            return {
+                "step_index": si,
+                "timestamp": t0 + dt,
+                "model": "gemini-4-neon-xhigh",
+                "input_tokens": tot_base if cr == 0 else inp,
+                "cache_read_tokens": cr,
+                "output_tokens": 300,
+                **extra,
+            }
+
+        # 2a. Realistic pattern: rule edit at +100, trailing tool hit at +105, first new turn cr=0 at +184 -> rule_change; next cr=0 at +271 -> abnormal_miss!
+        s_real = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 30, 118000), _mk(3, 105, 118000), _mk(4, 184, 0), _mk(5, 271, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual((s_real[3].classification, s_real[3].reason), ("expected_cold", "rule_change"))
+        self.assertEqual((s_real[4].classification, s_real[4].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2b. Rapid double rule save [100, 110] MUST NOT allow consecutive 2-step T1 whitewash!
+        s_dbl = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 50, 118000), _mk(3, 120, 0), _mk(4, 135, 0)],
+            rule_change_timestamps=[t0 + 100.0, t0 + 110.0],
+        )
+        self.assertEqual(s_dbl[2].reason, "rule_change")
+        self.assertEqual((s_dbl[3].classification, s_dbl[3].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2c. Brand-new conversation started AFTER rule edit MUST NOT whitewash Step 2 cr=0!
+        s_new = classify_steps(
+            [_mk(1, 110, 0), _mk(2, 125, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_new[0].reason, "first_turn")
+        self.assertEqual((s_new[1].classification, s_new[1].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2d. Existing conv hits compact_reset (>=32K) after rule edit -> watermark advances -> next cr=0 is abnormal_miss!
+        s_cmp = classify_steps(
+            [_mk(1, 0, 0, tot_base=200000), _mk(2, 50, 198000), _mk(3, 105, 0, tot_base=100000, after_checkpoint=True), _mk(4, 125, 0, tot_base=105000)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_cmp[2].reason, "compact_reset")
+        self.assertEqual((s_cmp[3].classification, s_cmp[3].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2e. Existing ongoing abnormal_miss chain MUST NOT be broken by a rule edit!
+        s_chain = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 30, 118000), _mk(3, 95, 0), _mk(4, 105, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_chain[2].classification, "abnormal_miss")
+        self.assertEqual(s_chain[3].classification, "abnormal_miss")
+
+        # 2f. >=2 consecutive hits AFTER rule edit -> later cr=0 is abnormal_miss (not blamed on old rule edit)!
+        s_2hit = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 30, 118000), _mk(3, 105, 118000), _mk(4, 120, 118000), _mk(5, 140, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual((s_2hit[4].classification, s_2hit[4].reason), ("abnormal_miss", "abnormal_zero"))
+
+        # 2g. Delayed out-of-order step MUST NOT consume rule watermark or trigger rule_change!
+        s_ooo = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 105, 118000), _mk(3, 50, 0), _mk(4, 125, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_ooo[2].classification, "abnormal_miss")
+        self.assertEqual(s_ooo[3].reason, "rule_change")
+
+        # 2h. Final-B regressions (P1-1, P1-2, P2-4):
+        # Same-second hits & <=5s micro-rollback MUST count >=2 hits and block rule_change!
+        s_same = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 105, 118000), _mk(3, 105, 118000), _mk(4, 105, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_same[3].classification, "abnormal_miss")
+        s_back = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 105, 118000), _mk(3, 108, 118000), _mk(4, 107, 0)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_back[3].classification, "abnormal_miss")
+        # <32K expected_cold after t_rule MUST advance watermark; new conv at t_rule+1s MUST NOT whitewash Step 2!
+        s_sub32 = classify_steps(
+            [_mk(1, 0, 0, tot_base=200000), _mk(2, 50, 198000), _mk(3, 105, 0, tot_base=20000, after_checkpoint=True), _mk(4, 115, 38000, inp=2000), _mk(5, 130, 0, tot_base=45000)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_sub32[4].classification, "abnormal_miss")
+        s_new1s = classify_steps(
+            [_mk(1, 101, 58000, inp=2000), _mk(2, 120, 0, tot_base=62000)],
+            rule_change_timestamps=[t0 + 100.0],
+        )
+        self.assertEqual(s_new1s[1].classification, "abnormal_miss")
+        # Double rule edit [t1, t2]: rule_change(t1) -> blocked abn(t2) MUST advance watermark so later cr=0 cannot reuse t2!
+        s_dbl2 = classify_steps(
+            [_mk(1, 0, 0), _mk(2, 50, 118000), _mk(3, 105, 0), _mk(4, 115, 0), _mk(5, 125, 118000), _mk(6, 135, 0)],
+            rule_change_timestamps=[t0 + 100.0, t0 + 112.0],
+        )
+        self.assertEqual(s_dbl2[2].reason, "rule_change")
+        self.assertEqual(s_dbl2[3].classification, "abnormal_miss")
+        self.assertEqual(s_dbl2[5].classification, "abnormal_miss")
+
+        # 3. End-to-end parity (main poll vs read_conversation_detail) + custom paths isolation + detail window readout width lock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = time.time()
+            def _iso(off: float) -> str:
+                return datetime.datetime.fromtimestamp(now + off, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            rules_file = root / "GEMINI.md"
+            rules_file.write_text("# rules v2\n", encoding="utf-8")
+            os.utime(rules_file, (now - 90.0, now - 90.0))
+
+            cid = "rule0001-1111-2222-3333-444444444444"
+            tdir = root / "brain" / cid / ".system_generated" / "logs"
+            tdir.mkdir(parents=True)
+            (tdir / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso(-240)}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso(-230), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 300}),
+                    json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso(-150), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 118000, "output_tokens": 300}),
+                    json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso(-85), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 120000, "output_tokens": 300}),
+                    json.dumps({"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": _iso(-10), "model": "gemini-4-neon-xhigh", "input_tokens": 124000, "cache_read_tokens": 0, "output_tokens": 300}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            base_p = {
+                "brain_dir": root / "brain",
+                "conversations_dir": root / "conversations",
+                "daemon_dir": root / "daemon",
+                "ls_log_path": root / "ls.log",
+                "cockpit_quota_db": root / "missing.sqlite",
+            }
+            # Without global_rules_path -> strictly isolated from host GEMINI.md -> step 5 is abnormal_miss
+            eng_iso = AntigravityMonitorEngine(paths=dict(base_p), read_only=True)
+            self.assertIsNone(eng_iso.global_rules_path)
+            eng_iso._account_cache = AccountQuotaInfo(short_label="de***1", online=True, observed_at=now)
+            eng_iso._last_account_poll = now
+            snap_iso = eng_iso.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_iso.active_conversations[0].latest_cache_reason, "abnormal_zero")
+
+            # With global_rules_path -> BOTH poll() and read_conversation_detail() classify step 5 as rule_change -> T0!
+            eng_rule = AntigravityMonitorEngine(paths={**base_p, "global_rules_path": rules_file}, read_only=True)
+            eng_rule._account_cache = AccountQuotaInfo(short_label="de***1", online=True, observed_at=now)
+            eng_rule._last_account_poll = now
+            snap_r = eng_rule.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_r.grade, "T0")
+            self.assertEqual(snap_r.active_conversations[0].latest_cache_reason, "rule_change")
+            detail_r = eng_rule.read_conversation_detail(cid, now_ts=now)
+            self.assertIsNotNone(detail_r)
+            assert detail_r is not None
+            self.assertEqual(detail_r.points[-1].reason, "rule_change")
+            self.assertEqual(detail_r.abnormal_miss_steps, 0)
+
+            # Hot-updating GEMINI.md invalidates _classified_cache on next poll without restarting!
+            eng_hot = AntigravityMonitorEngine(paths={**base_p, "global_rules_path": root / "missing_rules.md"}, read_only=True)
+            eng_hot._account_cache = AccountQuotaInfo(short_label="de***1", online=True, observed_at=now)
+            eng_hot._last_account_poll = now
+            self.assertEqual(eng_hot.poll(now_ts=now, force_account=False).active_conversations[0].latest_cache_reason, "abnormal_zero")
+            (root / "missing_rules.md").write_text("# hot created\n", encoding="utf-8")
+            os.utime(root / "missing_rules.md", (now - 90.0, now - 90.0))
+            self.assertEqual(eng_hot.poll(now_ts=now, force_account=False).active_conversations[0].latest_cache_reason, "rule_change")
+
+            # Main UI badge "规则冷", hover cold_explain["rule_change"], and detail window reusing real detail_r!
+            cfg_store = ConfigStore(root / "cfg.json")
+            app = AntigravityCapsuleApp(
+                app_root=Path(__file__).resolve().parent.parent,
+                config_store=cfg_store,
+                engine=eng_rule,
+                enable_tray=False,
+                start_minimized_override=False,
+            )
+            dw = None
+            try:
+                app.root.withdraw()
+                app.set_expanded(True)
+                app.render_snapshot(snap_r)
+                app.root.update()
+                self.assertEqual(app._conv_rows[0]["hit"].cget("text"), "规则冷")
+                self.assertIn("GEMINI.md", app._conv_hover_texts[0])
+                dw = ConversationDetailWindow(
+                    parent=app.root, theme=THEMES["midnight_blue"],
+                    load_report=lambda _cid: detail_r, on_toggle_pin=lambda _cid: None, is_pinned_fn=lambda _cid: False,
+                )
+                dw.win.withdraw()
+                locked = dw._lock_window_size()
+                dw.show_conversation(cid, place_near_parent=False)
+                dw.win.update()
+                self.assertEqual((dw.win.winfo_width(), dw.win.winfo_height()), locked)
+                self.assertIn("[改规冷启]", dw._lbl_readout.cget("text"))
+                self.assertLessEqual(dw._lbl_readout.winfo_reqwidth(), dw._readout_box.winfo_width() + 2)
+            finally:
+                if dw is not None:
+                    dw.close()
+                app.shutdown()
+
+    def test_v722_recovery_clearance_aging_and_subagent_jitter_denoising(self) -> None:
+        """v7.2.2 Modules 1 & 3: sustained hit clearance (abn=2->3 hits, abn=3->4 hits, abn=4 never), compact-bridged recovery, 10m live aging (historical preserved), cross-conv guard, verified healthy main & >=2 subagent burst guard."""
+        from core.log_monitor import ConversationSummary, StepRecord
+
+        now = 1_795_000_000.0
+
+        def _mk_conv(
+            cid: str,
+            specs: list[tuple[float, str, str]],
+            is_sub: bool = False,
+        ) -> ConversationSummary:
+            steps = []
+            for idx, (off, cls_v, rsn_v) in enumerate(specs, 1):
+                hr = 98.0 if cls_v == "hit" else 0.0
+                steps.append(StepRecord(idx, now + off, "gemini-4-neon-xhigh", 2000 if cls_v == "hit" else 100000, 98000 if cls_v == "hit" else 0, 300, 100000, hr, cls_v, rsn_v))
+            recent10 = steps[-10:]
+            st = AntigravityMonitorEngine._compute_eval_window_stats(steps, recent10)
+            return ConversationSummary(
+                conversation_id=cid, short_id=cid[:6], model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                context_tokens=100000, max_context_tokens=512000, latest_hit_rate=steps[-1].hit_rate,
+                latest_cached_in=steps[-1].cache_read_tokens, latest_uncached_in=steps[-1].input_tokens,
+                latest_timestamp=steps[-1].timestamp, recent_steps=recent10,
+                consec_miss=st["consec_miss"], consec_miss_start_step=st["consec_miss_start_step"],
+                single_miss=st["single_miss"], wasted_cold_tokens=st["wasted_cold_tokens"],
+                freshness_remaining_sec=180, abnormal_in_recent10=st["abnormal_in_recent10"],
+                cacheable_in_recent10=st["cacheable_in_recent10"], recent10_hit_ratio=st["recent10_hit_ratio"],
+                first_abnormal_step_in_recent10=st["first_abnormal_step_in_recent10"],
+                is_subagent=is_sub, tail_consec_hits_after_abnormal=st["tail_consec_hits_after_abnormal"],
+                last_abnormal_ts=st["last_abnormal_ts"], _scoped_steps_all=steps,
+            )
+
+        def _sel(convs: list[ConversationSummary], is_hist: bool = False, hr_key: str = "30m"):
+            return AntigravityMonitorEngine._select_cache_health_signals(
+                convs, now_ts=now, eval_cutoff_ts=now - 1800.0, eval_end_ts=now,
+                is_historical_rating=is_hist, hr_key=hr_key, is_custom_account_view=False,
+            )
+
+        # 1. abn=2 with only 2 trailing hits stays unstable WARN; with 3 trailing hits (even bridging expected_cold compact) clears!
+        c_2_2 = _mk_conv("m-2-2", [(-300, "abnormal_miss", "abnormal_zero"), (-240, "abnormal_miss", "abnormal_zero"), (-180, "hit", "cached"), (-120, "hit", "cached")])
+        self.assertIsNotNone(_sel([c_2_2])[3])
+        c_2_3_cmp = _mk_conv("m-2-3", [(-360, "abnormal_miss", "abnormal_zero"), (-300, "abnormal_miss", "abnormal_zero"), (-240, "hit", "cached"), (-180, "hit", "cached"), (-120, "expected_cold", "compact_reset"), (-60, "hit", "cached")])
+        self.assertEqual(c_2_3_cmp.tail_consec_hits_after_abnormal, 3)
+        self.assertIsNone(_sel([c_2_3_cmp])[3])  # self-exclusion ensures c_2_3_cmp does NOT self-lock!
+
+        # 2. abn=3 requires 4 trailing hits (3 hits still WARN); abn=4 NEVER clears!
+        c_3_3 = _mk_conv("m-3-3", [(-400, "abnormal_miss", "abnormal_zero"), (-350, "abnormal_miss", "abnormal_zero"), (-300, "abnormal_miss", "abnormal_zero"), (-200, "hit", "cached"), (-150, "hit", "cached"), (-100, "hit", "cached")])
+        self.assertIsNotNone(_sel([c_3_3])[3])
+        c_3_4 = _mk_conv("m-3-4", [(-450, "abnormal_miss", "abnormal_zero"), (-400, "abnormal_miss", "abnormal_zero"), (-350, "abnormal_miss", "abnormal_zero"), (-250, "hit", "cached"), (-200, "hit", "cached"), (-150, "hit", "cached"), (-100, "hit", "cached")])
+        self.assertIsNone(_sel([c_3_4])[3])
+        c_4_4 = _mk_conv("m-4-4", [(-500, "abnormal_miss", "abnormal_zero"), (-450, "abnormal_miss", "abnormal_zero"), (-400, "abnormal_miss", "abnormal_zero"), (-350, "abnormal_miss", "abnormal_zero"), (-250, "hit", "cached"), (-200, "hit", "cached"), (-150, "hit", "cached"), (-100, "hit", "cached"), (-50, "hit", "cached")])
+        self.assertIsNotNone(_sel([c_4_4])[3])
+
+        # 3. Condition A cross-conv guard: if another main conv dropped within 10m, c_2_3_cmp MUST NOT clear!
+        c_other_abn = _mk_conv("m-other-abn", [(-200, "abnormal_miss", "abnormal_zero"), (-100, "hit", "cached")])
+        self.assertIsNotNone(_sel([c_2_3_cmp, c_other_abn])[3])
+        # Cleared front-row conv MUST NOT shadow an uncleared conv behind it, and higher abnormal count wins priority!
+        c_old_nohit = _mk_conv("m-old-unrec", [(-720, "abnormal_miss", "abnormal_zero"), (-660, "abnormal_miss", "abnormal_zero")])
+        self.assertEqual(_sel([c_2_3_cmp, c_old_nohit])[3].conversation_id, "m-old-unrec")  # type: ignore[union-attr]
+        self.assertEqual(_sel([c_2_3_cmp, c_3_3])[3].conversation_id, "m-3-3")  # type: ignore[union-attr]
+
+        # 4. Condition B: 10m live aging clears paused conv with >=1 recovery hit, but historical view preserves it!
+        c_old_rec = _mk_conv("m-old", [(-900, "abnormal_miss", "abnormal_zero"), (-840, "abnormal_miss", "abnormal_zero"), (-780, "hit", "cached")])
+        self.assertIsNone(_sel([c_old_rec], is_hist=False)[3])
+        self.assertIsNotNone(_sel([c_old_rec], is_hist=True, hr_key="today")[3])
+
+        # 5. Main single_miss aging: aged >=10m + other main >=2 recent hits -> clears; default last_abnormal_ts=0.0 NEVER ages!
+        c_sm_old = _mk_conv("m-sm-old", [(-800, "hit", "cached"), (-700, "abnormal_miss", "abnormal_zero")])
+        c_main_ok = _mk_conv("m-ok", [(-200, "hit", "cached"), (-100, "hit", "cached")])
+        self.assertTrue(_sel([c_sm_old])[1])  # no other main confirming health -> stay WARN
+        self.assertFalse(_sel([c_sm_old, c_main_ok])[1])  # healthy peer confirms -> aged out!
+        self.assertTrue(_sel([c_sm_old, c_main_ok], is_hist=True)[1])  # historical never ages out
+        c_sm_zero_ts = ConversationSummary(
+            conversation_id="m-zero", short_id="m-zero", model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+            context_tokens=100000, max_context_tokens=512000, latest_hit_rate=0.0, latest_cached_in=0,
+            latest_uncached_in=100000, latest_timestamp=now - 30, recent_steps=[], consec_miss=1,
+            consec_miss_start_step=1, single_miss=True, wasted_cold_tokens=100000, freshness_remaining_sec=None,
+            abnormal_in_recent10=1, cacheable_in_recent10=1, last_abnormal_ts=0.0,
+        )
+        self.assertTrue(_sel([c_sm_zero_ts, c_main_ok])[1])
+
+        # 6. Subagent jitter denoising & guards
+        sub_sm1 = _mk_conv("s-1", [(-60, "hit", "cached"), (-20, "abnormal_miss", "abnormal_zero")], is_sub=True)
+        sub_sm2 = _mk_conv("s-2", [(-50, "hit", "cached"), (-15, "abnormal_miss", "abnormal_zero")], is_sub=True)
+        c_main_unverified = _mk_conv("m-cold", [(-60, "expected_cold", "small_ctx")])
+        c_main_stale = _mk_conv("m-stale", [(-1200, "hit", "cached")])  # 20m old sleeping main
+        # Verified healthy main + 1 subagent single_miss -> denoised to False!
+        self.assertFalse(_sel([c_main_ok, sub_sm1])[1])
+        # Unverified (<32K) or 20m-stale main MUST NOT silence subagent single_miss!
+        self.assertTrue(_sel([c_main_unverified, sub_sm1])[1])
+        self.assertTrue(_sel([c_main_stale, sub_sm1])[1])
+        # >=2 distinct subagents simultaneously single_miss -> burst precursor MUST NOT be denoised!
+        self.assertTrue(_sel([c_main_ok, sub_sm1, sub_sm2])[1])
+        # Subagent consecutive >=2 miss -> T1 NEVER denoised!
+        sub_t1 = _mk_conv("s-t1", [(-60, "abnormal_miss", "abnormal_zero"), (-20, "abnormal_miss", "abnormal_zero")], is_sub=True)
+        self.assertEqual(_sel([c_main_ok, sub_t1])[0], 2)
+
+        # 7. Final-review regressions (P1-1, P1-2, P2-1):
+        # 7a. Historical rating: main conv with old hit BEFORE eval_cutoff_ts and only small_ctx inside window MUST NOT verify healthy main!
+        c_main_old_hit = _mk_conv("m-old-hit", [(-3600, "hit", "cached"), (-60, "expected_cold", "small_ctx")])
+        AntigravityMonitorEngine._recompute_conv_eval_stats(c_main_old_hit, now - 1800.0)
+        self.assertTrue(_sel([c_main_old_hit, sub_sm1], is_hist=True)[1])
+
+        # 7b. Wide historical view (today): 2 mains dropped 4h ago -> Condition A MUST anchor around last_abnormal_ts +-10m (NOT now-10m!)
+        c_hist_a = _mk_conv("m-ha", [(-14400, "abnormal_miss", "abnormal_zero"), (-14340, "abnormal_miss", "abnormal_zero"), (-14280, "hit", "cached"), (-14220, "hit", "cached"), (-14160, "hit", "cached")])
+        c_hist_b = _mk_conv("m-hb", [(-14300, "abnormal_miss", "abnormal_zero"), (-14200, "hit", "cached")])
+        res_hist_today = AntigravityMonitorEngine._select_cache_health_signals(
+            [c_hist_a, c_hist_b], now_ts=now, eval_cutoff_ts=now - 86400.0, eval_end_ts=now,
+            is_historical_rating=True, hr_key="today", is_custom_account_view=False,
+        )
+        self.assertIsNotNone(res_hist_today[3])
+
+        # 7c. Final-B P0-1: subagent with 2..3 abnormal misses + only 1 hit MUST NOT be silently bypassed to T0!
+        sub_u1 = _mk_conv("s-u1", [(-180, "abnormal_miss", "abnormal_zero"), (-120, "abnormal_miss", "abnormal_zero"), (-60, "hit", "cached")], is_sub=True)
+        sub_u2 = _mk_conv("s-u2", [(-170, "abnormal_miss", "abnormal_zero"), (-110, "abnormal_miss", "abnormal_zero"), (-50, "hit", "cached")], is_sub=True)
+        self.assertIsNotNone(_sel([c_main_ok, sub_u1])[3])  # even a SINGLE subagent with abn=2+1hit stays WARN!
+        self.assertIsNotNone(_sel([c_main_ok, sub_u1, sub_u2])[3])
+
+        # 7d. Final-B P1-3: if ANY main has recent abnormal_miss, subagent single_miss MUST NOT be denoised!
+        c_main_abn1 = _mk_conv("m-abn1", [(-120, "abnormal_miss", "abnormal_zero"), (-60, "hit", "cached")])
+        self.assertTrue(_sel([c_main_ok, c_main_abn1, sub_sm1])[1])
+
+        # 7e. Final-B P1-4 & P2-3: tail-appended delayed OOO step MUST NOT truncate _count_steps_in_window or lower last_abnormal_ts!
+        c_ooo_tail = _mk_conv("m-ooo-t", [(-120, "abnormal_miss", "abnormal_zero"), (-60, "abnormal_miss", "abnormal_zero"), (-900, "hit", "cached")])
+        self.assertEqual(AntigravityMonitorEngine._count_steps_in_window(c_ooo_tail, now - 600.0, now + 2.0), (0, 2))
+        c_ooo_abn = _mk_conv("m-ooo-a", [(-120, "abnormal_miss", "abnormal_zero"), (-900, "abnormal_miss", "abnormal_zero")])
+        self.assertEqual(c_ooo_abn.last_abnormal_ts, now - 120.0)
+
+        # 7f. Final-B P1-6 & P2-1: __all__ mixed accounts disables cross-account subagent denoising; 12m stale subagent does NOT pair with 1 fresh subagent!
+        res_all_mix = AntigravityMonitorEngine._select_cache_health_signals(
+            [c_main_ok, sub_sm1], now_ts=now, eval_cutoff_ts=now - 1800.0, eval_end_ts=now,
+            is_historical_rating=False, hr_key="30m", is_custom_account_view=True, is_all_accounts_mixed=True,
+        )
+        self.assertTrue(res_all_mix[1])
+        sub_stale_sm = _mk_conv("s-stale", [(-800, "hit", "cached"), (-720, "abnormal_miss", "abnormal_zero")], is_sub=True)
+        self.assertFalse(_sel([c_main_ok, sub_stale_sm, sub_sm1])[1])
+
+        # 7g. End-to-end poll() -> _evaluate_health verification (abn=2 + 3 hits -> T0; isolated subagent single_miss with healthy main -> T0!)
+        from core.log_monitor import AccountQuotaInfo
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now_e = time.time()
+            def _iso_e(off: float) -> str:
+                return datetime.datetime.fromtimestamp(now_e + off, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            m_dir = root / "brain" / "e2em0001-1111-2222-3333-444444444444" / ".system_generated" / "logs"
+            m_dir.mkdir(parents=True)
+            (m_dir / "transcript.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": _iso_e(-400)}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-390), "model": "gemini-4-neon-xhigh", "input_tokens": 100000, "cache_read_tokens": 0, "output_tokens": 300}),
+                    json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-340), "model": "gemini-4-neon-xhigh", "input_tokens": 100000, "cache_read_tokens": 0, "output_tokens": 300}),
+                    json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-290), "model": "gemini-4-neon-xhigh", "input_tokens": 100000, "cache_read_tokens": 0, "output_tokens": 300}),
+                    json.dumps({"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-220), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 300}),
+                    json.dumps({"step_index": 6, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-150), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 300}),
+                    json.dumps({"step_index": 7, "type": "PLANNER_RESPONSE", "created_at": _iso_e(-80), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 98000, "output_tokens": 300}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng_e = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain", "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon", "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "missing.sqlite",
+                },
+                read_only=True,
+            )
+            eng_e._account_cache = AccountQuotaInfo(short_label="de***9", online=True, observed_at=now_e)
+            eng_e._last_account_poll = now_e
+            self.assertEqual(eng_e.poll(now_ts=now_e, force_account=False).grade, "T0")
+
 
 if __name__ == "__main__":
     unittest.main()
