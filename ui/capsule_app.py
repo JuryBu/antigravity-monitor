@@ -203,6 +203,9 @@ class AntigravityCapsuleApp:
             self.engine.set_should_yield_fn(self._is_any_window_dragging)
         self._pending_drag_snapshot: Optional[MonitorSnapshot] = None
         self._pending_clamp: bool = False
+        self._root_min_w: int = 1
+        self._suppress_render_clamp: bool = False
+        self._last_expanded_geom_sig: Optional[Tuple[int, ...]] = None
         self._last_conv_bars_sig: Optional[Tuple[Any, ...]] = None
 
         self._after_ids: List[str] = []
@@ -380,6 +383,9 @@ class AntigravityCapsuleApp:
             widget.bind("<ButtonRelease-1>", self._on_drag_end)
             widget.bind("<Button-3>", self._show_context_menu)
 
+    def _details_window_alpha(self) -> float:
+        return min(1.0, float(self.config.get("window_alpha", 0.95)) + 0.03)
+
     def _build_expanded_panel(self) -> None:
         # Host the 200+ expanded widgets inside a detached borderless Toplevel so self.root
         # ALWAYS stays a lightweight ~18-HWND bar (prevents Win32 WS_EX_LAYERED + 200-HWND drag lag!).
@@ -387,7 +393,7 @@ class AntigravityCapsuleApp:
         dwin.withdraw()
         dwin.overrideredirect(True)
         dwin.attributes("-topmost", bool(self.config["topmost"]))
-        dwin.attributes("-alpha", float(self.config["window_alpha"]))
+        dwin.attributes("-alpha", self._details_window_alpha())
         dwin.configure(bg=self.theme["border"])
         dwin.protocol("WM_DELETE_WINDOW", lambda: self.set_expanded(False))
         self._details_win = dwin
@@ -1053,26 +1059,33 @@ class AntigravityCapsuleApp:
         return f"立即清理 {age_s} 外子代理"
 
     def _clamp_window_to_screen(self, force: bool = False) -> None:
+        if self._closing:
+            return
         if self._dragging and not force:
             self._pending_clamp = True
             return
-        self.root.update_idletasks()
-        vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
-        bar_w = max(1, int(self.root.winfo_reqwidth()))
-        bar_h = max(1, int(self.root.winfo_reqheight()))
-        cur_x = int(self.root.winfo_x())
-        cur_y = int(self.root.winfo_y())
-        new_x = max(vx + 4, min(vr - bar_w - 4, cur_x))
-        new_y = max(vy + 4, min(vb - bar_h - 44, cur_y))
+        try:
+            if not self.root.winfo_exists():
+                return
+            vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
+            cur_x = int(self.root.winfo_x())
+            cur_y = int(self.root.winfo_y())
+        except tk.TclError:
+            return
 
         dwin = self._details_win if (self._expanded and self._expanded_built) else None
         if dwin is not None and self._visible:
             try:
+                if not dwin.winfo_exists():
+                    return
+                self.root.update_idletasks()
                 dwin.update_idletasks()
-                det_req_w = int(dwin.winfo_reqwidth())
-                det_req_h = int(dwin.winfo_reqheight())
+                bar_req_w = max(1, int(self.root.winfo_reqwidth()))
+                bar_req_h = max(1, int(self.root.winfo_reqheight()))
+                det_req_w = max(1, int(dwin.winfo_reqwidth()))
+                det_req_h = max(1, int(dwin.winfo_reqheight()))
                 avail_total_h = max(240, (vb - 48) - (vy + 4))
-                avail_det_h = max(180, avail_total_h - bar_h)
+                avail_det_h = max(180, avail_total_h - bar_req_h)
                 if det_req_h > avail_det_h:
                     cur_vp_h = int(self._conv_viewport.winfo_reqheight())
                     overflow = det_req_h - avail_det_h
@@ -1082,31 +1095,58 @@ class AntigravityCapsuleApp:
                         self._conv_scrollbar.configure(height=new_vp_h)
                         self._sync_custom_scrollbar()
                         dwin.update_idletasks()
-                        det_req_w = int(dwin.winfo_reqwidth())
-                        det_req_h = int(dwin.winfo_reqheight())
-                # Keep combined (bar + attached details panel) vertically on screen
-                max_bar_y = max(vy + 4, (vb - 44) - (bar_h + det_req_h - 1))
-                if new_y > max_bar_y:
-                    new_y = max_bar_y
-                det_w = max(bar_w, det_req_w)
-                det_x = max(vx + 4, min(vr - det_w - 4, new_x))
-                det_y = new_y + bar_h - 1
+                        det_req_w = max(1, int(dwin.winfo_reqwidth()))
+                        det_req_h = max(1, int(dwin.winfo_reqheight()))
+                target_w = min(max(bar_req_w, det_req_w), max(320, vr - vx - 8))
+                new_x = max(vx + 4, min(vr - target_w - 4, cur_x))
+                det_x = new_x
+                max_bar_y = max(vy + 4, (vb - 44) - (bar_req_h + det_req_h - 1))
+                new_y = max(vy + 4, min(max_bar_y, cur_y))
+                det_y = new_y + bar_req_h - 1
+                self.root.wm_minsize(target_w, 1)
+                dwin.wm_minsize(target_w, 1)
+                self._root_min_w = target_w
                 self.root.geometry(f"+{new_x}+{new_y}")
-                self.root.update_idletasks()
-                dwin.wm_minsize(bar_w, 1)
                 dwin.geometry(f"+{det_x}+{det_y}")
                 if dwin.state() == "withdrawn":
                     dwin.deiconify()
-                dwin.attributes("-topmost", bool(self.config["topmost"]))
-                dwin.lift()
-                self.root.lift()
+                    dwin.attributes("-topmost", bool(self.config["topmost"]))
+                    dwin.lift()
+                    self.root.lift()
+                self.root.update_idletasks()
                 dwin.update_idletasks()
+                self._last_expanded_geom_sig = (
+                    bar_req_w,
+                    bar_req_h,
+                    det_req_w,
+                    det_req_h,
+                    target_w,
+                    int(self.root.winfo_x()),
+                    int(self.root.winfo_y()),
+                    int(self.root.winfo_width()),
+                    int(dwin.winfo_width()),
+                    int(dwin.winfo_x()),
+                    int(dwin.winfo_y()),
+                )
                 return
             except tk.TclError:
-                pass
+                return
 
-        self.root.geometry(f"+{new_x}+{new_y}")
-        self.root.update_idletasks()
+        try:
+            if self._root_min_w > 1:
+                self.root.wm_minsize(1, 1)
+                self._root_min_w = 1
+                self.root.geometry("")
+            self.root.update_idletasks()
+            bar_req_w = max(1, int(self.root.winfo_reqwidth()))
+            bar_req_h = max(1, int(self.root.winfo_reqheight()))
+            new_x = max(vx + 4, min(vr - bar_req_w - 4, cur_x))
+            new_y = max(vy + 4, min(vb - bar_req_h - 44, cur_y))
+            self.root.geometry(f"+{new_x}+{new_y}")
+            self.root.update_idletasks()
+            self._last_expanded_geom_sig = None
+        except tk.TclError:
+            return
 
     def _on_drag_start(self, event: tk.Event) -> None:
         self._hide_conv_tooltip()
@@ -1178,14 +1218,25 @@ class AntigravityCapsuleApp:
             return
         if moved:
             self._pending_clamp = False
-            self._clamp_window_to_screen(force=True)
-            self.config["window_x"] = self.root.winfo_x()
-            self.config["window_y"] = self.root.winfo_y()
-            self.config_store.save(self.config)
             pending_snap = self._pending_drag_snapshot
             self._pending_drag_snapshot = None
             if pending_snap is not None:
-                self.render_snapshot(pending_snap)
+                # Render updated snapshot silently while dwin is still withdrawn so we clamp & persist final geometry once
+                self._suppress_render_clamp = True
+                try:
+                    self.render_snapshot(pending_snap)
+                finally:
+                    self._suppress_render_clamp = False
+            self._clamp_window_to_screen(force=True)
+            try:
+                if not self.root.winfo_exists():
+                    return
+                self.root.update_idletasks()
+                self.config["window_x"] = self.root.winfo_x()
+                self.config["window_y"] = self.root.winfo_y()
+                self.config_store.save(self.config)
+            except tk.TclError:
+                return
         else:
             self._finish_drag_deferred_updates()
             self.toggle_expand()
@@ -1274,32 +1325,46 @@ class AntigravityCapsuleApp:
             self.show_window()
 
     def set_expanded(self, expanded: bool) -> None:
+        if self._closing:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         self._expanded = bool(expanded)
         self._last_conv_bars_sig = None
-        if self._expanded:
-            self._ensure_expanded_panel()
-            self._btn_expand.configure(text="▴")
-            if self._latest_snapshot is not None:
-                self.render_snapshot(self._latest_snapshot)
+        try:
+            if self._expanded:
+                self._ensure_expanded_panel()
+                self._btn_expand.configure(text="▴")
+                self._suppress_render_clamp = True
+                try:
+                    if self._latest_snapshot is not None:
+                        self.render_snapshot(self._latest_snapshot)
+                finally:
+                    self._suppress_render_clamp = False
+                self._clamp_window_to_screen(force=True)
+                self._apply_dwm_rounding()
+                self.root.update_idletasks()
+                return
+            else:
+                self._hide_conv_tooltip()
+                self._close_detail_window()
+                self._close_slots_window()
+                if self._details_win is not None:
+                    try:
+                        self._details_win.withdraw()
+                    except tk.TclError:
+                        pass
+                self._btn_expand.configure(text="▾")
             self._clamp_window_to_screen()
             self._apply_dwm_rounding()
             self.root.update_idletasks()
+            if self._latest_snapshot is not None:
+                self.render_snapshot(self._latest_snapshot)
+        except tk.TclError:
             return
-        else:
-            self._hide_conv_tooltip()
-            self._close_detail_window()
-            self._close_slots_window()
-            if self._details_win is not None:
-                try:
-                    self._details_win.withdraw()
-                except tk.TclError:
-                    pass
-            self._btn_expand.configure(text="▾")
-        self._clamp_window_to_screen()
-        self._apply_dwm_rounding()
-        self.root.update_idletasks()
-        if self._latest_snapshot is not None:
-            self.render_snapshot(self._latest_snapshot)
 
     def toggle_expand(self) -> None:
         if not self._visible:
@@ -1640,6 +1705,16 @@ class AntigravityCapsuleApp:
 
     def set_view_account(self, account_label: str) -> None:
         clean = (account_label or "").strip()
+        snap = self._latest_snapshot
+        if (
+            clean
+            and clean != "__all__"
+            and snap is not None
+            and snap.account.online
+            and snap.account.short_label
+            and clean.lower() == snap.account.short_label.strip().lower()
+        ):
+            clean = ""
         with self._view_lock:
             if clean == self._view_account:
                 return
@@ -1677,8 +1752,13 @@ class AntigravityCapsuleApp:
             activeforeground=t["cyan"],
             bd=1,
         )
+        eff_cur_view = (
+            ""
+            if (cur_view and cur_view != "__all__" and cur_online and cur_view.lower() == cur_online.lower())
+            else cur_view
+        )
         auto_lbl = f"● 自动跟随当前 ({cur_online})" if cur_online else "● 自动跟随当前账号"
-        if cur_view:
+        if eff_cur_view:
             auto_lbl = auto_lbl.replace("● ", "   ")
         menu.add_command(label=auto_lbl, command=lambda: self.set_view_account(""))
         other_accounts = [
@@ -1688,10 +1768,10 @@ class AntigravityCapsuleApp:
         if other_accounts:
             menu.add_separator()
             for acc in other_accounts:
-                mark = "● " if (cur_view and cur_view.lower() == acc.lower()) else "   "
+                mark = "● " if (eff_cur_view and eff_cur_view.lower() == acc.lower()) else "   "
                 menu.add_command(label=f"{mark}{acc} (历史记录)", command=lambda a=acc: self.set_view_account(a))
         menu.add_separator()
-        all_mark = "● " if cur_view == "__all__" else "   "
+        all_mark = "● " if eff_cur_view == "__all__" else "   "
         menu.add_command(label=f"{all_mark}全机合并视角", command=lambda: self.set_view_account("__all__"))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -2115,8 +2195,15 @@ class AntigravityCapsuleApp:
 
     # ------------------------------------------------------------------ Rendering
     def render_snapshot(self, snap: MonitorSnapshot) -> None:
+        if self._closing:
+            return
         if self._dragging:
             self._pending_drag_snapshot = snap
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         self._latest_snapshot = snap
         t = self.theme
@@ -2248,10 +2335,17 @@ class AntigravityCapsuleApp:
             disp_fresh_consec = snap.large_freshness_list[0].consec_miss if snap.large_freshness_list else 0
 
         # Freshness indicator must never look green when the active large conversation just dropped cache (cr=0)
+        is_nonlive_freshness_view = bool(
+            snap.is_custom_account_view
+            or snap.grade == "IDLE"
+            or (snap.history_range != "30m" and not snap.account.online)
+        )
         if disp_fresh_invalid:
             is_severe_fresh = is_severe_freshness_invalid(disp_fresh_invalid, disp_fresh_consec)
             fresh_color = t["red"] if is_severe_fresh else t["orange"]
             self._lbl_bar_fresh.configure(text="保鲜 失效", fg=fresh_color)
+        elif disp_fresh_sec is None and is_nonlive_freshness_view:
+            self._lbl_bar_fresh.configure(text="保鲜 —", fg=t["text_secondary"])
         else:
             fresh_txt = format_countdown(disp_fresh_sec)
             fresh_color = t["text_secondary"]
@@ -2319,8 +2413,7 @@ class AntigravityCapsuleApp:
                 self._lbl_bar_slots.pack_forget()
             if self._sep5.winfo_manager():
                 self._sep5.pack_forget()
-        if bar_slots_now_visible != bar_slots_was_visible:
-            self._clamp_window_to_screen()
+        need_geom_sync = bool(bar_slots_now_visible != bar_slots_was_visible)
 
         # High-priority main-conversation eviction risk guard: proactively surface HUD once even if muted/minimized!
         if inv is not None and inv.main_at_risk:
@@ -2372,6 +2465,16 @@ class AntigravityCapsuleApp:
                         self.tray.notify(title, msg)
 
         if not self._expanded or not self._expanded_built:
+            if self._visible and not self._dragging and not self._suppress_render_clamp:
+                try:
+                    self.root.update_idletasks()
+                    vx, _vy, vr, _vb = _get_virtual_screen_bounds(self.root)
+                    req_w = max(1, int(self.root.winfo_reqwidth()))
+                    cur_x = int(self.root.winfo_x())
+                    if need_geom_sync or (cur_x + req_w > vr - 4) or (cur_x < vx + 4):
+                        self._clamp_window_to_screen()
+                except tk.TclError:
+                    pass
             if self._detail_win is not None and not self._detail_win._closed:
                 self._detail_win.sync_from_snapshot(snap)
             if self._slots_win is not None and not self._slots_win._closed:
@@ -2413,12 +2516,22 @@ class AntigravityCapsuleApp:
 
         self._refresh_range_buttons()
         if snap.is_custom_account_view:
-            self._lbl_scope_hint.configure(
-                text=f"回看 {snap.resolved_account or '全机'} · {snap.history_range_label}",
-                fg=t["cyan"],
-            )
+            if snap.history_range != "30m":
+                scope_txt = f"回看 {snap.resolved_account or '全机'} · {snap.history_range_label} · {snap.range_steps} 步"
+            else:
+                scope_txt = f"回看 {snap.resolved_account or '全机'} · {snap.history_range_label}"
+            self._lbl_scope_hint.configure(text=scope_txt, fg=t["cyan"])
         elif snap.history_range != "30m":
-            self._lbl_scope_hint.configure(text=f"{snap.steps_scope_label} · {snap.history_range_label}", fg=t["cyan"])
+            if snap.grade == "IDLE":
+                self._lbl_scope_hint.configure(
+                    text=f"离线 · 选账号可回看{snap.history_range_label}",
+                    fg=t["text_secondary"],
+                )
+            else:
+                self._lbl_scope_hint.configure(
+                    text=f"{snap.steps_scope_label} · {snap.history_range_label} · {snap.range_steps} 步",
+                    fg=t["cyan"],
+                )
         elif snap.is_historical_rating and snap.rating_anchor_ts > 0:
             self._lbl_scope_hint.configure(
                 text=f"历史参考 · 上次活跃 {format_relative_age(snap.generated_at - snap.rating_anchor_ts)}",
@@ -2429,13 +2542,7 @@ class AntigravityCapsuleApp:
 
         pct = min(100, int(round((eff_steps / max(1, snap.daily_steps_alert)) * 100)))
         adapt_tag = " · 自适应" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else ""
-        if snap.history_range in ("6h", "today", "7d"):
-            r_tag = range_short or snap.history_range_label
-            self._lbl_steps_title.configure(
-                text=f"近24h保护线 ({snap.steps_scope_label}{adapt_tag}) · {r_tag}{snap.range_steps}步"
-            )
-        else:
-            self._lbl_steps_title.configure(text=f"近24h请求步数保护线 ({snap.steps_scope_label}{adapt_tag})")
+        self._lbl_steps_title.configure(text=f"近24h请求步数保护线 ({snap.steps_scope_label}{adapt_tag})")
         if eff_total_steps > eff_steps:
             steps_val_txt = f"{eff_steps} / {snap.daily_steps_alert} ({pct}%) · 全机 {eff_total_steps}"
         else:
@@ -2478,11 +2585,11 @@ class AntigravityCapsuleApp:
                 self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
                 if not risk_was_visible:
                     self._slot_risk_frame.pack(fill="x", pady=(5, 0))
-                    self._clamp_window_to_screen()
+                    need_geom_sync = True
             else:
                 if risk_was_visible:
                     self._slot_risk_frame.pack_forget()
-                    self._clamp_window_to_screen()
+                    need_geom_sync = True
         else:
             self._lbl_slots_val.configure(text="— / 500", fg=t["text_muted"])
             self._last_slots_pct = 0
@@ -2491,6 +2598,7 @@ class AntigravityCapsuleApp:
             self._slots_hover_text = ""
             if self._slot_risk_frame.winfo_manager():
                 self._slot_risk_frame.pack_forget()
+                need_geom_sync = True
 
         # Module 2: Speed & Freshness (reflects pinned conversation when active)
         if snap.is_custom_account_view or snap.history_range != "30m":
@@ -2563,6 +2671,10 @@ class AntigravityCapsuleApp:
                 self._lbl_fresh_big.configure(text=f"剩 {format_countdown(disp_fresh_sec)}", fg=t["orange"])
             else:
                 self._lbl_fresh_big.configure(text=f"剩 {format_countdown(disp_fresh_sec)}", fg=t["green"])
+        elif is_nonlive_freshness_view:
+            sub_txt = "离线待机" if (snap.grade == "IDLE" and not snap.is_custom_account_view) else "历史回看 (非实时)"
+            self._lbl_fresh_sub.configure(text=sub_txt)
+            self._lbl_fresh_big.configure(text="—", fg=t["text_muted"])
         else:
             self._lbl_fresh_sub.configure(text=f"参考窗 {snap.freshness_window_sec}s")
             self._lbl_fresh_big.configure(text="无活跃大对话", fg=t["text_muted"])
@@ -2575,7 +2687,6 @@ class AntigravityCapsuleApp:
             snap.account.online
             or getattr(snap, "hub_pid_alive", False)
             or snap.is_custom_account_view
-            or snap.history_range != "30m"
         ) and snap.grade != "IDLE"
         if logs_live:
             win_title = (
@@ -2583,6 +2694,27 @@ class AntigravityCapsuleApp:
                 if (snap.history_range == "30m" and snap.is_historical_rating and not snap.is_custom_account_view)
                 else snap.history_range_label
             )
+            log_sess_ts = float(getattr(snap, "log_session_start_ts", 0.0) or 0.0)
+            if snap.history_range != "30m" and log_sess_ts > 0.0:
+                ref_now = float(snap.generated_at or time.time())
+                if snap.history_range == "7d":
+                    range_start = ref_now - 7 * 86400.0
+                elif snap.history_range == "today":
+                    dt_now = datetime.datetime.fromtimestamp(ref_now)
+                    range_start = dt_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                elif snap.history_range == "6h":
+                    range_start = ref_now - 6 * 3600.0
+                else:
+                    range_start = ref_now - max(1, int(snap.sliding_window_min or 30)) * 60.0
+                if log_sess_ts > range_start + 300.0:
+                    sess_dt = datetime.datetime.fromtimestamp(log_sess_ts)
+                    now_dt = datetime.datetime.fromtimestamp(ref_now)
+                    hm = (
+                        sess_dt.strftime("%H:%M")
+                        if sess_dt.date() == now_dt.date()
+                        else sess_dt.strftime("%m-%d %H:%M")
+                    )
+                    win_title = f"自 {hm} 日志起"
             self._lbl_logs_title.configure(
                 text=f"底层日志监控（{snap.log_scope_label} · {win_title} / 今日）"
             )
@@ -2597,13 +2729,21 @@ class AntigravityCapsuleApp:
                 red_metric_override=server_timeout_recent,
             )
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1)
+            proxy_outage_cnt = int(getattr(snap, "proxy_outage_recent", 0) or 0)
+            proxy_outage_live = bool(proxy_outage_cnt > 0 and not snap.is_historical_rating)
+            retry_override = (
+                f"断流{proxy_outage_cnt}/{snap.today_retry}"
+                if (proxy_outage_live and snap.recent_retry == 0)
+                else ""
+            )
             self._update_log_cell(
                 "retry",
                 snap.recent_retry,
                 snap.today_retry,
                 warn_on_recent=5,
                 red_on_recent=9999,
-                force_warn=bool(getattr(snap, "proxy_outage_recent", 0) > 0 and not snap.is_historical_rating),
+                force_warn=proxy_outage_live,
+                override_text=retry_override,
             )
         else:
             self._lbl_logs_title.configure(text="底层日志监控（客户端未运行 · 已暂停实时告警）")
@@ -2612,17 +2752,35 @@ class AntigravityCapsuleApp:
             self._update_log_cell("403", snap.recent_403, snap.today_403, warn_on_recent=1, red_on_recent=1, offline_muted=True)
             self._update_log_cell("retry", snap.recent_retry, snap.today_retry, warn_on_recent=5, red_on_recent=9999, offline_muted=True)
 
+        culprit_summary = str(getattr(snap, "cache_culprit_summary", "") or "").strip()
+        is_severe_cold_banner = (
+            snap.grade != "IDLE"
+            and (snap.grade == "T1" or (not snap.is_historical_rating and snap.history_range == "30m"))
+            and snap.wasted_cold_tokens_total >= 150_000
+            and (snap.max_consec_miss >= T1_CONSEC_MISS_THRESHOLD or snap.max_abnormal_recent10 >= 4)
+        )
         if time.monotonic() < self._temp_banner_until and self._temp_banner_text:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=self._temp_banner_text)
-        elif snap.grade != "IDLE" and snap.wasted_cold_tokens_total >= 150_000 and (
-            snap.max_consec_miss >= T1_CONSEC_MISS_THRESHOLD or snap.max_abnormal_recent10 >= 4
-        ):
+        elif is_severe_cold_banner:
+            if snap.is_historical_rating or snap.history_range != "30m":
+                if culprit_summary:
+                    cold_txt = (
+                        f"{snap.history_range_label}内 {culprit_summary} 异常掉缓存已多耗约 "
+                        f"{format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token"
+                    )
+                else:
+                    cold_txt = (
+                        f"{snap.history_range_label}内异常掉缓存已多耗约 "
+                        f"{format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token"
+                    )
+            else:
+                cold_txt = f"近 10 步异常掉缓存已多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token，建议核查账号"
             self._banner_frame.configure(bg=t["alert_banner_bg"], highlightbackground=t["alert_banner_border"])
             self._lbl_banner.configure(
                 bg=t["alert_banner_bg"],
                 fg=t["alert_banner_text"],
-                text=f"近 10 步异常掉缓存已多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 冷算 Token，建议核查账号",
+                text=cold_txt,
             )
         elif logs_live and snap.grade in ("T2", "T3") and snap.recent_events:
             if snap.grade == "T3":
@@ -2639,6 +2797,8 @@ class AntigravityCapsuleApp:
         elif logs_live and snap.grade == "WARN" and (
             snap.t2_recovery_note
             or snap.max_consec_miss >= 2
+            or snap.max_abnormal_recent10 >= 4
+            or bool(culprit_summary)
             or snap.recent_timeout > 0
             or snap.recent_503 > 0
             or getattr(snap, "proxy_outage_recent", 0) > 0
@@ -2649,6 +2809,63 @@ class AntigravityCapsuleApp:
         else:
             self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["border_soft"])
             self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["text_secondary"], text=snap.sub_headline)
+
+        # Synchronize detached expanded panel geometry only when mismatch/overflow is detected
+        dwin = self._details_win
+        if (
+            self._visible
+            and dwin is not None
+            and not self._dragging
+            and not self._suppress_render_clamp
+        ):
+            try:
+                if dwin.state() != "withdrawn":
+                    self.root.update_idletasks()
+                    dwin.update_idletasks()
+                    vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
+                    bar_req_w = max(1, int(self.root.winfo_reqwidth()))
+                    bar_req_h = max(1, int(self.root.winfo_reqheight()))
+                    det_req_w = max(1, int(dwin.winfo_reqwidth()))
+                    det_req_h = max(1, int(dwin.winfo_reqheight()))
+                    target_w = min(max(bar_req_w, det_req_w), max(320, vr - vx - 8))
+                    root_w = int(self.root.winfo_width())
+                    dwin_w = int(dwin.winfo_width())
+                    root_x = int(self.root.winfo_x())
+                    root_y = int(self.root.winfo_y())
+                    dwin_x = int(dwin.winfo_x())
+                    dwin_y = int(dwin.winfo_y())
+                    det_overflow = (
+                        (root_x + target_w > vr - 4)
+                        or (root_x < vx + 4)
+                        or (root_y + bar_req_h + det_req_h - 1 > vb - 44)
+                        or (root_y < vy + 4)
+                        or (abs(dwin_y - (root_y + bar_req_h - 1)) > 1)
+                    )
+                    geom_mismatch = (
+                        need_geom_sync
+                        or abs(root_w - dwin_w) > 1
+                        or abs(root_w - target_w) > 1
+                        or abs(dwin_w - target_w) > 1
+                        or abs(root_x - dwin_x) > 1
+                        or det_overflow
+                    )
+                    cur_sig = (
+                        bar_req_w,
+                        bar_req_h,
+                        det_req_w,
+                        det_req_h,
+                        target_w,
+                        root_x,
+                        root_y,
+                        root_w,
+                        dwin_w,
+                        dwin_x,
+                        dwin_y,
+                    )
+                    if geom_mismatch and (need_geom_sync or cur_sig != self._last_expanded_geom_sig):
+                        self._clamp_window_to_screen()
+            except tk.TclError:
+                pass
 
         # Dynamically sync open modals on every poll tick
         if self._detail_win is not None and not self._detail_win._closed:
@@ -2666,6 +2883,7 @@ class AntigravityCapsuleApp:
         offline_muted: bool = False,
         force_warn: bool = False,
         red_metric_override: Optional[int] = None,
+        override_text: str = "",
     ) -> None:
         if not self._expanded_built:
             return
@@ -2674,7 +2892,7 @@ class AntigravityCapsuleApp:
         if offline_muted:
             cell["val"].configure(text=f"— / {today}", fg=t["text_muted"])
             return
-        txt = f"{recent} / {today}"
+        txt = override_text if override_text else f"{recent} / {today}"
         red_val = recent if red_metric_override is None else red_metric_override
         if red_val >= red_on_recent:
             fg = t["red"]
@@ -3113,6 +3331,9 @@ class AntigravityCapsuleApp:
         if not self._expanded_built:
             return
         try:
+            if self._lbl_convs_empty.winfo_manager() or not any(self._conv_row_ids):
+                self._conv_scrollbar.delete("all")
+                return
             bbox = self._conv_viewport.bbox("all")
             if bbox:
                 self._conv_viewport.configure(scrollregion=bbox)
@@ -3127,6 +3348,8 @@ class AntigravityCapsuleApp:
         t = self.theme
         try:
             sb.delete("all")
+            if self._lbl_convs_empty.winfo_manager() or not any(self._conv_row_ids):
+                return
             h = max(16, sb.winfo_height())
             w = max(6, sb.winfo_width())
             first, last = self._conv_viewport.yview()
@@ -3216,7 +3439,7 @@ class AntigravityCapsuleApp:
         if not self._expanded_built:
             return
         t = self.theme
-        all_convs = snap.active_conversations[:24]
+        all_convs = list(snap.active_conversations)
         main_convs = [c for c in all_convs if not c.is_subagent]
         sub_convs = [c for c in all_convs if c.is_subagent]
         self._refresh_filter_buttons(len(main_convs), len(sub_convs))
@@ -3228,11 +3451,37 @@ class AntigravityCapsuleApp:
         else:
             convs = list(all_convs)
 
+        culprit_summary_str = str(getattr(snap, "cache_culprit_summary", "") or "").strip()
+        culprit_sid = culprit_summary_str.split(" ", 1)[0].strip().lower() if culprit_summary_str else ""
+        if snap.history_range != "30m" and len(convs) > 1:
+            def _is_severe_cache_culprit(c: Any) -> bool:
+                return bool(
+                    int(getattr(c, "consec_miss", 0) or 0) >= 2
+                    or int(getattr(c, "abnormal_in_recent10", 0) or 0) >= 4
+                    or int(getattr(c, "wasted_cold_tokens", 0) or 0) >= 150_000
+                )
+
+            def _hist_sort_priority(c: Any) -> int:
+                if culprit_sid and str(getattr(c, "short_id", "") or "").strip().lower() == culprit_sid:
+                    return 0
+                if _is_severe_cache_culprit(c):
+                    return 1
+                return 2
+
+            convs.sort(
+                key=lambda c: (
+                    _hist_sort_priority(c),
+                    -float(getattr(c, "latest_timestamp", 0.0) or 0.0),
+                )
+            )
+
         if self._conv_filter in ("main", "all"):
             carry_raw = list(getattr(snap, "carryover_conversations", None) or [])
             if carry_raw:
                 carry_ids = {c.conversation_id for c in carry_raw}
-                convs = (carry_raw + [c for c in convs if c.conversation_id not in carry_ids])[:24]
+                convs = carry_raw + [c for c in convs if c.conversation_id not in carry_ids]
+
+        convs = convs[:len(self._conv_rows)]
 
         # Build lightweight structural signature so unchanged 2.5s polls skip tearing down & redrawing 48 canvases
         # and avoid rebuilding 24 tooltip strings every tick.
@@ -3248,12 +3497,22 @@ class AntigravityCapsuleApp:
                     bool(getattr(st, "is_compact", False)),
                     bool(getattr(st, "is_revert", False)),
                     bool(getattr(st, "is_account_switch", False)),
+                    int(round(float(getattr(st, "timestamp", 0.0) or 0.0))),
+                    int(getattr(st, "total_tokens", 0) or 0),
+                    int(getattr(st, "context_delta", 0) or 0),
+                    str(getattr(st, "model", "") or ""),
+                    int(getattr(st, "active_media_count", 0) or 0),
+                    int(getattr(st, "active_media_bytes", 0) or 0),
                 )
                 for st in conv.recent_steps[-10:]
             )
             ttfts_tail = tuple(
                 None if v is None else int(round(float(v) * 10.0))
                 for v in conv.recent_ttfts[-10:]
+            )
+            tps_tail = tuple(
+                None if v is None else int(round(float(v)))
+                for v in (getattr(conv, "recent_tps_list", None) or [])[-10:]
             )
             bar_sig_rows.append(
                 (
@@ -3278,6 +3537,7 @@ class AntigravityCapsuleApp:
                     int(round(float(getattr(conv, "large_ctx_ttft_allowance_sec", 0.0) or 0.0))),
                     steps_tail,
                     ttfts_tail,
+                    tps_tail,
                 )
             )
         bar_sig = (
@@ -3287,6 +3547,7 @@ class AntigravityCapsuleApp:
             self._conv_list_rows,
             snap.history_range,
             snap.is_custom_account_view,
+            culprit_summary_str,
             tuple(bar_sig_rows),
         )
         if bar_sig == self._last_conv_bars_sig:
@@ -3310,9 +3571,14 @@ class AntigravityCapsuleApp:
             }.get(self._conv_filter, "暂无活跃对话记录")
             self._lbl_convs_empty.configure(text=empty_msg)
             self._lbl_convs_empty.grid(row=0, column=0, columnspan=9, sticky="w", pady=4)
-            self._conv_viewport.configure(height=28)
-            self._conv_scrollbar.configure(height=28)
-            self._update_conv_scrollregion()
+            self._convs_table.update_idletasks()
+            empty_h = max(28, int(self._convs_table.winfo_reqheight()))
+            empty_w = max(1, int(self._convs_table.winfo_reqwidth()))
+            self._conv_viewport.configure(height=empty_h)
+            self._conv_scrollbar.configure(height=empty_h)
+            self._conv_viewport.yview_moveto(0.0)
+            self._conv_viewport.configure(scrollregion=(0, 0, empty_w, empty_h))
+            self._conv_scrollbar.delete("all")
             return
 
         self._lbl_convs_empty.grid_remove()
@@ -3502,6 +3768,7 @@ class AntigravityCapsuleApp:
             self._conv_row_px = measured_row
         if len(convs) <= self._conv_list_rows:
             vp_h = max(28, table_h)
+            self._conv_viewport.yview_moveto(0.0)
         else:
             vp_h = max(28, self._conv_list_rows * self._conv_row_px)
         self._conv_viewport.configure(height=vp_h)

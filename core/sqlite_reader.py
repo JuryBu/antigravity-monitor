@@ -297,7 +297,7 @@ class ConversationDbReader:
         self._lock = threading.RLock()
         self._cache: OrderedDict[str, Tuple[str, ConversationDbSnapshot]] = OrderedDict()
         self._full_cache: OrderedDict[str, _FullCacheEntry] = OrderedDict()
-        self._max_full_cache_entries: int = min(12, max(8, int(max_cache_entries)))
+        self._max_full_cache_entries: int = min(48, max(12, int(max_cache_entries) * 3 // 4))
 
     def read(self, conversation_id: str) -> Optional[ConversationDbSnapshot]:
         if not conversation_id:

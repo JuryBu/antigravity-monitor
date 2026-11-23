@@ -6782,5 +6782,634 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 pass
 
 
+
+    def test_v726_bug_a_adaptive_steps_same_day_recovery_refutation_and_ghost_bucket_guard(self) -> None:
+        """v7.2.6 Bug A: same-day post-degradation sustained healthy run unlocks adaptive_up after settlement, recent unsettled run refutes stale adaptive_down back to default (without chasing), ledger merge prefers real high load over shrunk rescan, and 0-step ghost buckets are self-healed & blocked from writing."""
+        import datetime
+        from core.account_ledger import AccountSwitchLedger
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            compute_adaptive_daily_steps_limits,
+            compute_settled_rolling_24h_records,
+        )
+
+        # 1) Same-day sustained recovery (>=3 healthy hours, >=max(1200, 1.5*deg_at)) after morning degradation -> unlocks once settled
+        h_23_00 = int(datetime.datetime(2026, 11, 23, 0, 0, 0).timestamp() // 3600)
+        buckets_23 = {
+            h_23_00: {"steps": 54, "degraded": True, "degraded_24h_at": 134},
+            h_23_00 + 4: {"steps": 789, "degraded": True, "degraded_24h_at": 1052},
+            h_23_00 + 5: {"steps": 968, "degraded": False, "degraded_24h_at": None},
+            h_23_00 + 6: {"steps": 780, "degraded": False, "degraded_24h_at": None},
+            h_23_00 + 7: {"steps": 500, "degraded": False, "degraded_24h_at": None},
+            h_23_00 + 8: {"steps": 600, "degraded": False, "degraded_24h_at": None},
+            h_23_00 + 9: {"steps": 819, "degraded": False, "degraded_24h_at": None},
+        }
+        now_settled = datetime.datetime(2026, 11, 25, 0, 30, 0).timestamp()
+        recs = compute_settled_rolling_24h_records(buckets_23, now_ts=now_settled)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["date"], "2026-11-23")
+        self.assertEqual(recs[0].get("post_deg_safe_steps"), 3667)
+        # Combined with an older 11-20 deg_at=440, 11-23 post_deg_safe_steps clears stale 440 lock and scales up to 4300!
+        hist_combo = [{"date": "2026-11-20", "safe_steps": 0, "degraded_at": 440}] + recs
+        w, a, mode, _note, pk = compute_adaptive_daily_steps_limits(960, 1200, hist_combo)
+        self.assertEqual((mode, pk, a, w), ("adaptive_up", 3667, 4300, 3440))
+
+        # 2) Stale adaptive_down (440 -> 600) refuted by recent unsettled healthy run (>=max(1200, 2*440)) restores default 1200 WITHOUT chasing!
+        w_ref, a_ref, m_ref, n_ref, _ = compute_adaptive_daily_steps_limits(
+            960,
+            1200,
+            [{"date": "2026-11-20", "safe_steps": 0, "degraded_at": 440}],
+            recent_recovery_steps=3667,
+        )
+        self.assertEqual((w_ref, a_ref, m_ref), (960, 1200, "default"))
+        self.assertIn("3667", n_ref)
+
+        # 3) End-to-end engine: 0-step ghost bucket in ledger is self-healed on merge AND post_deg_safe_steps is preserved through _get_account_completed_daily_history
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lp = root / "account_ledger.json"
+            lgr = AccountSwitchLedger(ledger_path=lp, read_only=False)
+            h_20_19 = int(datetime.datetime(2026, 11, 20, 19, 0, 0).timestamp() // 3600)
+            h_24_00 = int(datetime.datetime(2026, 11, 24, 0, 0, 0).timestamp() // 3600)
+            lgr.record_hourly_step_buckets(
+                "ly***8",
+                {
+                    h_20_19: 33,
+                    h_23_00: 54,
+                    h_23_00 + 4: 789,
+                    h_23_00 + 5: 968,
+                    h_23_00 + 6: 780,
+                    h_23_00 + 7: 700,
+                    h_23_00 + 8: 600,
+                },
+                degraded_hours={h_20_19: 440, h_23_00: 134, h_23_00 + 4: 1052, h_24_00: 5074},
+                now_ts=datetime.datetime(2026, 11, 24, 3, 30, 0).timestamp(),
+            )
+            # Verify the 0-step ghost bucket 11-24 00:00 exists in raw ledger before self-healing
+            self.assertEqual(lgr.get_account_hourly_buckets("ly***8")[h_24_00]["steps"], 0)
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": root / "ls.log",
+                    "cockpit_quota_db": root / "ck.sqlite",
+                    "ledger_path": lp,
+                },
+                read_only=True,
+            )
+            now_0330 = datetime.datetime(2026, 11, 24, 3, 30, 0).timestamp()
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_0330)
+            eng._last_account_poll = now_0330
+            snap_now = eng.poll(now_ts=now_0330, force_account=False)
+            # Ghost 0-step bucket at 11-24 00:00 MUST NOT block refutation -> ly***8 unlocks from 600 to 1200!
+            self.assertEqual(snap_now.daily_steps_alert, 1200)
+            self.assertEqual(snap_now.daily_steps_limit_mode, "default")
+
+            # Once 11-23 settles (+24h), post_deg_safe_steps=3048 passes through & scales up to 3600!
+            now_next = datetime.datetime(2026, 11, 25, 0, 30, 0).timestamp()
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_next)
+            eng._last_account_poll = now_next
+            snap_settled = eng.poll(now_ts=now_next, force_account=False)
+            self.assertEqual(snap_settled.daily_steps_limit_mode, "adaptive_up")
+            self.assertEqual(snap_settled.daily_steps_alert, 3600)
+
+    def test_v726_bug_b_c_d_e_history_30m_online_7d_offline_t2_and_proxy_dedup(self) -> None:
+        """v7.2.6 Bugs B/C/D/E: custom account 30m strictly filters [now-30m,now] (0 convs like 6h); online 7d preserves live freshness, demotes >24h recovered local T1 to WARN naming culprit, reports true log session start; offline default 7d with stale 503 stays IDLE (never T2); errorreport.go dual-bucket EOF no longer triggers fake proxy outage."""
+        import datetime
+        import os
+        from core.log_monitor import AccountQuotaInfo, LanguageServerLogTailer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 24, 3, 30, 0).timestamp()
+
+            def _iso(ts_v: float) -> str:
+                return datetime.datetime.fromtimestamp(ts_v, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+            ck = root / "cockpit_logs"
+            ck.mkdir()
+            t_old_ly = now - 3.3 * 86400.0
+            t_ca = now - 31.0 * 3600.0
+            t_ly_back = now - 20.0 * 3600.0
+            (ck / "app.log.2026-11-22").write_text(
+                f"{_iso(t_old_ly - 300)} INFO [Antigravity 2.0] 写入系统凭据: ly008@example.com\n"
+                f"{_iso(t_ca - 60)} INFO [Antigravity 2.0] 写入系统凭据: ca008@example.com\n"
+                f"{_iso(t_ly_back)} INFO [Antigravity 2.0] 写入系统凭据: ly008@example.com\n",
+                encoding="utf-8",
+            )
+
+            # 1) Old ly***8 conv 3.3d ago with 6 abnormal misses then recovered on final step
+            cid_old = "1a5df400-aaaa-bbbb"
+            d_old = root / "brain" / cid_old / ".system_generated" / "logs"
+            d_old.mkdir(parents=True)
+            old_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso(t_old_ly), "content": "old"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso(t_old_ly + 10), "model": "gemini-4-neon-xhigh", "input_tokens": 220000, "cache_read_tokens": 0, "output_tokens": 200},
+            ]
+            for k in range(2, 8):
+                old_rows.append({"type": "PLANNER_RESPONSE", "step_index": k, "created_at": _iso(t_old_ly + k * 20), "model": "gemini-4-neon-xhigh", "input_tokens": 220000 + k * 1000, "cache_read_tokens": 0, "output_tokens": 200})
+            old_rows.append({"type": "PLANNER_RESPONSE", "step_index": 8, "created_at": _iso(t_old_ly + 180), "model": "gemini-4-neon-xhigh", "input_tokens": 3000, "cache_read_tokens": 225000, "output_tokens": 200})
+            tp_old = d_old / "transcript.jsonl"
+            tp_old.write_text("\n".join(json.dumps(r) for r in old_rows) + "\n", encoding="utf-8")
+            os.utime(tp_old, (t_old_ly + 180, t_old_ly + 180))
+
+            # 2) Historical ca***8 conv 31h ago (0 activity in 30m and 6h!)
+            cid_ca = "ca968052-cccc-dddd"
+            d_ca = root / "brain" / cid_ca / ".system_generated" / "logs"
+            d_ca.mkdir(parents=True)
+            ca_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso(t_ca), "content": "ca"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso(t_ca + 15), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso(t_ca + 40), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 120000, "output_tokens": 200},
+            ]
+            tp_ca = d_ca / "transcript.jsonl"
+            tp_ca.write_text("\n".join(json.dumps(r) for r in ca_rows) + "\n", encoding="utf-8")
+            os.utime(tp_ca, (t_ca + 40, t_ca + 40))
+
+            # 3) Live healthy large-context ly***8 conv 30s ago
+            cid_live = "f202b800-eeee-ffff"
+            d_live = root / "brain" / cid_live / ".system_generated" / "logs"
+            d_live.mkdir(parents=True)
+            live_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso(now - 90), "content": "live"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso(now - 70), "model": "gemini-4-neon-xhigh", "input_tokens": 310000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso(now - 50), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 310000, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": _iso(now - 30), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 312000, "output_tokens": 200},
+            ]
+            tp_live = d_live / "transcript.jsonl"
+            tp_live.write_text("\n".join(json.dumps(r) for r in live_rows) + "\n", encoding="utf-8")
+            os.utime(tp_live, (now - 30, now - 30))
+
+            # 4) language_server.log starts at 02:59 with ONLY 2 background quota EOF + errorreport.go echoes (must NOT trigger proxy outage!)
+            ls_log = root / "language_server.log"
+            ls_log.write_text(
+                "I1124 02:59:48.100000 24140 main.go:10] Starting language server\n"
+                "E1124 03:15:23.100000 40303 cache.go:157] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary\": EOF\n"
+                "E1124 03:15:23.101000 40303 errorreport.go:285] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary\": EOF\n"
+                "E1124 03:15:58.100000 41959 cache.go:157] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary\": EOF\n"
+                "E1124 03:15:58.101000 41959 errorreport.go:285] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary\": EOF\n",
+                encoding="utf-8",
+            )
+
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "ck.sqlite",
+                    "cockpit_logs_dir": ck,
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now)
+            eng._last_account_poll = now
+
+            # Bug B: historical ca***8 on 30m MUST return 0 convs & WAIT (matching 6h), NEVER pull 31h-old data!
+            s_ca_30 = eng.poll(now_ts=now, force_account=False, view_account="ca***8", history_range="30m")
+            s_ca_6h = eng.poll(now_ts=now, force_account=False, view_account="ca***8", history_range="6h")
+            self.assertEqual(s_ca_30.grade, "WAIT")
+            self.assertEqual(len(s_ca_30.active_conversations), 0)
+            self.assertEqual(s_ca_6h.grade, "WAIT")
+            self.assertEqual(len(s_ca_6h.active_conversations), 0)
+
+            # Bug C & E: online ly***8 on 30m has ONLY live conv (monotonic subset of 7d) & 0 fake proxy outage;
+            # on 7d retains live freshness, demotes 3.3d-old recovered 1a5df4 to WARN naming culprit, and reports 02:59 log_session_start_ts!
+            s_ly_30 = eng.poll(now_ts=now, force_account=False, view_account="", history_range="30m")
+            s_ly_7d = eng.poll(now_ts=now, force_account=False, view_account="", history_range="7d")
+            self.assertEqual([c.short_id for c in s_ly_30.active_conversations], ["f202b8"])
+            self.assertEqual(s_ly_30.proxy_outage_recent, 0)
+            self.assertEqual(len(s_ly_7d.active_conversations), 2)
+            self.assertIsNotNone(s_ly_7d.min_freshness_sec)
+            self.assertGreater(s_ly_7d.min_freshness_sec or 0, 100)
+            self.assertEqual(s_ly_7d.grade, "WARN")
+            self.assertIn("1a5df4", s_ly_7d.sub_headline)
+            self.assertIn("1a5df4", s_ly_7d.cache_culprit_summary)
+            self.assertGreater(s_ly_7d.log_session_start_ts, 0.0)
+            self.assertEqual(datetime.datetime.fromtimestamp(s_ly_7d.log_session_start_ts).strftime("%H:%M"), "02:59")
+
+            # Bug D: offline client (no live hub) + stale 503 in log + default 7d view MUST stay IDLE (NEVER red T2!)
+            ls_log.write_text(
+                "I1124 02:00:00.100000 11111 main.go:10] Starting language server\n"
+                "E1124 02:10:01.100000 22222 run.go:315] Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity available)\n"
+                "E1124 02:10:05.100000 22222 run.go:315] Run: attempt 2 failed (UNAVAILABLE (code 503): No capacity available)\n",
+                encoding="utf-8",
+            )
+            eng_off = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root / "brain",
+                    "conversations_dir": root / "conversations",
+                    "daemon_dir": root / "daemon",
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "ck.sqlite",
+                    "cockpit_logs_dir": ck,
+                    "ledger_path": root / "ledger.json",
+                },
+                read_only=True,
+            )
+            now_off = now + 600.0
+            eng_off._account_cache = AccountQuotaInfo(short_label="离线", online=False, observed_at=now_off)
+            eng_off._last_account_poll = now_off
+            s_off_7d = eng_off.poll(now_ts=now_off, force_account=False, view_account="", history_range="7d")
+            self.assertEqual(s_off_7d.grade, "IDLE")
+            self.assertEqual(s_off_7d.recent_503, 0)
+            self.assertEqual(s_off_7d.pressure, "offline_unknown")
+
+    def test_v726_bug_e_f_g_h_i_ui_alignment_empty_scrollbar_proxy_cell_and_18_hwnd_isolation(self) -> None:
+        """v7.2.6 Bugs E/F/G/H/I UI: bidirectional exact width lock across account/range switches without adding widgets to self.root, clean collapsed width release, zero empty-list blue scrollbar thumb, compact proxy outage cell (no orange 0/0), spaced scope_hint & +0.03 details alpha."""
+        import datetime
+        from dataclasses import replace
+        from core.config_store import ConfigStore
+        from core.log_monitor import AccountQuotaInfo, ConversationSummary, MonitorSnapshot, StepRecord
+        from ui.capsule_app import AntigravityCapsuleApp
+
+        def _count_tk_descendants(widget) -> int:
+            total = 0
+            stack = list(widget.winfo_children())
+            while stack:
+                w = stack.pop()
+                if str(w.winfo_class()) == "Toplevel":
+                    continue
+                total += 1
+                stack.extend(w.winfo_children())
+            return total
+
+        with tempfile.TemporaryDirectory() as td:
+            root_d = Path(td)
+            cfg = ConfigStore(root_d / "config.json")
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root_d / "brain",
+                    "conversations_dir": root_d / "conversations",
+                    "daemon_dir": root_d / "daemon",
+                    "ls_log_path": root_d / "ls.log",
+                    "cockpit_quota_db": root_d / "ck.sqlite",
+                },
+                read_only=True,
+            )
+            app = AntigravityCapsuleApp(Path(__file__).resolve().parent.parent, cfg, eng, enable_tray=False)
+            try:
+                now = datetime.datetime(2026, 11, 24, 3, 30, 0).timestamp()
+                st_ok = StepRecord(1, now - 15, "gemini-4-neon-xhigh", 2000, 180000, 300, 182000, 98.9, "hit", "cached")
+                conv_ok = ConversationSummary(
+                    conversation_id="f202b800-1111", short_id="f202b8", model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                    context_tokens=311500, max_context_tokens=512000, latest_hit_rate=98.9, latest_cached_in=180000,
+                    latest_uncached_in=2000, latest_timestamp=now - 15, recent_steps=[st_ok] * 8,
+                    consec_miss=0, consec_miss_start_step=0, single_miss=False, wasted_cold_tokens=0,
+                    freshness_remaining_sec=180, title="猫猫云梯核心开发对话", tps=127.0, ttft_sec=8.6,
+                    recent_ttfts=[8.6] * 8, recent_tps_list=[127.0] * 8, ttft_avg_sec=8.6, ttft_max_sec=12.0,
+                    speed_status="ok",
+                )
+                conv_culprit = ConversationSummary(
+                    conversation_id="1a5df400-9999", short_id="1a5df4", model="Neon XHigh", model_raw="gemini-4-neon-xhigh",
+                    context_tokens=220000, max_context_tokens=512000, latest_hit_rate=98.7, latest_cached_in=220000,
+                    latest_uncached_in=3000, latest_timestamp=now - 3 * 86400.0, recent_steps=[st_ok] * 2,
+                    consec_miss=0, consec_miss_start_step=0, single_miss=False, wasted_cold_tokens=1_647_345,
+                    abnormal_in_recent10=7, cacheable_in_recent10=9, recent10_hit_ratio=2 / 9,
+                    freshness_remaining_sec=None, title="旧掉缓存罪魁对话", tps=100.0, ttft_sec=9.0,
+                    recent_ttfts=[9.0, 9.0], recent_tps_list=[100.0, 100.0], ttft_avg_sec=9.0, ttft_max_sec=9.0,
+                    speed_status="ok",
+                )
+                base_snap = MonitorSnapshot(
+                    generated_at=now, level="green", grade="T0", headline="T0 健康 · Neon XHigh",
+                    sub_headline="近 30 分钟缓存与底层日志均健康", active_model="Neon XHigh",
+                    primary_hit_rate=98.9, primary_hit_classification="hit", primary_tps=127.0,
+                    primary_ttft=8.6, primary_speed_status="ok", min_freshness_sec=180,
+                    min_freshness_conv="f202b8", min_freshness_ctx=311500, min_freshness_invalid_reason="",
+                    today_steps=300, daily_steps_warn=960, daily_steps_alert=1200,
+                    active_conversations=[conv_ok], large_freshness_list=[conv_ok],
+                    recent_503=0, today_503=0, recent_timeout=0, today_timeout=0,
+                    recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+                    recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+                    account=AccountQuotaInfo(short_label="ly***8", five_hour_pct=95.6, weekly_pct=68.0, online=True, observed_at=now),
+                    sliding_window_min=30, freshness_window_sec=210,
+                    resolved_account="ly***8", steps_scope_label="ly***8", log_scope_label="ly***8",
+                    rolling_24h_steps=2027, total_24h_steps=2027,
+                    log_session_start_ts=datetime.datetime(2026, 11, 24, 2, 59, 48).timestamp(),
+                )
+
+                app.set_expanded(True)
+                app.render_snapshot(base_snap)
+                app.root.update()
+                self.assertLessEqual(_count_tk_descendants(app.root), 32)
+                self.assertAlmostEqual(float(app.root.attributes("-alpha")), 0.95, places=2)
+                self.assertAlmostEqual(float(app._details_win.attributes("-alpha")), 0.98, places=2)
+                self.assertLessEqual(abs(app.root.winfo_width() - app._details_win.winfo_width()), 1)
+                self.assertEqual(app.root.winfo_x(), app._details_win.winfo_x())
+
+                # Bug C + G + I: 7d view -> culprit placed on top even if originally behind >24 convs, spaced range_steps in scope_hint, log title notes 02:59 start
+                extra_convs = [replace(conv_ok, conversation_id=f"fill{i:02d}00-1111", short_id=f"fill{i:02d}", latest_timestamp=now - 60 - i) for i in range(25)]
+                snap_7d = replace(
+                    base_snap,
+                    grade="WARN", level="orange", is_historical_rating=True,
+                    history_range="7d", history_range_label="近 7 天", range_steps=2851,
+                    active_conversations=extra_convs + [conv_culprit],
+                    wasted_cold_tokens_total=1_647_345, max_abnormal_recent10=7,
+                    cache_culprit_summary="1a5df4 (11-20)",
+                    sub_headline="[近 7 天汇总] 1a5df4 (11-20) 曾掉缓存 7/9 步，后续已恢复",
+                )
+                app.render_snapshot(snap_7d)
+                app.root.update()
+                self.assertEqual(app._conv_row_ids[0], "1a5df400-9999")
+                self.assertIn("主对话(26)", app._filter_buttons["main"].cget("text"))
+                self.assertIn("2851 步", app._lbl_scope_hint.cget("text"))
+                self.assertNotIn("2851", app._lbl_steps_title.cget("text"))
+                self.assertIn("02:59", app._lbl_logs_title.cget("text"))
+                self.assertLessEqual(abs(app.root.winfo_width() - app._details_win.winfo_width()), 1)
+                wide_7d_w = app.root.winfo_width()
+                # Scroll full list to bottom before emptying to test yview reset
+                app._conv_viewport.yview_moveto(1.0)
+                app.root.update()
+
+                # Bug F + H: historical empty ca***8 6h -> exact width alignment + true shrink + ZERO scrollbar items!
+                snap_ca_empty = replace(
+                    base_snap,
+                    grade="WAIT", level="cyan", is_custom_account_view=True, is_historical_rating=True,
+                    resolved_account="ca***8", steps_scope_label="ca***8", log_scope_label="ca***8",
+                    history_range="6h", history_range_label="近 6 小时", range_steps=0,
+                    active_conversations=[], large_freshness_list=[], min_freshness_sec=None,
+                    rolling_24h_steps=0, total_24h_steps=2030, daily_steps_alert=5000, daily_steps_warn=4000,
+                )
+                app.render_snapshot(snap_ca_empty)
+                app.root.update()
+                self.assertLessEqual(abs(app.root.winfo_width() - app._details_win.winfo_width()), 1)
+                self.assertEqual(app.root.winfo_x(), app._details_win.winfo_x())
+                self.assertLess(app.root.winfo_width(), wide_7d_w)
+                self.assertEqual(app._conv_scrollbar.find_all(), ())
+                self.assertEqual(app._conv_viewport.yview(), (0.0, 1.0))
+                self.assertEqual(app._lbl_bar_fresh.cget("text"), "保鲜 —")
+
+                # Round-trip empty -> 1 item -> full list -> empty keeps scrollbar accurate
+                app.render_snapshot(base_snap)
+                app.root.update()
+                self.assertEqual(app._conv_scrollbar.find_all(), ())
+                app.render_snapshot(snap_7d)
+                app.root.update()
+                self.assertTrue(len(app._conv_scrollbar.find_all()) > 0)
+                app.render_snapshot(snap_ca_empty)
+                app.root.update()
+                self.assertEqual(app._conv_scrollbar.find_all(), ())
+
+                # Bug E: live proxy outage with recent_retry=0 MUST NOT show orange "0 / 0"
+                snap_outage = replace(
+                    base_snap,
+                    grade="WARN", level="orange", proxy_outage_recent=4,
+                    proxy_outage_note="代理线路疑似断流 (03:15 60s内 4次跨接口断连，非服务端限流)",
+                )
+                app.render_snapshot(snap_outage)
+                app.root.update()
+                retry_lbl = app._log_cells["retry"]["val"]
+                self.assertEqual(retry_lbl.cget("fg"), app.theme["orange"])
+                self.assertNotEqual(retry_lbl.cget("text"), "0 / 0")
+                self.assertIn("4", retry_lbl.cget("text"))
+
+                # Collapse cleanly releases width lock
+                exp_w = app.root.winfo_width()
+                app.set_expanded(False)
+                app.render_snapshot(snap_ca_empty)
+                app.root.update()
+                self.assertLessEqual(_count_tk_descendants(app.root), 32)
+                self.assertLess(app.root.winfo_width(), exp_w)
+            finally:
+                app.shutdown()
+
+    def test_v726_final_review_hardening(self) -> None:
+        """Hardening regressions from v7.2.6 independent final dual-review (A + B)."""
+        from dataclasses import replace
+        from core.config_store import ConfigStore
+        from core.log_monitor import (
+            AccountQuotaInfo,
+            ConversationSummary,
+            LanguageServerLogTailer,
+            MonitorSnapshot,
+            StepRecord,
+            compute_adaptive_daily_steps_limits,
+            compute_settled_rolling_24h_records,
+            format_json_snapshot,
+            format_text_summary,
+        )
+        from core.sqlite_reader import ConversationDbReader
+        from ui.capsule_app import AntigravityCapsuleApp
+
+        # 1. SQLite full-history LRU scales with max_cache_entries=64 (prevents today/7d 48-conv thrash)
+        with tempfile.TemporaryDirectory() as td:
+            reader = ConversationDbReader(Path(td), max_cache_entries=64, tail_rows=16)
+            self.assertGreaterEqual(reader._max_full_cache_entries, 48)
+
+        # 2. Cross-midnight unsettled degradation MUST suppress prior-day post_deg_safe_steps & adaptive_up
+        now_dt = datetime.datetime(2026, 11, 24, 12, 0, 0)
+        now_ts = now_dt.timestamp()
+        h23_04 = int(datetime.datetime(2026, 11, 23, 4, 0, 0).timestamp() // 3600)
+        h24_01 = int(datetime.datetime(2026, 11, 24, 1, 0, 0).timestamp() // 3600)
+        cross_buckets = {
+            h23_04: {"steps": 100, "degraded": True, "degraded_24h_at": 500},
+            h23_04 + 1: {"steps": 900, "degraded": False, "degraded_24h_at": None},
+            h23_04 + 2: {"steps": 900, "degraded": False, "degraded_24h_at": None},
+            h23_04 + 3: {"steps": 700, "degraded": False, "degraded_24h_at": None},
+            h24_01: {"steps": 100, "degraded": True, "degraded_24h_at": 2600},  # unsettled!
+        }
+        settled_cross = compute_settled_rolling_24h_records(cross_buckets, now_ts)
+        rec_23 = next((r for r in settled_cross if r["date"] == "2026-11-23"), None)
+        self.assertIsNotNone(rec_23)
+        self.assertNotIn("post_deg_safe_steps", rec_23)
+        _, lim_cross, mode_cross, _, _ = compute_adaptive_daily_steps_limits(960, 1200, settled_cross)
+        self.assertNotEqual(mode_cross, "adaptive_up")
+        self.assertLessEqual(lim_cross, 1200)
+
+        # 3. _merge_account_hourly_buckets prefers max(l_at, s_at) when both >= 400 (subagent shrink guard)
+        merged = AntigravityMonitorEngine._merge_account_hourly_buckets(
+            {498700: {"steps": 100, "degraded": True, "degraded_24h_at": 1052}},
+            {498700: {"steps": 60, "degraded": True, "degraded_24h_at": 573}},
+        )
+        self.assertEqual(merged[498700]["degraded_24h_at"], 1052)
+        self.assertEqual(merged[498700]["steps"], 100)
+
+        # 4. Live T2 on top-of-hour 0-step bucket anchors to prior active bucket (no 0-step ghost, no dropped T2)
+        #    AND live T2 in current hour NEVER lifts prior adaptive_down tightening!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            brain = root / "brain"
+            convs_dir = root / "conversations"
+            daemon = root / "daemon"
+            ls_log = root / "language_server.log"
+            ledger_p = root / "ledger.json"
+            brain.mkdir()
+            convs_dir.mkdir()
+            daemon.mkdir()
+
+            t_now = datetime.datetime(2026, 11, 24, 1, 0, 30)
+            now_f = t_now.timestamp()
+            t_prev_step = datetime.datetime(2026, 11, 24, 0, 30, 0).timestamp()
+            # Write 1 healthy step at 00:30 so today_steps=1, cur_h (01:00) has 0 steps
+            cid_t = "aaaa1111-2222-3333-4444-555566667777"
+            tr_p = brain / cid_t / ".system_generated" / "logs" / "transcript.jsonl"
+            tr_p.parent.mkdir(parents=True, exist_ok=True)
+            iso_prev = datetime.datetime.fromtimestamp(t_prev_step, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tr_p.write_text(
+                json.dumps({"source": "USER_EXPLICIT", "step_index": 0, "type": "USER_INPUT", "content": "hi", "created_at": iso_prev}) + "\n"
+                + json.dumps({
+                    "step_index": 1, "type": "PLANNER_RESPONSE", "model": "gemini-4-neon-xhigh",
+                    "created_at": iso_prev, "input_tokens": 5000, "cache_read_tokens": 50000, "output_tokens": 100,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(tr_p, (t_prev_step, t_prev_step))
+            # Two live 503 errors at 01:00:10 and 01:00:20 -> grade T2
+            ls_log.write_text(
+                "E1124 01:00:10.000000 100 run.go:100] HTTP 503 Service Unavailable MODEL_CAPACITY_EXHAUSTED\n"
+                "E1124 01:00:20.000000 101 run.go:100] HTTP 503 Service Unavailable MODEL_CAPACITY_EXHAUSTED\n",
+                encoding="utf-8",
+            )
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": brain,
+                    "conversations_dir": convs_dir,
+                    "daemon_dir": daemon,
+                    "ls_log_path": ls_log,
+                    "cockpit_quota_db": root / "ck.sqlite",
+                    "ledger_path": ledger_p,
+                },
+                read_only=False,
+            )
+            # Seed old tightening (11-20 deg_at=440 -> 600) + unsettled healthy hours on 11-23
+            h20 = int(datetime.datetime(2026, 11, 20, 10, 0, 0).timestamp() // 3600)
+            h23 = int(datetime.datetime(2026, 11, 23, 18, 0, 0).timestamp() // 3600)
+            eng._ledger.record_hourly_step_buckets(
+                "ly***8",
+                hour_counts={h20: 440, h23: 500, h23 + 1: 500, h23 + 2: 500},
+                degraded_hours={h20: 440},
+                now_ts=now_f,
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_f)
+            eng._last_account_poll = now_f
+            eng._ledger.observe_online("ly***8", now_f - 7200)
+            snap_t2 = eng.poll(now_ts=now_f, force_account=False, view_account="", history_range="30m")
+            self.assertEqual(snap_t2.grade, "T2")
+            # Live T2 in current hour MUST keep prior adaptive_down tightening (600) rather than lifting to 1200!
+            self.assertEqual(snap_t2.daily_steps_limit_mode, "adaptive_down")
+            self.assertEqual(snap_t2.daily_steps_alert, 600)
+            # Persisted ledger MUST NOT contain a 0-step degraded bucket at 01:00, and MUST record T2 on 00:00 active bucket!
+            hb_after = eng._ledger.get_account_hourly_buckets("ly***8")
+            h00 = int(datetime.datetime(2026, 11, 24, 0, 0, 0).timestamp() // 3600)
+            h01 = int(datetime.datetime(2026, 11, 24, 1, 0, 0).timestamp() // 3600)
+            self.assertFalse(hb_after.get(h01, {}).get("degraded", False) and hb_after.get(h01, {}).get("steps", 0) == 0)
+            self.assertTrue(hb_after.get(h00, {}).get("degraded", False))
+            self.assertGreater(hb_after.get(h00, {}).get("steps", 0), 0)
+
+        # 5. Proxy EOF same-gid sliding 2s dedup across even-second boundary + >4KB header log session start
+        with tempfile.TemporaryDirectory() as td:
+            lp = Path(td) / "ls.log"
+            t_base = datetime.datetime(2026, 11, 24, 3, 15, 21).timestamp()
+            lp.write_text(
+                "E1124 03:15:21.990000 500 cache.go:189] Post \"https://cloudcode.googleapis.com/v1:fetchUserInfo\": EOF\n"
+                "E1124 03:15:22.010000 500 caller.go:42] Post \"https://cloudcode.googleapis.com/v1:other\": EOF\n",
+                encoding="utf-8",
+            )
+            tailer = LanguageServerLogTailer(lp)
+            tailer.poll(now_ts=t_base + 5.0)
+            cnt_out, _, _, _ = tailer.get_proxy_outage_info(t_base + 5.0, window_min=30)
+            self.assertEqual(cnt_out, 0)
+
+            big_lp = Path(td) / "big_ls.log"
+            banner = ("NO_TS_BANNER_LINE_PADDING_" + "X" * 100 + "\n") * 80  # ~10 KB > 4 KB
+            first_ts_line = "I1124 01:00:05.123456 10 main.go:1] boot start\n"
+            filler = ("plain body line without header " + "Y" * 100 + "\n") * 22000  # > 2 MB
+            tail_line = "I1124 02:30:00.000000 10 main.go:2] tail line\n"
+            big_lp.write_text(banner + first_ts_line + filler + tail_line, encoding="utf-8")
+            big_tailer = LanguageServerLogTailer(big_lp)
+            big_tailer.poll(now_ts=datetime.datetime(2026, 11, 24, 2, 31, 0).timestamp())
+            self.assertGreater(big_tailer.get_session_start_ts(), 0.0)
+            self.assertEqual(datetime.datetime.fromtimestamp(big_tailer.get_session_start_ts()).strftime("%H:%M"), "01:00")
+
+        # 6. format_json_snapshot handles log_session_start_ts=None & format_text_summary has clean spacing
+        dummy_snap = MonitorSnapshot(
+            generated_at=now_ts, level="orange", grade="WARN", headline="留意预警", sub_headline="test",
+            active_model="Neon XHigh", primary_hit_rate=95.0, primary_hit_classification="hit",
+            primary_tps=100.0, primary_ttft=5.0, primary_speed_status="ok",
+            min_freshness_sec=None, min_freshness_conv="", min_freshness_ctx=0, min_freshness_invalid_reason="",
+            today_steps=10, daily_steps_warn=960, daily_steps_alert=1200,
+            active_conversations=[], large_freshness_list=[],
+            recent_503=0, today_503=0, recent_timeout=0, today_timeout=0,
+            recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+            recent_events=[], wasted_cold_tokens_total=200_000, max_consec_miss=1,
+            account=AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_ts),
+            sliding_window_min=30, freshness_window_sec=210,
+            history_range="7d", history_range_label="近 7 天", is_historical_rating=True,
+            cache_culprit_summary="", log_session_start_ts=None,  # type: ignore[arg-type]
+        )
+        j_out = json.loads(format_json_snapshot(dummy_snap))
+        self.assertEqual(j_out["errors_30m"]["log_session_start_ts"], 0.0)
+        self.assertIsNone(j_out["errors_30m"]["log_session_start_local"])
+        txt_out = format_text_summary(dummy_snap)
+        self.assertIn("近 7 天内异常掉缓存累计多耗约", txt_out)
+        self.assertNotIn("近 7 天内 异常", txt_out)
+
+        # 7. UI: non-severe culprit pinned at row 0 + drag pending snapshot final coords + destroy TclError safety
+        with tempfile.TemporaryDirectory() as td:
+            root_d = Path(td)
+            cfg = ConfigStore(root_d / "config.json")
+            eng = AntigravityMonitorEngine(
+                paths={
+                    "brain_dir": root_d / "brain",
+                    "conversations_dir": root_d / "conversations",
+                    "daemon_dir": root_d / "daemon",
+                    "ls_log_path": root_d / "ls.log",
+                    "cockpit_quota_db": root_d / "ck.sqlite",
+                },
+                read_only=True,
+            )
+            app = AntigravityCapsuleApp(Path(__file__).resolve().parents[1], cfg, eng, enable_tray=False)
+            try:
+                app.set_expanded(True)
+                st_ok = StepRecord(1, now_ts - 20, "gemini-4-neon-xhigh", 2000, 100000, 200, 102000, 98.0, "hit", "cached")
+                convs_30 = [
+                    ConversationSummary(
+                        conversation_id=f"c{i:05d}00-0000", short_id=f"c{i:05d}", model="Neon XHigh",
+                        model_raw="gemini-4-neon-xhigh", context_tokens=100000, max_context_tokens=512000,
+                        latest_hit_rate=98.0, latest_cached_in=98000, latest_uncached_in=2000,
+                        latest_timestamp=now_ts - i * 60, recent_steps=[st_ok] * 5,
+                        consec_miss=0, consec_miss_start_step=0, single_miss=False, wasted_cold_tokens=0,
+                        freshness_remaining_sec=None, title=f"对话{i}",
+                    )
+                    for i in range(28)
+                ]
+                # Make row #27 a NON-severe culprit (abnormal=2, wasted=80K < 150K, consec=0) named by cache_culprit_summary
+                convs_30[27].abnormal_in_recent10 = 2
+                convs_30[27].wasted_cold_tokens = 80_000
+                snap_culprit = replace(
+                    dummy_snap,
+                    active_conversations=convs_30,
+                    cache_culprit_summary="c00027 (11-23)",
+                )
+                app.render_snapshot(snap_culprit)
+                app.root.update()
+                self.assertEqual(app._conv_row_ids[0], "c0002700-0000")
+
+                # Drag ended with _pending_drag_snapshot saves FINAL post-snapshot clamped coords (no mismatch)
+                app._dragging = True
+                app._on_dragger_move_started()
+                app.render_snapshot(snap_culprit)
+                self.assertIsNotNone(app._pending_drag_snapshot)
+                app._on_dragger_ended(moved=True)
+                app.root.update()
+                self.assertEqual(app.config["window_x"], app.root.winfo_x())
+                self.assertEqual(app.config["window_y"], app.root.winfo_y())
+
+                # Destroying _details_win MUST NOT fall through and corrupt _root_min_w
+                prev_min_w = app._root_min_w
+                app._details_win.destroy()
+                app._clamp_window_to_screen(force=True)
+                self.assertEqual(app._root_min_w, prev_min_w)
+
+                # Destroying root MUST NOT raise TclError from render_snapshot / set_expanded / clamp
+                app.root.destroy()
+                app._clamp_window_to_screen(force=True)
+                app.render_snapshot(snap_culprit)
+                app.set_expanded(False)
+            finally:
+                app.shutdown()
+
 if __name__ == "__main__":
     unittest.main()
