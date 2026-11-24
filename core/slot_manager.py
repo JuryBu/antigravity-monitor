@@ -29,10 +29,16 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 MIN_PROTECT_AGE_MIN: int = 30
 DEFAULT_SLOT_CAP: int = 500
+_RECYCLE_UNAVAILABLE_MARKERS: Tuple[str, ...] = (
+    "recycle_bin_disabled_on_volume",
+    "recycle_bin_unavailable_on_volume",
+    "path_exceeds_max_path_for_recycle",
+    "recycle_unsupported_non_windows",
+)
 _HASH_BUF_BYTES = 1024 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _CLEANUP_MUTEX_NAME = "Local\\AntigravityMonitorSlotCleanupMutex_v1"
@@ -434,6 +440,8 @@ class SlotCleanupResult:
     archive_path: str = ""
     error: str = ""
     removed_cids: List[str] = field(default_factory=list)
+    skipped_recycle_unavailable_count: int = 0
+    last_skip_reason: str = ""
 
 
 class SlotInventoryScanner:
@@ -445,6 +453,7 @@ class SlotInventoryScanner:
         brain_dir: Path,
         summaries_db_path: Path,
         cache_ttl_sec: float = 15.0,
+        active_dir_cache_ttl_sec: float = 8.0,
     ) -> None:
         self.conversations_dir = Path(conversations_dir)
         self.brain_dir = Path(brain_dir)
@@ -455,19 +464,25 @@ class SlotInventoryScanner:
         self._cached_key: Optional[Tuple[Any, ...]] = None
         self._cached_at: float = 0.0
         self._dir_size_lock = threading.Lock()
-        self._dir_size_cache: OrderedDict[str, Tuple[float, int, int, int]] = OrderedDict()
-        self._dir_size_cache_max: int = 512
+        self._dir_size_cache: OrderedDict[str, Tuple[float, int, int, int, int]] = OrderedDict()
+        self._dir_size_cache_max: int = max(512, DEFAULT_SLOT_CAP + 128)
         self._dir_size_cache_ttl_sec: float = 300.0
+        self._active_dir_size_cache_ttl_sec: float = max(0.5, float(active_dir_cache_ttl_sec))
         self._dir_size_epoch: int = 0
 
-    def invalidate_cache(self) -> None:
+    def invalidate_cache(self, cids: Optional[Iterable[str]] = None) -> None:
         with self._lock:
             self._cached_snap = None
             self._cached_key = None
             self._cached_at = 0.0
         with self._dir_size_lock:
+            # Always bump epoch (both full and targeted invalidation) so in-flight scans cannot write stale sizes back.
             self._dir_size_epoch += 1
-            self._dir_size_cache.clear()
+            if cids is None:
+                self._dir_size_cache.clear()
+            else:
+                for cid in cids:
+                    self._dir_size_cache.pop(str(cid), None)
 
     def _get_brain_dir_bytes(
         self,
@@ -475,6 +490,9 @@ class SlotInventoryScanner:
         brain_dir_str: str,
         disk_age_min: float,
         transcript_mtime_ns: int,
+        transcript_size: int = 0,
+        *,
+        force: bool = False,
     ) -> int:
         try:
             dir_st = os.lstat(brain_dir_str)
@@ -490,32 +508,33 @@ class SlotInventoryScanner:
                 self._dir_size_cache.pop(cid, None)
             return 0
 
-        # Active (< 30m) directories may write into deep subdirs without updating root mtime:
-        # always scan live and evict any stale cache entry.
-        if disk_age_min < float(MIN_PROTECT_AGE_MIN):
-            with self._dir_size_lock:
-                self._dir_size_cache.pop(cid, None)
-            return _dir_tree_bytes(brain_dir_str)
+        is_active = disk_age_min < float(MIN_PROTECT_AGE_MIN)
+        ttl = self._active_dir_size_cache_ttl_sec if is_active else self._dir_size_cache_ttl_sec
+        bypass_short_cache = bool(force and is_active)
 
         dir_mt_ns = int(dir_st.st_mtime_ns)
+        tr_sz_now = max(0, int(transcript_size))
         mono_now = time.monotonic()
         with self._dir_size_lock:
             epoch = self._dir_size_epoch
-            cached = self._dir_size_cache.get(cid)
-            if (
-                cached is not None
-                and cached[1] == dir_mt_ns
-                and cached[2] == transcript_mtime_ns
-                and (mono_now - cached[0]) < self._dir_size_cache_ttl_sec
-            ):
-                self._dir_size_cache.move_to_end(cid)
-                return cached[3]
+            if not bypass_short_cache:
+                cached = self._dir_size_cache.get(cid)
+                if cached is not None and (mono_now - cached[0]) < ttl:
+                    if is_active:
+                        # Active conversations append to transcript.jsonl every second; within the
+                        # short 8s TTL, reuse the tree size plus live transcript delta instead of
+                        # re-walking thousands of step output files on every refresh.
+                        self._dir_size_cache.move_to_end(cid)
+                        return max(0, cached[3] + (tr_sz_now - cached[4]))
+                    if cached[1] == dir_mt_ns and cached[2] == transcript_mtime_ns:
+                        self._dir_size_cache.move_to_end(cid)
+                        return cached[3]
 
         total = _dir_tree_bytes(brain_dir_str)
         mono_done = time.monotonic()
         with self._dir_size_lock:
             if self._dir_size_epoch == epoch:
-                self._dir_size_cache[cid] = (mono_done, dir_mt_ns, transcript_mtime_ns, total)
+                self._dir_size_cache[cid] = (mono_done, dir_mt_ns, transcript_mtime_ns, total, tr_sz_now)
                 self._dir_size_cache.move_to_end(cid)
                 while len(self._dir_size_cache) > self._dir_size_cache_max:
                     self._dir_size_cache.popitem(last=False)
@@ -616,6 +635,8 @@ class SlotInventoryScanner:
         cap = max(50, int(slot_cap))
         warn_th = max(10, min(int(warn_threshold), cap - 5))
         alert_th = max(warn_th + 1, min(int(alert_threshold), cap))
+        with self._dir_size_lock:
+            self._dir_size_cache_max = max(512, cap + 128)
 
         with self._lock:
             stamp = self._compute_light_stamp(eff_protect, cap, warn_th, alert_th)
@@ -698,6 +719,8 @@ class SlotInventoryScanner:
                     join(brain_root_str, cid),
                     disk_age_min,
                     tr_mt_ns,
+                    tr_sz,
+                    force=force,
                 )
                 est_bytes = db_sz + wal_sz + brain_bytes
             total_bytes += est_bytes
@@ -1301,7 +1324,13 @@ class SlotSubagentCleaner:
                 # Step 1: Try removing/recycling .db FIRST. If LS holds an open handle on Windows, fail cleanly and skip!
                 ok_db, _err_db = self._remove_single_path(db_path, remove_mode)
                 if not ok_db:
-                    res.skipped_locked_count += 1
+                    err_text = str(_err_db or "")
+                    if err_text:
+                        res.last_skip_reason = err_text
+                    if any(marker in err_text for marker in _RECYCLE_UNAVAILABLE_MARKERS):
+                        res.skipped_recycle_unavailable_count += 1
+                    else:
+                        res.skipped_locked_count += 1
                     continue
 
                 # Step 2: Best-effort remove/recycle .db-wal, .db-shm and brain/<cid>/
@@ -1325,7 +1354,7 @@ class SlotSubagentCleaner:
                 res.freed_bytes += freed_this
                 res.removed_cids.append(cid)
 
-            self.scanner.invalidate_cache()
+            self.scanner.invalidate_cache(cids=res.removed_cids)
             post_cnt = 0
             if conv_dir.is_dir():
                 try:
@@ -1349,7 +1378,9 @@ class SlotSubagentCleaner:
                     "removed": res.removed_count,
                     "freed_bytes": res.freed_bytes,
                     "skipped_locked": res.skipped_locked_count,
+                    "skipped_recycle_unavailable": res.skipped_recycle_unavailable_count,
                     "skipped_changed": res.skipped_changed_count,
+                    "last_skip_reason": res.last_skip_reason,
                     "brain_remove_failed": brain_fail_count,
                     "remaining_db": res.remaining_db_count,
                     "archive_path": archive_tar_str,

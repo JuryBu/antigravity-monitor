@@ -68,6 +68,10 @@ class TrayManager:
                 self._invoke("toggle_expand"),
             ),
             pystray.MenuItem(
+                "参数设置",
+                self._invoke("open_settings"),
+            ),
+            pystray.MenuItem(
                 "界面主题",
                 pystray.Menu(
                     pystray.MenuItem(

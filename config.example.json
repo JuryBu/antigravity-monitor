@@ -2,7 +2,7 @@
   "theme": "midnight_blue",
   "poll_interval_ms": 2500,
   "freshness_window_sec": 210,
-  "idle_rewarm_sec": 180,
+  "idle_rewarm_sec": 210,
   "large_context_threshold": 100000,
   "daily_steps_warn": 960,
   "daily_steps_alert": 1200,
@@ -26,6 +26,7 @@
   "slot_clean_mode": "recycle",
   "slot_archive_dir": "",
   "update_check_enabled": true,
+  "update_mode": "download",
   "auto_update_restart": false,
   "update_check_interval_min": 30,
   "update_ignored_version": ""

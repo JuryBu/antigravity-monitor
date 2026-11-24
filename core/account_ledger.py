@@ -45,6 +45,60 @@ def _parse_ts(raw: str) -> Optional[float]:
 
 _INVALID_ACCOUNT_LABELS = frozenset({"", "离线", "离***", "offline", "unknown"})
 
+VALID_DEGRADED_KINDS = frozenset({"t1_single", "t1_multi", "t2", "t3"})
+_MAJOR_DEGRADED_KINDS = frozenset({"t1_multi", "t2", "t3"})
+_DEGRADED_KIND_SEVERITY: Dict[str, int] = {
+    "": 0,
+    "t1_single": 1,
+    "t1_multi": 2,
+    "t2": 3,
+    "t3": 4,
+}
+
+
+def normalize_account_tier(raw_tier: str) -> str:
+    """Normalize Hub ``userTier.id`` (never ``plan_status``) into ``ultra | pro | free | ''``."""
+    if not isinstance(raw_tier, str):
+        return ""
+    low = raw_tier.strip().lower()
+    if not low:
+        return ""
+    if "ultra" in low:
+        return "ultra"
+    if "pro" in low:
+        return "pro"
+    if "free" in low:
+        return "free"
+    return ""
+
+
+def _tier_deg_min(norm_tier: str) -> int:
+    if norm_tier == "pro":
+        return 50
+    if norm_tier == "free":
+        return 30
+    return 400
+
+
+def _normalize_degraded_kind(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    low = raw.strip().lower()
+    return low if low in VALID_DEGRADED_KINDS else ""
+
+
+def _merge_degraded_kind(a: str, b: str, is_major_degraded: bool) -> str:
+    ka = _normalize_degraded_kind(a)
+    kb = _normalize_degraded_kind(b)
+    if is_major_degraded:
+        # Once an hour is marked as a real account-wide degradation (d=True), never let a stale
+        # t1_single label mask it as a benign single-conversation drift.
+        if ka == "t1_single":
+            ka = ""
+        if kb == "t1_single":
+            kb = ""
+    return ka if _DEGRADED_KIND_SEVERITY.get(ka, 0) >= _DEGRADED_KIND_SEVERITY.get(kb, 0) else kb
+
 
 def _is_invalid_label(raw: str) -> bool:
     clean = (raw or "").strip().lower()
@@ -85,6 +139,7 @@ class AccountSwitchLedger:
         self._own_events: List[Tuple[float, str]] = []
         self._daily_step_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._hourly_step_buckets: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        self._account_tiers: Dict[str, Dict[str, Any]] = {}
         self._rule_change_timestamps: List[float] = []
         self._cockpit_cache: Dict[str, Tuple[Tuple[int, int], List[Tuple[float, str]]]] = {}
         self._load_own()
@@ -112,13 +167,30 @@ class AccountSwitchLedger:
         return None
 
     @staticmethod
-    def _pick_preferred_deg_at(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    def _parse_optional_bucket_int(val: Dict[str, Any], short_k: str, long_k: str, max_v: int = 500_000) -> int:
+        raw = val.get(short_k)
+        if raw is None:
+            raw = val.get(long_k)
+        if raw is None or isinstance(raw, bool):
+            return 0
+        parsed = AccountSwitchLedger._parse_strict_int(raw)
+        if parsed is None or parsed < 0:
+            return 0
+        return min(max_v, parsed)
+
+    @staticmethod
+    def _pick_preferred_deg_at(
+        a: Optional[int],
+        b: Optional[int],
+        deg_min: int = 400,
+    ) -> Optional[int]:
         if a is None:
             return b
         if b is None:
             return a
-        a_high = a >= 400
-        b_high = b >= 400
+        th = max(1, int(deg_min))
+        a_high = a >= th
+        b_high = b >= th
         if a_high and b_high:
             return min(a, b)
         if a_high:
@@ -238,6 +310,42 @@ class AccountSwitchLedger:
             dedup_rules.append(val)
         self._rule_change_timestamps = dedup_rules[-64:]
 
+        account_tiers: Dict[str, Dict[str, Any]] = {}
+        t_canon_by_low: Dict[str, str] = {}
+        raw_tiers = data.get("account_tiers")
+        if isinstance(raw_tiers, dict):
+            for raw_acct, rec in raw_tiers.items():
+                lbl = _mask_short(str(raw_acct))
+                if not lbl or _is_invalid_label(lbl) or not isinstance(rec, dict):
+                    continue
+                raw_tid = rec.get("tier")
+                if not isinstance(raw_tid, str):
+                    continue
+                clean_tid = raw_tid.strip()[:64]
+                if not clean_tid or not normalize_account_tier(clean_tid):
+                    continue
+                raw_upd = rec.get("updated_at", 0)
+                if isinstance(raw_upd, bool):
+                    continue
+                try:
+                    upd_ts = float(raw_upd)
+                except (TypeError, ValueError, OverflowError):
+                    upd_ts = 0.0
+                if not math.isfinite(upd_ts) or upd_ts < 0.0:
+                    upd_ts = 0.0
+                low = lbl.lower()
+                canon_lbl = t_canon_by_low.setdefault(low, lbl)
+                prev_t = account_tiers.get(canon_lbl)
+                if prev_t is None or upd_ts >= float(prev_t.get("updated_at", 0.0)):
+                    account_tiers[canon_lbl] = {"tier": clean_tid, "updated_at": int(round(upd_ts))}
+        if len(account_tiers) > 32:
+            sorted_tiers = sorted(
+                account_tiers.items(),
+                key=lambda kv: float(kv[1].get("updated_at", 0.0)),
+            )
+            account_tiers = dict(sorted_tiers[-32:])
+        self._account_tiers = account_tiers
+
         hourly_buckets: Dict[str, Dict[int, Dict[str, Any]]] = {}
         h_canon_by_low: Dict[str, str] = {}
         raw_hourly = data.get("hourly_step_buckets")
@@ -248,6 +356,7 @@ class AccountSwitchLedger:
                     continue
                 low = lbl.lower()
                 canon_lbl = h_canon_by_low.setdefault(low, lbl)
+                acct_deg_min = _tier_deg_min(self.get_account_tier(canon_lbl))
                 target_hours = hourly_buckets.setdefault(canon_lbl, {})
                 for hk_raw, val in hmap_raw.items():
                     hk = self._parse_strict_int(hk_raw)
@@ -256,6 +365,12 @@ class AccountSwitchLedger:
                     steps: Optional[int] = None
                     degraded = False
                     deg_at: Optional[int] = None
+                    dk = ""
+                    m_cnt = 0
+                    sub_cnt = 0
+                    lt_cnt = 0
+                    p3_cnt = 0
+                    uc_k = 0
                     if isinstance(val, int) and not isinstance(val, bool):
                         if not (0 <= val <= 500_000):
                             continue
@@ -277,6 +392,9 @@ class AccountSwitchLedger:
                         else:
                             raw_d = False
                         degraded = isinstance(raw_d, bool) and raw_d
+                        # Parse dk unconditionally (NOT gated by `if degraded:`) so t1_single (d=False, dk="t1_single") loads cleanly
+                        raw_dk = val.get("dk") if "dk" in val else val.get("degraded_kind")
+                        dk = _normalize_degraded_kind(raw_dk)
                         if degraded:
                             if "degraded_24h_at" in val:
                                 raw_at = val["degraded_24h_at"]
@@ -288,9 +406,14 @@ class AccountSwitchLedger:
                                 parsed_at = self._parse_strict_int(raw_at)
                                 if parsed_at is not None and 1 <= parsed_at <= 500_000:
                                     deg_at = parsed_at
+                        m_cnt = self._parse_optional_bucket_int(val, "m", "main_steps", 500_000)
+                        sub_cnt = self._parse_optional_bucket_int(val, "sub", "sub_steps", 500_000)
+                        lt_cnt = self._parse_optional_bucket_int(val, "lt", "light_steps", 500_000)
+                        p3_cnt = self._parse_optional_bucket_int(val, "p3", "third_party_steps", 500_000)
+                        uc_k = self._parse_optional_bucket_int(val, "uc", "uncached_k", 500_000_000)
                     else:
                         continue
-                    if steps == 0 and not degraded:
+                    if steps == 0 and not degraded and not dk:
                         continue
                     prev = target_hours.get(hk)
                     if prev is None:
@@ -298,11 +421,21 @@ class AccountSwitchLedger:
                             "steps": steps,
                             "degraded": degraded,
                             "degraded_24h_at": deg_at,
+                            "dk": dk,
+                            "m": m_cnt,
+                            "sub": sub_cnt,
+                            "lt": lt_cnt,
+                            "p3": p3_cnt,
+                            "uc": uc_k,
                         }
                     else:
                         merged_deg = bool(prev["degraded"]) or degraded
                         merged_at = (
-                            self._pick_preferred_deg_at(prev.get("degraded_24h_at"), deg_at)
+                            self._pick_preferred_deg_at(
+                                prev.get("degraded_24h_at"),
+                                deg_at,
+                                deg_min=acct_deg_min,
+                            )
                             if merged_deg
                             else None
                         )
@@ -310,6 +443,12 @@ class AccountSwitchLedger:
                             "steps": max(int(prev["steps"]), steps),
                             "degraded": merged_deg,
                             "degraded_24h_at": merged_at,
+                            "dk": _merge_degraded_kind(str(prev.get("dk", "")), dk, merged_deg),
+                            "m": max(int(prev.get("m", 0)), m_cnt),
+                            "sub": max(int(prev.get("sub", 0)), sub_cnt),
+                            "lt": max(int(prev.get("lt", 0)), lt_cnt),
+                            "p3": max(int(prev.get("p3", 0)), p3_cnt),
+                            "uc": max(int(prev.get("uc", 0)), uc_k),
                         }
         trimmed_hourly: Dict[str, Dict[int, Dict[str, Any]]] = {}
         active_hourly_accts = [
@@ -333,6 +472,19 @@ class AccountSwitchLedger:
                 "version": 1,
                 "events": [{"ts": round(ts, 3), "label": lbl} for ts, lbl in self._own_events[-120:]],
             }
+            if self._account_tiers:
+                sorted_tiers = sorted(
+                    self._account_tiers.items(),
+                    key=lambda kv: float(kv[1].get("updated_at", 0.0)),
+                )
+                out_obj["account_tiers"] = {
+                    lbl: {
+                        "tier": str(rec["tier"]),
+                        "updated_at": int(round(float(rec.get("updated_at", 0.0)))),
+                    }
+                    for lbl, rec in sorted_tiers[-32:]
+                    if rec.get("tier")
+                }
             if self._daily_step_profiles:
                 active_accts = [
                     (max(dmap.keys()), lbl)
@@ -361,15 +513,37 @@ class AccountSwitchLedger:
                         rec = hmap[hk]
                         steps = max(0, min(500_000, int(rec.get("steps", 0))))
                         degraded = bool(rec.get("degraded", False))
-                        if degraded:
-                            item: Dict[str, Any] = {"s": steps, "d": True}
-                            deg_at = rec.get("degraded_24h_at")
-                            if deg_at is not None and not isinstance(deg_at, bool):
-                                deg_at_i = int(deg_at)
-                                if 1 <= deg_at_i <= 500_000:
-                                    item["at"] = deg_at_i
+                        dk = _normalize_degraded_kind(rec.get("dk", ""))
+                        m_cnt = max(0, min(500_000, int(rec.get("m", 0) or 0)))
+                        sub_cnt = max(0, min(500_000, int(rec.get("sub", 0) or 0)))
+                        lt_cnt = max(0, min(500_000, int(rec.get("lt", 0) or 0)))
+                        p3_cnt = max(0, min(500_000, int(rec.get("p3", 0) or 0)))
+                        uc_k = max(0, min(500_000_000, int(rec.get("uc", 0) or 0)))
+                        has_extra = bool(dk) or (m_cnt > 0) or (sub_cnt > 0) or (lt_cnt > 0) or (p3_cnt > 0) or (uc_k > 0)
+                        if degraded or has_extra:
+                            item: Dict[str, Any] = {"s": steps}
+                            if degraded:
+                                item["d"] = True
+                                deg_at = rec.get("degraded_24h_at")
+                                if deg_at is not None and not isinstance(deg_at, bool):
+                                    deg_at_i = int(deg_at)
+                                    if 1 <= deg_at_i <= 500_000:
+                                        item["at"] = deg_at_i
+                            if dk:
+                                item["dk"] = dk
+                            if m_cnt > 0:
+                                item["m"] = m_cnt
+                            if sub_cnt > 0:
+                                item["sub"] = sub_cnt
+                            if lt_cnt > 0:
+                                item["lt"] = lt_cnt
+                            if p3_cnt > 0:
+                                item["p3"] = p3_cnt
+                            if uc_k > 0:
+                                item["uc"] = uc_k
                             acct_out[str(hk)] = item
                         elif steps > 0:
+                            # Compact legacy format: bare int for pure step counts without degradation/metadata
                             acct_out[str(hk)] = steps
                     if acct_out:
                         trimmed_hourly_out[lbl] = acct_out
@@ -380,7 +554,24 @@ class AccountSwitchLedger:
             payload = json.dumps(out_obj, ensure_ascii=False, indent=2) + "\n"
             tmp = self.ledger_path.with_name(f"{self.ledger_path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
             tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self.ledger_path)
+            last_exc: Optional[OSError] = None
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, self.ledger_path)
+                    last_exc = None
+                    break
+                except PermissionError as exc:
+                    last_exc = exc
+                    if attempt < 3:
+                        time.sleep(0.015)
+                except OSError as exc:
+                    last_exc = exc
+                    if attempt < 3 and getattr(exc, "winerror", None) in (5, 32, 33):
+                        time.sleep(0.015)
+                    else:
+                        break
+            if last_exc is not None:
+                raise last_exc
             tmp = None
         except OSError:
             if tmp is not None:
@@ -388,6 +579,79 @@ class AccountSwitchLedger:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def observe_account_tier(self, short_label: str, tier_id: str, now_ts: float) -> bool:
+        """Persist observed Hub ``userTier.id`` (throttled: write only on change or >=24h, strictly read_only-safe)."""
+        if self.read_only:
+            return False
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return False
+        if not isinstance(tier_id, str):
+            return False
+        clean_tid = tier_id.strip()[:64]
+        if not clean_tid or not normalize_account_tier(clean_tid):
+            return False
+        if isinstance(now_ts, bool):
+            return False
+        try:
+            now_f = float(now_ts)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(now_f) or now_f <= 0.0:
+            return False
+
+        canon_key = next((k for k in self._account_tiers if k.lower() == lbl.lower()), lbl)
+        prev = self._account_tiers.get(canon_key)
+        if prev is not None:
+            prev_tid = str(prev.get("tier", ""))
+            prev_upd = float(prev.get("updated_at", 0.0))
+            if prev_tid == clean_tid and (now_f - prev_upd) < 86400.0:
+                return False
+
+        self._account_tiers[canon_key] = {
+            "tier": clean_tid,
+            "updated_at": int(round(now_f)),
+        }
+        while len(self._account_tiers) > 32:
+            evict_candidates = [k for k in self._account_tiers if k != canon_key]
+            if not evict_candidates:
+                break
+            oldest_acct = min(
+                evict_candidates,
+                key=lambda k: float(self._account_tiers[k].get("updated_at", 0.0)),
+            )
+            self._account_tiers.pop(oldest_acct, None)
+        self._save_own()
+        return True
+
+    def get_account_tier(self, short_label: str) -> str:
+        """Return normalized account tier (``ultra | pro | free | ''``) for a masked label."""
+        lbl = _mask_short(short_label)
+        if not lbl or _is_invalid_label(lbl):
+            return ""
+        target_low = lbl.lower()
+        for k, rec in self._account_tiers.items():
+            if k.lower() == target_low:
+                return normalize_account_tier(str(rec.get("tier", "")))
+        return ""
+
+    def get_all_account_tiers(self) -> Dict[str, str]:
+        """Return a copy of all known masked account labels mapped to normalized tiers."""
+        out: Dict[str, str] = {}
+        for k, rec in self._account_tiers.items():
+            norm = normalize_account_tier(str(rec.get("tier", "")))
+            if norm:
+                out[k] = norm
+        return out
+
+    def get_all_hourly_step_buckets(self) -> Dict[str, Dict[int, Dict[str, Any]]]:
+        """Return a read-only copy of all accounts' hourly step buckets for same-tier peer prior aggregation."""
+        out: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        for acct, hmap in self._hourly_step_buckets.items():
+            if hmap:
+                out[acct] = {hk: dict(rec) for hk, rec in hmap.items()}
+        return out
 
     def record_rule_change(self, mtime_ts: float, now_ts: Optional[float] = None) -> bool:
         """Record a global rule-file modification timestamp (updates memory even when read_only)."""
@@ -514,6 +778,7 @@ class AccountSwitchLedger:
         if not lbl or _is_invalid_label(lbl):
             return {}
         target_low = lbl.lower()
+        acct_deg_min = _tier_deg_min(self.get_account_tier(lbl))
         merged: Dict[int, Dict[str, Any]] = {}
         for k, hmap in self._hourly_step_buckets.items():
             if k.lower() != target_low:
@@ -521,11 +786,25 @@ class AccountSwitchLedger:
             for hk, rec in hmap.items():
                 prev = merged.get(hk)
                 if prev is None:
-                    merged[hk] = dict(rec)
+                    merged[hk] = {
+                        "steps": int(rec.get("steps", 0)),
+                        "degraded": bool(rec.get("degraded", False)),
+                        "degraded_24h_at": rec.get("degraded_24h_at"),
+                        "dk": _normalize_degraded_kind(rec.get("dk", "")),
+                        "m": int(rec.get("m", 0) or 0),
+                        "sub": int(rec.get("sub", 0) or 0),
+                        "lt": int(rec.get("lt", 0) or 0),
+                        "p3": int(rec.get("p3", 0) or 0),
+                        "uc": int(rec.get("uc", 0) or 0),
+                    }
                 else:
                     m_deg = bool(prev.get("degraded", False)) or bool(rec.get("degraded", False))
                     m_at = (
-                        self._pick_preferred_deg_at(prev.get("degraded_24h_at"), rec.get("degraded_24h_at"))
+                        self._pick_preferred_deg_at(
+                            prev.get("degraded_24h_at"),
+                            rec.get("degraded_24h_at"),
+                            deg_min=acct_deg_min,
+                        )
                         if m_deg
                         else None
                     )
@@ -533,6 +812,12 @@ class AccountSwitchLedger:
                         "steps": max(int(prev.get("steps", 0)), int(rec.get("steps", 0))),
                         "degraded": m_deg,
                         "degraded_24h_at": m_at,
+                        "dk": _merge_degraded_kind(str(prev.get("dk", "")), str(rec.get("dk", "")), m_deg),
+                        "m": max(int(prev.get("m", 0) or 0), int(rec.get("m", 0) or 0)),
+                        "sub": max(int(prev.get("sub", 0) or 0), int(rec.get("sub", 0) or 0)),
+                        "lt": max(int(prev.get("lt", 0) or 0), int(rec.get("lt", 0) or 0)),
+                        "p3": max(int(prev.get("p3", 0) or 0), int(rec.get("p3", 0) or 0)),
+                        "uc": max(int(prev.get("uc", 0) or 0), int(rec.get("uc", 0) or 0)),
                     }
         return merged
 
@@ -542,8 +827,11 @@ class AccountSwitchLedger:
         hour_counts: Dict[int, int],
         degraded_hours: Optional[Dict[int, Optional[int]]] = None,
         now_ts: Optional[float] = None,
+        hour_meta: Optional[Dict[int, Dict[str, Any]]] = None,
+        degraded_kinds: Optional[Dict[int, str]] = None,
+        deg_min: Optional[int] = None,
     ) -> bool:
-        """Throttled privacy-safe persistence of per-account UTC hourly step & degradation buckets."""
+        """Throttled privacy-safe persistence of per-account UTC hourly step, degradation & pool metadata buckets."""
         if self.read_only:
             return False
         lbl = _mask_short(short_label)
@@ -564,6 +852,7 @@ class AccountSwitchLedger:
         cur_h = int(now // 3600)
         min_valid_h = cur_h - 336
         max_valid_h = cur_h + 1
+        eff_deg_min = max(1, int(deg_min)) if deg_min is not None else _tier_deg_min(self.get_account_tier(lbl))
 
         clean_counts: Dict[int, int] = {}
         if isinstance(hour_counts, dict):
@@ -590,11 +879,57 @@ class AccountSwitchLedger:
                     if at_val is not None and 1 <= at_val <= 500_000:
                         parsed_at = at_val
                 if hk in clean_deg:
-                    clean_deg[hk] = self._pick_preferred_deg_at(clean_deg[hk], parsed_at)
+                    clean_deg[hk] = self._pick_preferred_deg_at(
+                        clean_deg[hk],
+                        parsed_at,
+                        deg_min=eff_deg_min,
+                    )
                 else:
                     clean_deg[hk] = parsed_at
 
-        all_hks = set(clean_counts.keys()) | set(clean_deg.keys())
+        clean_kinds: Dict[int, str] = {}
+        if isinstance(degraded_kinds, dict):
+            for hk_raw, dk_raw in degraded_kinds.items():
+                hk = self._parse_strict_int(hk_raw)
+                if hk is None or not (262968 <= hk <= 1139568) or hk < min_valid_h or hk > max_valid_h:
+                    continue
+                dk_norm = _normalize_degraded_kind(dk_raw)
+                if not dk_norm:
+                    continue
+                prev_dk = clean_kinds.get(hk, "")
+                clean_kinds[hk] = _merge_degraded_kind(
+                    prev_dk,
+                    dk_norm,
+                    is_major_degraded=(hk in clean_deg or dk_norm in _MAJOR_DEGRADED_KINDS),
+                )
+
+        clean_meta: Dict[int, Dict[str, int]] = {}
+        if isinstance(hour_meta, dict):
+            for hk_raw, meta_raw in hour_meta.items():
+                hk = self._parse_strict_int(hk_raw)
+                if hk is None or not (262968 <= hk <= 1139568) or hk < min_valid_h or hk > max_valid_h:
+                    continue
+                if not isinstance(meta_raw, dict):
+                    continue
+                m_v = self._parse_optional_bucket_int(meta_raw, "m", "main_steps", 500_000)
+                sub_v = self._parse_optional_bucket_int(meta_raw, "sub", "sub_steps", 500_000)
+                lt_v = self._parse_optional_bucket_int(meta_raw, "lt", "light_steps", 500_000)
+                p3_v = self._parse_optional_bucket_int(meta_raw, "p3", "third_party_steps", 500_000)
+                uc_v = self._parse_optional_bucket_int(meta_raw, "uc", "uncached_k", 500_000_000)
+                if m_v or sub_v or lt_v or p3_v or uc_v:
+                    prev_m = clean_meta.get(hk)
+                    if prev_m is None:
+                        clean_meta[hk] = {"m": m_v, "sub": sub_v, "lt": lt_v, "p3": p3_v, "uc": uc_v}
+                    else:
+                        clean_meta[hk] = {
+                            "m": max(prev_m["m"], m_v),
+                            "sub": max(prev_m["sub"], sub_v),
+                            "lt": max(prev_m["lt"], lt_v),
+                            "p3": max(prev_m["p3"], p3_v),
+                            "uc": max(prev_m["uc"], uc_v),
+                        }
+
+        all_hks = set(clean_counts.keys()) | set(clean_deg.keys()) | set(clean_kinds.keys()) | set(clean_meta.keys())
         if not all_hks:
             return False
 
@@ -605,41 +940,83 @@ class AccountSwitchLedger:
         dirty = False
         for hk in all_hks:
             cur_steps = clean_counts.get(hk, 0)
-            is_deg = hk in clean_deg
-            cur_at = clean_deg.get(hk) if is_deg else None
+            cur_dk = clean_kinds.get(hk, "")
+            is_deg = (hk in clean_deg) or (cur_dk in _MAJOR_DEGRADED_KINDS)
+            cur_at = clean_deg.get(hk) if (hk in clean_deg) else None
+            cmeta = clean_meta.get(hk)
+            cur_m = cmeta["m"] if cmeta else 0
+            cur_sub = cmeta["sub"] if cmeta else 0
+            cur_lt = cmeta["lt"] if cmeta else 0
+            cur_p3 = cmeta["p3"] if cmeta else 0
+            cur_uc = cmeta["uc"] if cmeta else 0
 
             prev = existing_hmap.get(hk)
             if prev is None:
                 new_steps = cur_steps
                 new_deg = is_deg
                 new_at = cur_at if new_deg else None
-                if new_steps == 0 and not new_deg:
+                new_dk = _merge_degraded_kind("", cur_dk, new_deg)
+                if new_steps == 0 and not new_deg and not new_dk:
                     continue
                 pending_updates[hk] = {
                     "steps": new_steps,
                     "degraded": new_deg,
                     "degraded_24h_at": new_at,
+                    "dk": new_dk,
+                    "m": cur_m,
+                    "sub": cur_sub,
+                    "lt": cur_lt,
+                    "p3": cur_p3,
+                    "uc": cur_uc,
                 }
                 dirty = True
             else:
                 prev_steps = int(prev.get("steps", 0))
                 prev_deg = bool(prev.get("degraded", False))
                 prev_at = prev.get("degraded_24h_at") if prev_deg else None
+                prev_dk = _normalize_degraded_kind(prev.get("dk", ""))
+                prev_m = int(prev.get("m", 0) or 0)
+                prev_sub = int(prev.get("sub", 0) or 0)
+                prev_lt = int(prev.get("lt", 0) or 0)
+                prev_p3 = int(prev.get("p3", 0) or 0)
+                prev_uc = int(prev.get("uc", 0) or 0)
 
                 new_steps = max(prev_steps, cur_steps)
                 new_deg = prev_deg or is_deg
-                new_at = self._pick_preferred_deg_at(prev_at, cur_at) if new_deg else None
-                if new_steps == 0 and not new_deg:
+                new_at = (
+                    self._pick_preferred_deg_at(prev_at, cur_at, deg_min=eff_deg_min)
+                    if new_deg
+                    else None
+                )
+                new_dk = _merge_degraded_kind(prev_dk, cur_dk, new_deg)
+                new_m = max(prev_m, cur_m)
+                new_sub = max(prev_sub, cur_sub)
+                new_lt = max(prev_lt, cur_lt)
+                new_p3 = max(prev_p3, cur_p3)
+                new_uc = max(prev_uc, cur_uc)
+                if new_steps == 0 and not new_deg and not new_dk:
                     continue
                 pending_updates[hk] = {
                     "steps": new_steps,
                     "degraded": new_deg,
                     "degraded_24h_at": new_at,
+                    "dk": new_dk,
+                    "m": new_m,
+                    "sub": new_sub,
+                    "lt": new_lt,
+                    "p3": new_p3,
+                    "uc": new_uc,
                 }
+                prev_has_meta = (prev_m > 0) or (prev_sub > 0) or (prev_lt > 0) or (prev_p3 > 0) or (prev_uc > 0)
+                new_has_meta = (new_m > 0) or (new_sub > 0) or (new_lt > 0) or (new_p3 > 0) or (new_uc > 0)
+                dk_upgraded = _DEGRADED_KIND_SEVERITY.get(new_dk, 0) > _DEGRADED_KIND_SEVERITY.get(prev_dk, 0)
                 if (
                     (new_steps - prev_steps) >= 25
                     or (new_deg and not prev_deg)
                     or (new_at != prev_at)
+                    or dk_upgraded
+                    or (new_has_meta and not prev_has_meta)
+                    or (new_p3 - prev_p3) >= 25
                 ):
                     dirty = True
 

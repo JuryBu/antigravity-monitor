@@ -31,6 +31,7 @@ from core.log_monitor import (
     format_text_summary,
     format_tokens,
     is_severe_freshness_invalid,
+    parse_iso_timestamp,
     truncate_display_width,
 )
 try:
@@ -52,6 +53,52 @@ except ImportError:
             return "orange"
         return "green"
 
+try:
+    from core.log_monitor import FRESHNESS_RESCUE_WINDOW_SEC, format_freshness_status
+except ImportError:
+    FRESHNESS_RESCUE_WINDOW_SEC = 90
+
+    def format_freshness_status(
+        remaining_sec: Optional[int],
+        invalid_reason: str = "",
+        rescue_window_sec: int = FRESHNESS_RESCUE_WINDOW_SEC,
+        compact: bool = False,
+    ) -> Tuple[str, str]:
+        """Return (plain-Chinese label, semantic color key 'green'|'orange'|'red'|'muted')."""
+        if invalid_reason:
+            return ("已失效" if compact else invalid_reason, "red")
+        if remaining_sec is None:
+            return ("闲置", "muted")
+        if remaining_sec > 60:
+            return (f"剩 {format_countdown(remaining_sec)}", "green")
+        if remaining_sec > 0:
+            return (
+                f"快冷 {format_countdown(remaining_sec)}" if compact else f"即将冷却 剩 {format_countdown(remaining_sec)}",
+                "orange",
+            )
+        if remaining_sec >= -int(rescue_window_sec):
+            rescue_left = max(0, int(rescue_window_sec) + int(remaining_sec))
+            cd_s = format_countdown(rescue_left) if rescue_left > 0 else "0:00"
+            return (
+                f"抢救 {cd_s}" if compact else f"临界抢救 剩 {cd_s}",
+                "red",
+            )
+        return ("已冷却", "orange")
+
+try:
+    from core.log_monitor import resolve_tier_display
+except ImportError:
+    def resolve_tier_display(tier_id: str) -> Tuple[str, str]:
+        """Strictly parse Hub userTier.id -> (tier_label, tier_short)."""
+        low = (tier_id or "").strip().lower()
+        if "ultra" in low:
+            return ("Ultra", "[U]")
+        if "pro" in low:
+            return ("Pro", "[P]")
+        if "free" in low:
+            return ("Free", "[F]")
+        return ("", "")
+
 from core.slot_manager import SlotCleanupResult, SlotInventorySnapshot, format_bytes_human
 from core.startup_manager import is_startup_enabled, set_startup_enabled
 from core.version import APP_VERSION, is_newer_version, read_local_version_info
@@ -63,6 +110,8 @@ from ui.window_drag import SmoothWindowDragger
 if TYPE_CHECKING:
     from core.updater import UpdateApplyResult, UpdateCheckResult, UpdateManager
 
+_BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
 _CACHE_REASON_CN_FALLBACK: Dict[str, str] = {
     "partial_miss": "部分失效",
     "cached_diluted": "命中·新输入稀释",
@@ -70,9 +119,66 @@ _CACHE_REASON_CN_FALLBACK: Dict[str, str] = {
 _COLD_SHORT_BADGE_FALLBACK: Dict[str, str] = {
     "partial_miss": "部分失",
 }
+_LOG_CELL_TITLES: Dict[str, str] = {
+    "503": "503 繁忙",
+    "timeout": "请求超时",
+    "403": "403 权限",
+    "retry": "网络重试",
+}
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
+
+
+def _format_duration_short(seconds: Optional[int]) -> str:
+    """Format duration seconds into compact human string like 45m / 2h10m / 3d05h."""
+    if seconds is None:
+        return ""
+    sec = int(seconds)
+    if sec <= 0:
+        return ""
+    if sec < 3600:
+        return f"{max(1, sec // 60)}m"
+    if sec < 86400:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        return f"{h}h{m:02d}m" if m > 0 else f"{h}h"
+    d = sec // 86400
+    h = (sec % 86400) // 3600
+    return f"{d}d{h}h" if h > 0 else f"{d}d"
+
+
+def _resolve_reset_remaining_sec(
+    reset_in_sec: Optional[int],
+    reset_at_iso: Optional[str],
+    now_ts: float,
+) -> Optional[int]:
+    if reset_in_sec is not None:
+        return max(0, int(reset_in_sec))
+    if reset_at_iso:
+        ts = parse_iso_timestamp(reset_at_iso)
+        if ts is not None:
+            return max(0, int(round(ts - now_ts)))
+    return None
+
+
+def _format_beijing_reset_clock(
+    reset_at_iso: Optional[str],
+    reset_in_sec: Optional[int],
+    now_ts: float,
+) -> str:
+    ts: Optional[float] = None
+    if reset_at_iso:
+        ts = parse_iso_timestamp(reset_at_iso)
+    if ts is None and reset_in_sec is not None and int(reset_in_sec) > 0:
+        ts = now_ts + float(reset_in_sec)
+    if ts is None:
+        return ""
+    now_bj = datetime.datetime.fromtimestamp(now_ts, tz=_BJ_TZ)
+    dt_bj = datetime.datetime.fromtimestamp(ts, tz=_BJ_TZ)
+    if dt_bj.date() == now_bj.date():
+        return dt_bj.strftime("%H:%M")
+    return dt_bj.strftime("%m-%d %H:%M")
 
 
 def _lerp_hex(c1: str, c2: str, t: float) -> str:
@@ -260,12 +366,16 @@ class AntigravityCapsuleApp:
         self._conv_row_carryover: List[bool] = []
         self._hovered_row_idx: Optional[int] = None
         self._pinned_conv_id: Optional[str] = None
-        self._fresh_hover_text: str = ""
-        self._speed_hover_text: str = ""
-        self._steps_hover_text: str = ""
-        self._slots_hover_text: str = ""
+        self._status_hover_override: Optional[str] = None
+        self._cache_hover_override: Optional[str] = None
+        self._acc_hover_override: Optional[str] = None
+        self._fresh_hover_override: Optional[str] = None
+        self._speed_hover_override: Optional[str] = None
+        self._steps_hover_override: Optional[str] = None
+        self._slots_hover_override: Optional[str] = None
         self._detail_win: Optional[ConversationDetailWindow] = None
         self._slots_win: Optional[ConversationSlotsWindow] = None
+        self._settings_win: Optional[Any] = None
         self._slots_cleaning_busy: bool = False
         self._auto_clean_thread: Optional[threading.Thread] = None
         self._last_main_risk_alerted: bool = False
@@ -281,6 +391,7 @@ class AntigravityCapsuleApp:
         self._update_banner_is_error: bool = False
         self._temp_banner_until: float = 0.0
         self._temp_banner_text: str = ""
+        self._temp_banner_level: str = "cyan"
         self._conv_filter: str = str(self.config.get("conv_filter", "main"))
         self._view_account: str = ""
         self._history_range: str = "30m"
@@ -316,26 +427,38 @@ class AntigravityCapsuleApp:
 
         self._lbl_bar_status = tk.Label(self._bar, text="T0 健康", font=(UI_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["green"])
         self._lbl_bar_status.pack(side="left")
+        self._lbl_bar_status.bind("<Enter>", self._show_status_tooltip)
+        self._lbl_bar_status.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._lbl_bar_cache_k = tk.Label(self._bar, text=" 缓存 ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_secondary"])
         self._lbl_bar_cache_k.pack(side="left")
+        self._lbl_bar_cache_k.bind("<Enter>", self._show_cache_tooltip)
+        self._lbl_bar_cache_k.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
         self._lbl_bar_cache_v = tk.Label(self._bar, text="—", font=(MONO_FONT, 10, "bold"), bg=self.theme["panel_bg"], fg=self.theme["green"])
         self._lbl_bar_cache_v.pack(side="left")
+        self._lbl_bar_cache_v.bind("<Enter>", self._show_cache_tooltip)
+        self._lbl_bar_cache_v.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep1 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep1.pack(side="left")
         self._lbl_bar_tps = tk.Label(self._bar, text="— t/s", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["cyan"])
         self._lbl_bar_tps.pack(side="left")
+        self._lbl_bar_tps.bind("<Enter>", self._show_speed_tooltip)
+        self._lbl_bar_tps.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep2 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep2.pack(side="left")
         self._lbl_bar_fresh = tk.Label(self._bar, text="保鲜 闲置", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_primary"])
         self._lbl_bar_fresh.pack(side="left")
+        self._lbl_bar_fresh.bind("<Enter>", self._show_freshness_tooltip)
+        self._lbl_bar_fresh.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep3 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep3.pack(side="left")
         self._lbl_bar_acc = tk.Label(self._bar, text="离线", font=(MONO_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["text_secondary"])
         self._lbl_bar_acc.pack(side="left")
+        self._lbl_bar_acc.bind("<Enter>", self._show_acc_tooltip)
+        self._lbl_bar_acc.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep4 = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._sep4.pack(side="left")
@@ -348,6 +471,8 @@ class AntigravityCapsuleApp:
         self._lbl_bar_slots = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["orange"], cursor="hand2")
         self._lbl_bar_slots.bind("<Button-1>", lambda _e: self.open_slots_window())
         self._lbl_bar_slots.bind("<Button-3>", self._show_context_menu)
+        self._lbl_bar_slots.bind("<Enter>", self._show_slots_tooltip)
+        self._lbl_bar_slots.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
 
         self._sep_upd = tk.Label(self._bar, text=" │ ", font=(UI_FONT, 9), bg=self.theme["panel_bg"], fg=self.theme["divider"])
         self._lbl_bar_update = tk.Label(self._bar, text="", font=(MONO_FONT, 9, "bold"), bg=self.theme["panel_bg"], fg=self.theme["cyan"], cursor="hand2")
@@ -421,22 +546,39 @@ class AntigravityCapsuleApp:
         self._lbl_acc_pill = tk.Label(head_row2, text="离线 ▾", font=(MONO_FONT, 9, "bold"), padx=6, pady=1, cursor="hand2")
         self._lbl_acc_pill.pack(side="left", padx=(0, 6))
         self._lbl_acc_pill.bind("<Button-1>", self._show_account_selector_menu)
+        self._lbl_tier_badge = tk.Label(head_row2, text="", font=(UI_FONT, 7, "bold"), padx=5, pady=1)
         self._lbl_back_live = tk.Label(head_row2, text="↩ 当前", font=(UI_FONT, 7, "bold"), padx=5, pady=1, cursor="hand2")
         self._lbl_back_live.bind("<Button-1>", lambda _e: self.reset_live_view())
         self._lbl_acc_5h = tk.Label(head_row2, text="5h —", font=(MONO_FONT, 9))
         self._lbl_acc_5h.pack(side="left", padx=(0, 10))
         self._lbl_acc_wk = tk.Label(head_row2, text="周 —", font=(MONO_FONT, 9))
         self._lbl_acc_wk.pack(side="left")
+        for acc_w in (self._lbl_acc_pill, self._lbl_tier_badge, self._lbl_acc_5h, self._lbl_acc_wk):
+            acc_w.bind("<Enter>", self._show_acc_tooltip)
+            acc_w.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
+
+        self._lbl_settings_btn = tk.Label(head_row2, text="⚙ 设置", font=(UI_FONT, 8), padx=6, pady=1, cursor="hand2")
+        self._lbl_settings_btn.pack(side="right")
+        self._lbl_settings_btn.bind("<Button-1>", lambda _e: self.open_settings_window())
+        self._lbl_settings_btn.bind("<Enter>", lambda _e: self._lbl_settings_btn.configure(bg=self.theme["btn_hover"]))
+        self._lbl_settings_btn.bind("<Leave>", lambda _e: self._lbl_settings_btn.configure(bg=self.theme["btn_bg"]))
 
         self._lbl_theme_tag = tk.Label(head_row2, text="主题:星蓝 ⇄", font=(UI_FONT, 8), padx=6, pady=1, cursor="hand2")
-        self._lbl_theme_tag.pack(side="right")
+        self._lbl_theme_tag.pack(side="right", padx=(0, 4))
         self._lbl_theme_tag.bind("<Button-1>", lambda _e: self.cycle_theme())
 
-        head_row_scope = tk.Frame(self._card_head)
-        head_row_scope.pack(fill="x", pady=(0, 4))
-        self._lbl_range_prefix = tk.Label(head_row_scope, text="范围", font=(UI_FONT, 7))
+        self._head_row_pools = tk.Frame(self._card_head)
+        self._lbl_pool_secondary = tk.Label(self._head_row_pools, text="", font=(MONO_FONT, 8), anchor="w")
+        self._lbl_pool_secondary.pack(side="left", fill="x", expand=True)
+        for pw in (self._head_row_pools, self._lbl_pool_secondary):
+            pw.bind("<Enter>", self._show_acc_tooltip)
+            pw.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
+
+        self._head_row_scope = tk.Frame(self._card_head)
+        self._head_row_scope.pack(fill="x", pady=(0, 4))
+        self._lbl_range_prefix = tk.Label(self._head_row_scope, text="范围", font=(UI_FONT, 7))
         self._lbl_range_prefix.pack(side="left", padx=(0, 4))
-        self._range_bar = tk.Frame(head_row_scope)
+        self._range_bar = tk.Frame(self._head_row_scope)
         self._range_bar.pack(side="left")
         self._range_buttons: Dict[str, tk.Label] = {}
         for rk in ("30m", "6h", "today", "7d"):
@@ -445,7 +587,7 @@ class AntigravityCapsuleApp:
             rb.pack(side="left", padx=(0, 3))
             rb.bind("<Button-1>", lambda _e, k=rk: self.set_history_range(k))
             self._range_buttons[rk] = rb
-        self._lbl_scope_hint = tk.Label(head_row_scope, text="自动跟随当前", font=(UI_FONT, 7), anchor="e")
+        self._lbl_scope_hint = tk.Label(self._head_row_scope, text="自动跟随当前", font=(UI_FONT, 7), anchor="e")
         self._lbl_scope_hint.pack(side="right")
 
         head_row3 = tk.Frame(self._card_head)
@@ -703,6 +845,8 @@ class AntigravityCapsuleApp:
         self._conv_rows: List[Dict[str, Any]] = []
         self._lbl_convs_empty = tk.Label(self._convs_table, text="当前分类暂无活跃对话记录", font=(UI_FONT, 8), anchor="w")
         self._lbl_convs_empty.bind("<MouseWheel>", self._on_conv_mousewheel)
+        self._lbl_convs_trunc = tk.Label(self._convs_table, text="", font=(UI_FONT, 7), anchor="w")
+        self._lbl_convs_trunc.bind("<MouseWheel>", self._on_conv_mousewheel)
         for r_idx in range(24):
             lbl_id = tk.Label(self._convs_table, text="", font=(MONO_FONT, 9, "bold"), anchor="w", cursor="hand2")
             lbl_title = tk.Label(self._convs_table, text="", font=(UI_FONT, 8), anchor="w", cursor="hand2")
@@ -746,25 +890,39 @@ class AntigravityCapsuleApp:
         self._log_grid.pack(fill="x")
         self._log_cells: Dict[str, Dict[str, Any]] = {}
         cell_specs = [
-            ("503", "503 限流"),
-            ("timeout", "流超时"),
-            ("403", "403 封禁"),
-            ("retry", "代理重试"),
+            ("503", _LOG_CELL_TITLES["503"]),
+            ("timeout", _LOG_CELL_TITLES["timeout"]),
+            ("403", _LOG_CELL_TITLES["403"]),
+            ("retry", _LOG_CELL_TITLES["retry"]),
         ]
         for idx, (key, title) in enumerate(cell_specs):
             self._log_grid.grid_columnconfigure(idx, weight=1, uniform="lg")
-            box = tk.Frame(self._log_grid, padx=6, pady=5, highlightthickness=1)
+            box = tk.Frame(self._log_grid, padx=6, pady=5, highlightthickness=1, cursor="hand2")
             box.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 3, 0 if idx == 3 else 3))
-            lbl_t = tk.Label(box, text=title, font=(UI_FONT, 8))
+            lbl_t = tk.Label(box, text=title, font=(UI_FONT, 8), cursor="hand2")
             lbl_t.pack()
-            lbl_v = tk.Label(box, text="0 / 0", font=(MONO_FONT, 10, "bold"))
+            lbl_v = tk.Label(box, text="0 / 0", font=(MONO_FONT, 10, "bold"), cursor="hand2")
             lbl_v.pack(pady=(2, 0))
+            for cw in (box, lbl_t, lbl_v):
+                cw.bind("<Enter>", lambda e, k=key: self._show_log_cell_tooltip(k, e))
+                cw.bind("<Leave>", lambda _e: self._hide_conv_tooltip())
+                cw.bind("<Button-1>", lambda _e, k=key: self._copy_log_cell_timeline(k))
             self._log_cells[key] = {"box": box, "title": lbl_t, "val": lbl_v}
 
         self._banner_frame = tk.Frame(self._card_logs, padx=8, pady=5, highlightthickness=1)
         self._banner_frame.pack(fill="x", pady=(6, 0))
-        self._lbl_banner = tk.Label(self._banner_frame, text="纯本地只读监控运行中", font=(UI_FONT, 8), anchor="w", justify="left", wraplength=520)
+        self._lbl_banner = tk.Label(self._banner_frame, text="纯本地只读监控运行中", font=(UI_FONT, 8), anchor="w", justify="left", wraplength=700)
         self._lbl_banner.pack(fill="x")
+
+        def _sync_banner_wrap(e: tk.Event) -> None:
+            try:
+                w = max(320, int(e.width) - 20)
+                if int(self._lbl_banner.cget("wraplength") or 0) != w:
+                    self._lbl_banner.configure(wraplength=w)
+            except (tk.TclError, ValueError):
+                pass
+
+        self._banner_frame.bind("<Configure>", _sync_banner_wrap)
 
         # --- Module 5: Quick Action Bar + Bottom Height Resize Grip ---
         self._actions_row = tk.Frame(self._details, pady=2)
@@ -827,6 +985,7 @@ class AntigravityCapsuleApp:
     def _build_context_menu(self) -> None:
         self._ctx_menu = tk.Menu(self.root, tearoff=False)
         self._ctx_menu.add_command(label="展开 / 收起体检详情", command=self.toggle_expand)
+        self._ctx_menu.add_command(label="参数设置", command=self.open_settings_window)
         self._ctx_menu.add_command(label="切换主题（午夜星蓝 / 深炭极简）", command=self.cycle_theme)
         self._ctx_menu.add_separator()
         self._ctx_menu.add_checkbutton(label="窗口置顶", variable=self._var_topmost, command=self.toggle_topmost)
@@ -940,14 +1099,18 @@ class AntigravityCapsuleApp:
         self._lbl_headline.configure(bg=t["card_bg"])
         self._lbl_clock.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_acc_pill.configure(bg=t["card_alt_bg"], fg=t["text_primary"])
+        self._lbl_tier_badge.configure(bg=t["purple_bg"], fg=t["purple"])
         self._lbl_back_live.configure(bg=t["btn_hover"], fg=t["cyan"])
         self._lbl_acc_5h.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_acc_wk.configure(bg=t["card_bg"], fg=t["text_secondary"])
+        self._lbl_settings_btn.configure(bg=t["btn_bg"], fg=t["btn_text"])
         self._lbl_theme_tag.configure(
             bg=t["btn_bg"],
             fg=t["text_secondary"],
             text="主题:星蓝 ⇄" if self.config["theme"] == "midnight_blue" else "主题:深炭 ⇄",
         )
+        self._head_row_pools.configure(bg=t["card_bg"])
+        self._lbl_pool_secondary.configure(bg=t["card_bg"], fg=t["text_secondary"])
         self._lbl_range_prefix.configure(bg=t["card_bg"], fg=t["text_muted"])
         self._range_bar.configure(bg=t["card_bg"])
         self._lbl_scope_hint.configure(bg=t["card_bg"], fg=t["text_muted"])
@@ -986,6 +1149,7 @@ class AntigravityCapsuleApp:
         self._conv_scrollbar.configure(bg=t["card_bg"])
         self._convs_table.configure(bg=t["card_bg"])
         self._lbl_convs_empty.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._lbl_convs_trunc.configure(bg=t["card_bg"], fg=t["text_muted"])
         for row_ui in self._conv_rows:
             row_ui["id"].configure(bg=t["card_bg"], fg=t["text_primary"])
             row_ui["title"].configure(bg=t["card_bg"], fg=t["text_primary"])
@@ -1061,7 +1225,7 @@ class AntigravityCapsuleApp:
     def _clamp_window_to_screen(self, force: bool = False) -> None:
         if self._closing:
             return
-        if self._dragging and not force:
+        if self._is_any_window_dragging() and not force:
             self._pending_clamp = True
             return
         try:
@@ -1178,9 +1342,17 @@ class AntigravityCapsuleApp:
             sd = getattr(sw, "_dragger", None)
             if sd is not None and sd.active:
                 return True
+        setw = getattr(self, "_settings_win", None)
+        if setw is not None and not getattr(setw, "_closed", False):
+            if getattr(setw, "_dragging", False):
+                return True
+            setd = getattr(setw, "_dragger", None)
+            if setd is not None and setd.active:
+                return True
         return False
 
     def _on_dragger_started(self) -> None:
+        self._hide_conv_tooltip()
         self._dragging = True
         self._drag_idle_event.clear()
 
@@ -1196,7 +1368,8 @@ class AntigravityCapsuleApp:
 
     def _finish_drag_deferred_updates(self) -> None:
         self._dragging = False
-        self._drag_idle_event.set()
+        if not self._is_any_window_dragging():
+            self._drag_idle_event.set()
         if self._closing:
             self._pending_clamp = False
             self._pending_drag_snapshot = None
@@ -1211,7 +1384,8 @@ class AntigravityCapsuleApp:
 
     def _on_dragger_ended(self, moved: bool) -> None:
         self._dragging = False
-        self._drag_idle_event.set()
+        if not self._is_any_window_dragging():
+            self._drag_idle_event.set()
         if self._closing:
             self._pending_clamp = False
             self._pending_drag_snapshot = None
@@ -1232,9 +1406,12 @@ class AntigravityCapsuleApp:
                 if not self.root.winfo_exists():
                     return
                 self.root.update_idletasks()
-                self.config["window_x"] = self.root.winfo_x()
-                self.config["window_y"] = self.root.winfo_y()
-                self.config_store.save(self.config)
+                self._save_config_patch(
+                    {
+                        "window_x": self.root.winfo_x(),
+                        "window_y": self.root.winfo_y(),
+                    }
+                )
             except tk.TclError:
                 return
         else:
@@ -1291,6 +1468,37 @@ class AntigravityCapsuleApp:
         self._clamp_window_to_screen()
         self._apply_dwm_rounding()
 
+    def _save_config_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist only changed keys via ConfigStore.save_patch (with disk-merge fallback)."""
+        clean_patch = dict(patch or {})
+        save_patch = getattr(self.config_store, "save_patch", None)
+        if callable(save_patch):
+            self.config = save_patch(clean_patch)
+            return self.config
+        latest = self.config_store.load()
+        latest.update(clean_patch)
+        self.config = self.config_store.save(latest)
+        return self.config
+
+    def _preview_window_alpha(self, alpha: float) -> None:
+        if self._closing:
+            return
+        clamped = max(0.72, min(1.0, float(alpha)))
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-alpha", clamped)
+        except tk.TclError:
+            pass
+        if self._details_win is not None:
+            try:
+                if self._details_win.winfo_exists():
+                    self._details_win.attributes("-alpha", min(1.0, clamped + 0.03))
+            except tk.TclError:
+                pass
+
+    def _restore_window_alpha_from_config(self) -> None:
+        self._preview_window_alpha(float(self.config.get("window_alpha", 0.95)))
+
     def _close_detail_window(self) -> None:
         if self._detail_win is not None:
             dw = self._detail_win
@@ -1303,6 +1511,16 @@ class AntigravityCapsuleApp:
             self._slots_win = None
             sw.close()
 
+    def _close_settings_window(self) -> None:
+        if self._settings_win is not None:
+            sw = self._settings_win
+            self._settings_win = None
+            try:
+                sw.close()
+            except Exception:
+                pass
+            self._restore_window_alpha_from_config()
+
     def hide_window(self) -> None:
         if self._closing:
             return
@@ -1311,6 +1529,7 @@ class AntigravityCapsuleApp:
         self._hide_conv_tooltip()
         self._close_detail_window()
         self._close_slots_window()
+        self._close_settings_window()
         if self._details_win is not None:
             try:
                 self._details_win.withdraw()
@@ -1371,53 +1590,62 @@ class AntigravityCapsuleApp:
             self.show_window()
         self.set_expanded(not self._expanded)
 
-    def set_theme(self, theme_name: str) -> None:
+    def _apply_theme_change(self, theme_name: str, *, persist: bool = True, rerender: bool = True) -> None:
         if theme_name not in THEMES:
             return
-        self.config["theme"] = theme_name
-        self.config_store.save(self.config)
+        if persist:
+            self._save_config_patch({"theme": theme_name})
         self.theme = get_theme(theme_name)
         self._last_conv_bars_sig = None
         self._apply_theme_colors()
-        if self._detail_win is not None:
+        if self._detail_win is not None and not getattr(self._detail_win, "_closed", False):
             self._detail_win.apply_theme(self.theme)
-        if self._slots_win is not None:
+        if self._slots_win is not None and not getattr(self._slots_win, "_closed", False):
             self._slots_win.apply_theme(self.theme)
-        if self._latest_snapshot is not None:
+        if self._settings_win is not None and not getattr(self._settings_win, "_closed", False):
+            self._settings_win.apply_theme(self.theme)
+        if rerender and self._latest_snapshot is not None:
             self.render_snapshot(self._latest_snapshot)
         if self.tray is not None:
             self.tray.refresh_menu()
+
+    def set_theme(self, theme_name: str) -> None:
+        self._apply_theme_change(theme_name, persist=True, rerender=True)
 
     def cycle_theme(self) -> None:
         next_theme = "obsidian_dark" if self.config["theme"] == "midnight_blue" else "midnight_blue"
         self.set_theme(next_theme)
 
     def toggle_topmost(self) -> None:
-        self.config["topmost"] = not bool(self.config["topmost"])
-        self._var_topmost.set(self.config["topmost"])
-        self.root.attributes("-topmost", self.config["topmost"])
+        new_val = not bool(self.config["topmost"])
+        self._save_config_patch({"topmost": new_val})
+        self._var_topmost.set(bool(self.config["topmost"]))
+        self.root.attributes("-topmost", bool(self.config["topmost"]))
         if self._details_win is not None:
             try:
-                self._details_win.attributes("-topmost", self.config["topmost"])
+                self._details_win.attributes("-topmost", bool(self.config["topmost"]))
             except tk.TclError:
                 pass
-        self.config_store.save(self.config)
+        if self._settings_win is not None and not getattr(self._settings_win, "_closed", False):
+            sync_tm = getattr(self._settings_win, "sync_topmost", None)
+            if callable(sync_tm):
+                sync_tm(bool(self.config["topmost"]))
         self._sync_action_button_labels()
         if self.tray is not None:
             self.tray.refresh_menu()
 
     def toggle_notifications(self) -> None:
-        self.config["notifications_enabled"] = not bool(self.config["notifications_enabled"])
-        self._var_notifications.set(self.config["notifications_enabled"])
-        self.config_store.save(self.config)
+        new_val = not bool(self.config["notifications_enabled"])
+        self._save_config_patch({"notifications_enabled": new_val})
+        self._var_notifications.set(bool(self.config["notifications_enabled"]))
         self._sync_action_button_labels()
         if self.tray is not None:
             self.tray.refresh_menu()
 
     def toggle_start_minimized(self) -> None:
-        self.config["start_minimized"] = not bool(self.config["start_minimized"])
-        self._var_start_min.set(self.config["start_minimized"])
-        self.config_store.save(self.config)
+        new_val = not bool(self.config["start_minimized"])
+        self._save_config_patch({"start_minimized": new_val})
+        self._var_start_min.set(bool(self.config["start_minimized"]))
         if self.tray is not None:
             self.tray.refresh_menu()
 
@@ -1437,14 +1665,153 @@ class AntigravityCapsuleApp:
             self._btn_slots_clean.configure(text=text, fg=fg)
 
     def toggle_auto_clean_slots(self) -> None:
-        self.config["slot_auto_clean_enabled"] = not bool(self.config.get("slot_auto_clean_enabled", True))
-        self.config_store.save(self.config)
+        new_val = not bool(self.config.get("slot_auto_clean_enabled", True))
+        self._save_config_patch({"slot_auto_clean_enabled": new_val})
         self.engine.update_config(self.config)
         self._sync_slots_auto_button()
         if self._slots_win is not None and not self._slots_win._closed:
             self._slots_win.sync_auto_button()
         if self.tray is not None:
             self.tray.refresh_menu()
+
+    def _preview_window_theme(self, theme_name: str) -> None:
+        if self._closing or theme_name not in THEMES:
+            return
+        self._apply_theme_change(theme_name, persist=False, rerender=True)
+
+    def _preview_window_topmost(self, topmost: bool) -> None:
+        if self._closing:
+            return
+        val = bool(topmost)
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-topmost", val)
+        except tk.TclError:
+            pass
+        if self._details_win is not None:
+            try:
+                if self._details_win.winfo_exists():
+                    self._details_win.attributes("-topmost", val)
+            except tk.TclError:
+                pass
+
+    def _flush_aux_drag_deferred_updates(self) -> None:
+        if self._closing or self._is_any_window_dragging():
+            return
+        self._drag_idle_event.set()
+        if self._pending_clamp:
+            self._pending_clamp = False
+            self._clamp_window_to_screen(force=True)
+        pending_snap = self._pending_drag_snapshot
+        self._pending_drag_snapshot = None
+        if pending_snap is not None:
+            self.render_snapshot(pending_snap)
+
+    def _on_aux_window_drag_state(self, active: bool) -> None:
+        if self._closing:
+            return
+        if active:
+            self._drag_idle_event.clear()
+        else:
+            self._flush_aux_drag_deferred_updates()
+
+    def open_settings_window(self) -> None:
+        if self._closing:
+            return
+        self._hide_conv_tooltip()
+        if self._settings_win is None or getattr(self._settings_win, "_closed", False):
+            from ui.settings_window import MonitorSettingsWindow
+
+            def _on_closed() -> None:
+                self._settings_win = None
+                self._flush_aux_drag_deferred_updates()
+                self._restore_window_alpha_from_config()
+                self._preview_window_topmost(bool(self.config.get("topmost", True)))
+                cfg_theme = str(self.config.get("theme", "midnight_blue"))
+                if cfg_theme in THEMES and self.theme is not get_theme(cfg_theme):
+                    self._apply_theme_change(cfg_theme, persist=False, rerender=True)
+
+            self._settings_win = MonitorSettingsWindow(
+                parent=self.root,
+                theme=self.theme,
+                get_config=lambda: dict(self.config),
+                on_save_patch=self.apply_settings_patch,
+                on_preview_alpha=self._preview_window_alpha,
+                on_preview_theme=self._preview_window_theme,
+                on_preview_topmost=self._preview_window_topmost,
+                on_drag_state_changed=self._on_aux_window_drag_state,
+                on_closed=_on_closed,
+                apply_rounding_fn=_apply_win11_rounded_corners,
+                screen_bounds_fn=_get_virtual_screen_bounds,
+            )
+            self._settings_win.show(place_near_parent=True)
+        else:
+            self._settings_win.show(place_near_parent=False)
+
+    def apply_settings_patch(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        """Hot-reload configuration patch from settings modal without losing external JSON edits."""
+        eff_patch = dict(patch or {})
+        if "freshness_window_sec" in eff_patch and "idle_rewarm_sec" not in eff_patch:
+            eff_patch["idle_rewarm_sec"] = eff_patch["freshness_window_sec"]
+        if "update_mode" in eff_patch and eff_patch["update_mode"] in ("download", "auto_restart", "notify"):
+            upd_enabled = bool(eff_patch.get("update_check_enabled", self.config.get("update_check_enabled", True)))
+            eff_patch["auto_update_restart"] = (eff_patch["update_mode"] == "auto_restart") and upd_enabled
+        if "update_check_enabled" in eff_patch and not bool(eff_patch["update_check_enabled"]):
+            eff_patch["auto_update_restart"] = False
+
+        prev_theme = str(self.config.get("theme", "midnight_blue"))
+        self.config = self._save_config_patch(eff_patch)
+        self.engine.update_config(self.config)
+
+        # Sync alpha (root & detached details window with +0.03 offset) & topmost
+        self._restore_window_alpha_from_config()
+        topmost = bool(self.config.get("topmost", True))
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-topmost", topmost)
+        except tk.TclError:
+            pass
+        if self._details_win is not None:
+            try:
+                if self._details_win.winfo_exists():
+                    self._details_win.attributes("-topmost", topmost)
+            except tk.TclError:
+                pass
+
+        # Sync all Tk menu variables & view controls
+        self._var_topmost.set(topmost)
+        self._var_notifications.set(bool(self.config.get("notifications_enabled", True)))
+        self._var_start_min.set(bool(self.config.get("start_minimized", False)))
+        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_update_check.set(bool(self.config.get("update_check_enabled", True)))
+        self._var_update_mode.set(self._current_update_mode())
+        self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
+        if str(self.config.get("conv_filter", "")) in ("main", "subagent", "all"):
+            self._conv_filter = str(self.config["conv_filter"])
+        self._conv_list_rows = max(3, min(12, int(self.config.get("conv_list_rows", self._conv_list_rows))))
+
+        new_theme = str(self.config.get("theme", prev_theme))
+        if new_theme != prev_theme and new_theme in THEMES:
+            self._apply_theme_change(new_theme, persist=False, rerender=False)
+
+        self._sync_action_button_labels()
+        self._sync_slots_auto_button()
+        self._sync_update_auto_button()
+        self._refresh_filter_buttons()
+
+        if self._detail_win is not None and not getattr(self._detail_win, "_closed", False):
+            upd_tps = getattr(self._detail_win, "update_slow_tps_threshold", None)
+            if callable(upd_tps):
+                upd_tps(float(self.config.get("slow_tps_threshold", 40.0)))
+        if self._slots_win is not None and not getattr(self._slots_win, "_closed", False):
+            self._slots_win.sync_auto_button()
+            self._slots_win.refresh()
+        if self.tray is not None:
+            self.tray.refresh_menu()
+        if self._latest_snapshot is not None and not self._closing:
+            self.render_snapshot(self._latest_snapshot)
+        self.request_immediate_poll()
+        return dict(self.config)
 
     def open_slots_window(self) -> None:
         if self._closing:
@@ -1453,21 +1820,28 @@ class AntigravityCapsuleApp:
         if self._slots_win is None or self._slots_win._closed:
             def _on_closed() -> None:
                 self._slots_win = None
+                self._flush_aux_drag_deferred_updates()
 
-            self._slots_win = ConversationSlotsWindow(
-                parent=self.root,
-                theme=self.theme,
-                load_inventory=lambda: self.engine.read_slot_inventory(include_items=True, force=True),
-                on_clean_now=self._run_manual_clean_async,
-                is_auto_clean_enabled=lambda: bool(self.config.get("slot_auto_clean_enabled", True)),
-                on_toggle_auto_clean=self.toggle_auto_clean_slots,
-                get_protect_age_min=lambda: max(30, int(self.config.get("slot_protect_age_min", 120))),
-                get_clean_mode=lambda: str(self.config.get("slot_clean_mode", "recycle")),
-                on_closed=_on_closed,
-                apply_rounding_fn=_apply_win11_rounded_corners,
-                screen_bounds_fn=_get_virtual_screen_bounds,
-                async_refresh=True,
-            )
+            sw_kwargs: Dict[str, Any] = {
+                "parent": self.root,
+                "theme": self.theme,
+                "load_inventory": lambda: self.engine.read_slot_inventory(include_items=True, force=True),
+                "on_clean_now": self._run_manual_clean_async,
+                "is_auto_clean_enabled": lambda: bool(self.config.get("slot_auto_clean_enabled", True)),
+                "on_toggle_auto_clean": self.toggle_auto_clean_slots,
+                "get_protect_age_min": lambda: max(30, int(self.config.get("slot_protect_age_min", 120))),
+                "get_clean_mode": lambda: str(self.config.get("slot_clean_mode", "recycle")),
+                "on_closed": _on_closed,
+                "on_drag_state_changed": self._on_aux_window_drag_state,
+                "apply_rounding_fn": _apply_win11_rounded_corners,
+                "screen_bounds_fn": _get_virtual_screen_bounds,
+                "async_refresh": True,
+            }
+            try:
+                self._slots_win = ConversationSlotsWindow(**sw_kwargs)
+            except TypeError:
+                sw_kwargs.pop("on_drag_state_changed", None)
+                self._slots_win = ConversationSlotsWindow(**sw_kwargs)
             self._slots_win.show(place_near_parent=True)
         else:
             self._slots_win.show(place_near_parent=False)
@@ -1587,7 +1961,7 @@ class AntigravityCapsuleApp:
                     ),
                     parent=self.root,
                 )
-                if not ok:
+                if not ok or self._closing:
                     return
                 self._set_slots_clean_btn("清理中…", self.theme["orange"])
 
@@ -1664,7 +2038,16 @@ class AntigravityCapsuleApp:
         if self._expanded_built:
             btn = self._action_buttons["copy"]
             btn.configure(text="已复制 ✓", fg=self.theme["green"])
+            prev_aid = getattr(self, "_copy_summary_aid", None)
+            if prev_aid:
+                try:
+                    self.root.after_cancel(prev_aid)
+                except tk.TclError:
+                    pass
+                if prev_aid in self._after_ids:
+                    self._after_ids.remove(prev_aid)
             aid = self.root.after(1500, lambda: btn.configure(text="复制摘要", fg=self.theme["btn_text"]) if not self._closing else None)
+            self._copy_summary_aid = aid
             self._after_ids.append(aid)
 
     def open_logs_folder(self) -> None:
@@ -1792,11 +2175,18 @@ class AntigravityCapsuleApp:
             self._updater = UpdateManager(app_root=self.app_root)
         return self._updater
 
-    def _set_temp_banner_notice(self, text: str, duration_sec: float = 6.0) -> None:
+    def _set_temp_banner_notice(self, text: str, duration_sec: float = 6.0, level: str = "cyan") -> None:
         self._temp_banner_text = text
         self._temp_banner_until = time.monotonic() + max(1.0, float(duration_sec))
+        self._temp_banner_level = "green" if level == "green" else "cyan"
         if self._expanded_built:
-            self._lbl_banner.configure(text=text)
+            t = self.theme
+            if self._temp_banner_level == "green":
+                self._banner_frame.configure(bg=t["green_bg"], highlightbackground=t["green"], highlightcolor=t["green"])
+                self._lbl_banner.configure(bg=t["green_bg"], fg=t["green"], text=text)
+            else:
+                self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"], highlightcolor=t["cyan"])
+                self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=text)
 
     def _current_update_mode(self) -> str:
         raw = str(self.config.get("update_mode") or "").strip()
@@ -1925,12 +2315,14 @@ class AntigravityCapsuleApp:
     def set_update_mode(self, mode: str) -> None:
         if mode not in ("download", "auto_restart", "notify"):
             return
-        self.config["update_mode"] = mode
-        self.config["auto_update_restart"] = (mode == "auto_restart")
+        patch: Dict[str, Any] = {
+            "update_mode": mode,
+            "auto_update_restart": (mode == "auto_restart"),
+        }
         if mode in ("download", "auto_restart"):
-            self.config["update_check_enabled"] = True
+            patch["update_check_enabled"] = True
             self._var_update_check.set(True)
-        self.config = self.config_store.save(self.config)
+        self._save_config_patch(patch)
         self._var_update_mode.set(self._current_update_mode())
         self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
         self._sync_update_auto_button()
@@ -1953,13 +2345,13 @@ class AntigravityCapsuleApp:
 
     def toggle_update_check_enabled(self) -> None:
         new_val = not bool(self.config.get("update_check_enabled", True))
-        self.config["update_check_enabled"] = new_val
+        patch: Dict[str, Any] = {"update_check_enabled": new_val}
         if not new_val:
             # Disabling background update checks must also turn off auto-update-restart to keep UI/state consistent
-            self.config["auto_update_restart"] = False
+            patch["auto_update_restart"] = False
             self._var_auto_update.set(False)
-        self.config = self.config_store.save(self.config)
-        self._var_update_check.set(new_val)
+        self._save_config_patch(patch)
+        self._var_update_check.set(bool(self.config.get("update_check_enabled", new_val)))
         self._var_update_mode.set(self._current_update_mode())
         self._sync_update_auto_button()
         if self.tray is not None:
@@ -1976,8 +2368,7 @@ class AntigravityCapsuleApp:
             return
         upd = self._latest_update
         if upd is not None and upd.remote_version:
-            self.config["update_ignored_version"] = upd.remote_version
-            self.config = self.config_store.save(self.config)
+            self._save_config_patch({"update_ignored_version": upd.remote_version})
         self._latest_update = None
         self._hide_update_banner()
         if self.tray is not None:
@@ -2120,8 +2511,7 @@ class AntigravityCapsuleApp:
         if res.ok and res.needs_restart:
             self._notified_update_error_key = ""
             if self.config.get("update_ignored_version"):
-                self.config["update_ignored_version"] = ""
-                self.config = self.config_store.save(self.config)
+                self._save_config_patch({"update_ignored_version": ""})
             if res.missing_requirements:
                 miss_txt = ", ".join(res.missing_requirements[:4])
                 warn_msg = f"已更新至 v{res.to_version}，缺少新依赖({miss_txt})，请先执行 pip install -r requirements.txt 后手动重启"
@@ -2193,11 +2583,25 @@ class AntigravityCapsuleApp:
             cb()
         self.shutdown()
 
+    def _resolve_account_tier(self, snap: MonitorSnapshot) -> Tuple[str, str]:
+        acc = snap.account
+        lbl = str(getattr(acc, "tier_label", "") or "").strip()
+        short = str(getattr(acc, "tier_short", "") or "").strip()
+        if lbl or short:
+            return (lbl, short)
+        raw_tier = str(getattr(acc, "tier", "") or "").strip()
+        if raw_tier:
+            return resolve_tier_display(raw_tier)
+        norm = str(getattr(snap, "account_tier_norm", "") or "").strip()
+        if norm:
+            return resolve_tier_display(norm)
+        return ("", "")
+
     # ------------------------------------------------------------------ Rendering
     def render_snapshot(self, snap: MonitorSnapshot) -> None:
         if self._closing:
             return
-        if self._dragging:
+        if self._is_any_window_dragging():
             self._pending_drag_snapshot = snap
             return
         try:
@@ -2206,6 +2610,13 @@ class AntigravityCapsuleApp:
         except tk.TclError:
             return
         self._latest_snapshot = snap
+        self._status_hover_override = None
+        self._cache_hover_override = None
+        self._acc_hover_override = None
+        self._fresh_hover_override = None
+        self._speed_hover_override = None
+        self._steps_hover_override = None
+        self._slots_hover_override = None
         t = self.theme
         if snap.grade in ("IDLE", "WAIT") or snap.level == "cyan":
             level_color = t["cyan"]
@@ -2326,6 +2737,9 @@ class AntigravityCapsuleApp:
             disp_fresh_ctx = pinned_conv.context_tokens
             disp_fresh_invalid = pinned_conv.freshness_invalid_reason
             disp_fresh_consec = pinned_conv.consec_miss
+            disp_fresh_window = int(
+                getattr(pinned_conv, "freshness_window_sec", snap.freshness_window_sec) or snap.freshness_window_sec
+            )
         else:
             disp_fresh_sec = snap.min_freshness_sec
             disp_fresh_conv = snap.min_freshness_conv
@@ -2333,6 +2747,9 @@ class AntigravityCapsuleApp:
             disp_fresh_ctx = snap.min_freshness_ctx
             disp_fresh_invalid = snap.min_freshness_invalid_reason
             disp_fresh_consec = snap.large_freshness_list[0].consec_miss if snap.large_freshness_list else 0
+            disp_fresh_window = int(
+                getattr(snap, "min_freshness_window_sec", snap.freshness_window_sec) or snap.freshness_window_sec
+            )
 
         # Freshness indicator must never look green when the active large conversation just dropped cache (cr=0)
         is_nonlive_freshness_view = bool(
@@ -2340,6 +2757,12 @@ class AntigravityCapsuleApp:
             or snap.grade == "IDLE"
             or (snap.history_range != "30m" and not snap.account.online)
         )
+        fresh_col_map = {
+            "green": t["green"],
+            "orange": t["orange"],
+            "red": t["red"],
+            "muted": t["text_secondary"],
+        }
         if disp_fresh_invalid:
             is_severe_fresh = is_severe_freshness_invalid(disp_fresh_invalid, disp_fresh_consec)
             fresh_color = t["red"] if is_severe_fresh else t["orange"]
@@ -2347,13 +2770,13 @@ class AntigravityCapsuleApp:
         elif disp_fresh_sec is None and is_nonlive_freshness_view:
             self._lbl_bar_fresh.configure(text="保鲜 —", fg=t["text_secondary"])
         else:
-            fresh_txt = format_countdown(disp_fresh_sec)
-            fresh_color = t["text_secondary"]
-            if disp_fresh_sec is not None:
-                fresh_color = t["orange"] if disp_fresh_sec <= 60 else t["green"]
-            self._lbl_bar_fresh.configure(text=f"保鲜 {fresh_txt}", fg=fresh_color)
+            fresh_short, fresh_col_key = format_freshness_status(disp_fresh_sec, invalid_reason="", compact=True)
+            fresh_color = fresh_col_map.get(fresh_col_key, t["text_secondary"])
+            self._lbl_bar_fresh.configure(text=f"保鲜 {fresh_short}", fg=fresh_color)
 
+        tier_label, tier_short = self._resolve_account_tier(snap)
         range_short = HISTORY_RANGE_SPECS.get(snap.history_range, ("", ""))[0]
+        bar_acc_fg = t["text_secondary"]
         if snap.is_custom_account_view:
             view_lbl = snap.resolved_account or "全机"
             acc_txt = f"回看 {view_lbl}"
@@ -2363,16 +2786,21 @@ class AntigravityCapsuleApp:
             if not snap.account.online and getattr(snap, "hub_pid_alive", False):
                 acc_txt = "连接中"
             else:
-                acc_txt = snap.account.short_label
+                base_acc = snap.account.short_label or "离线"
+                acc_txt = f"{base_acc}{tier_short}" if (snap.account.online and tier_short) else base_acc
+            q_fam = str(getattr(snap.account, "quota_family", "gemini") or "gemini").strip().lower()
+            pool_prefix = "3P:" if q_fam == "3p" else "G:"
             if snap.account.five_hour_pct is not None and snap.account.weekly_pct is not None:
-                acc_txt += f" {snap.account.five_hour_pct:.0f}%/周{snap.account.weekly_pct:.0f}%"
+                acc_txt += f" {pool_prefix}{snap.account.five_hour_pct:.0f}%/周{snap.account.weekly_pct:.0f}%"
             elif snap.account.five_hour_pct is not None:
-                acc_txt += f" {snap.account.five_hour_pct:.0f}%"
+                acc_txt += f" {pool_prefix}{snap.account.five_hour_pct:.0f}%"
             elif snap.account.weekly_pct is not None:
-                acc_txt += f" 周{snap.account.weekly_pct:.0f}%"
+                acc_txt += f" {pool_prefix}周{snap.account.weekly_pct:.0f}%"
             if snap.history_range != "30m" and range_short:
                 acc_txt += f"·{range_short}"
-        self._lbl_bar_acc.configure(text=acc_txt)
+            if snap.account.online and bool(getattr(snap.account, "will_exhaust_before_reset", False)):
+                bar_acc_fg = t["orange"]
+        self._lbl_bar_acc.configure(text=acc_txt, fg=bar_acc_fg)
 
         has_24h = getattr(snap, "rolling_24h_steps", None) is not None
         eff_steps = int(snap.rolling_24h_steps or 0) if has_24h else int(snap.today_steps)
@@ -2386,8 +2814,6 @@ class AntigravityCapsuleApp:
         )
         step_text_color = step_bar_color if eff_steps >= snap.daily_steps_warn else t["text_secondary"]
         self._lbl_bar_steps.configure(text=f"{eff_steps}/{snap.daily_steps_alert}", fg=step_text_color)
-        # Keep collapsed-bar steps tooltip fresh even while collapsed
-        self._steps_hover_text = self._build_steps_tooltip_text(snap)
 
         inv = snap.slot_inventory
         bar_slots_was_visible = bool(self._lbl_bar_slots.winfo_manager())
@@ -2465,7 +2891,7 @@ class AntigravityCapsuleApp:
                         self.tray.notify(title, msg)
 
         if not self._expanded or not self._expanded_built:
-            if self._visible and not self._dragging and not self._suppress_render_clamp:
+            if self._visible and not self._is_any_window_dragging() and not self._suppress_render_clamp:
                 try:
                     self.root.update_idletasks()
                     vx, _vy, vr, _vb = _get_virtual_screen_bounds(self.root)
@@ -2495,24 +2921,146 @@ class AntigravityCapsuleApp:
                 pill_txt = f"{snap.account.short_label or '离线'} ▾"
             self._lbl_acc_pill.configure(text=pill_txt, bg=t["card_alt_bg"], fg=t["text_primary"])
 
+        show_tier_badge = bool((not snap.is_custom_account_view) and snap.account.online and tier_label)
+        if show_tier_badge:
+            if tier_label == "Ultra":
+                tb_bg, tb_fg = t["purple_bg"], t["purple"]
+            elif tier_label == "Pro":
+                tb_bg, tb_fg = t["btn_hover"], t["cyan"]
+            else:
+                tb_bg, tb_fg = t["card_alt_bg"], t["text_secondary"]
+            self._lbl_tier_badge.configure(text=tier_label, bg=tb_bg, fg=tb_fg)
+            if not self._lbl_tier_badge.winfo_manager():
+                self._lbl_tier_badge.pack(side="left", padx=(0, 6), after=self._lbl_acc_pill)
+        else:
+            if self._lbl_tier_badge.winfo_manager():
+                self._lbl_tier_badge.pack_forget()
+
         show_back_live = bool(snap.is_custom_account_view or snap.history_range != "30m")
         if show_back_live:
-            self._lbl_back_live.pack(side="left", padx=(0, 6), after=self._lbl_acc_pill)
+            back_anchor = self._lbl_tier_badge if self._lbl_tier_badge.winfo_manager() else self._lbl_acc_pill
+            self._lbl_back_live.pack(side="left", padx=(0, 6), after=back_anchor)
         else:
             self._lbl_back_live.pack_forget()
 
+        now_ts = float(snap.generated_at or time.time())
+        pools = getattr(snap.account, "pools", None) or {}
+        pool_row_was_vis = bool(self._head_row_pools.winfo_manager())
         if snap.is_custom_account_view:
-            self._lbl_acc_5h.configure(text="历史独立视角", fg=t["cyan"])
-            self._lbl_acc_wk.configure(text=f"共 {len(snap.available_accounts)} 号可选" if snap.available_accounts else "", fg=t["text_muted"])
+            if snap.account.online and snap.account.short_label:
+                self._lbl_acc_5h.configure(
+                    text=f"在线 {snap.account.short_label}{tier_short} · 正回看历史",
+                    fg=t["text_secondary"],
+                )
+                self._lbl_acc_wk.configure(
+                    text=f"共 {len(snap.available_accounts)} 号" if snap.available_accounts else "",
+                    fg=t["text_muted"],
+                )
+            else:
+                self._lbl_acc_5h.configure(text="历史独立视角", fg=t["cyan"])
+                self._lbl_acc_wk.configure(
+                    text=f"共 {len(snap.available_accounts)} 号可选" if snap.available_accounts else "",
+                    fg=t["text_muted"],
+                )
+            if pool_row_was_vis:
+                self._head_row_pools.pack_forget()
+                need_geom_sync = True
         else:
-            self._lbl_acc_5h.configure(
-                text=f"5h {snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "5h —",
-                fg=t["text_muted"] if snap.account.five_hour_pct is None else (t["green"] if snap.account.five_hour_pct >= 35 else t["orange"]),
+            active_fam = (
+                "3p"
+                if str(getattr(snap.account, "quota_family", "gemini") or "gemini").strip().lower() == "3p"
+                else "gemini"
             )
-            self._lbl_acc_wk.configure(
-                text=f"周 {snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "周 —",
-                fg=t["text_secondary"],
+            other_fam = "gemini" if active_fam == "3p" else "3p"
+            active_pool = pools.get(active_fam) if isinstance(pools, dict) else None
+            other_pool = pools.get(other_fam) if isinstance(pools, dict) else None
+            p5h = (
+                active_pool.five_hour_pct
+                if (active_pool is not None and active_pool.five_hour_pct is not None)
+                else snap.account.five_hour_pct
             )
+            pwk = (
+                active_pool.weekly_pct
+                if (active_pool is not None and active_pool.weekly_pct is not None)
+                else snap.account.weekly_pct
+            )
+            p5h_rst_in = getattr(active_pool, "five_hour_reset_in_sec", None) if active_pool is not None else None
+            if p5h_rst_in is None:
+                p5h_rst_in = getattr(snap.account, "five_hour_reset_in_sec", None)
+            p5h_rst_iso = getattr(active_pool, "five_hour_reset_at", None) if active_pool is not None else None
+            if not p5h_rst_iso:
+                p5h_rst_iso = getattr(snap.account, "five_hour_reset_at", None)
+            p5h_rem_s = _format_duration_short(_resolve_reset_remaining_sec(p5h_rst_in, p5h_rst_iso, now_ts))
+            will_exh = bool(
+                (active_pool is not None and getattr(active_pool, "will_exhaust_before_reset", False))
+                or getattr(snap.account, "will_exhaust_before_reset", False)
+            )
+            wk_pace = getattr(active_pool, "weekly_pace_ratio", None) if active_pool is not None else None
+            if wk_pace is None:
+                wk_pace = getattr(snap.account, "weekly_pace_ratio", None)
+            active_pool_name = "Claude/GPT" if active_fam == "3p" else "Gemini"
+            if p5h is not None:
+                txt_5h = f"{active_pool_name} 5h {p5h:.0f}%"
+                if p5h_rem_s:
+                    txt_5h += f" ({p5h_rem_s}重置)"
+                if will_exh:
+                    txt_5h += " ⚡耗快"
+                fg_5h = t["orange"] if (will_exh or p5h < 35) else t["green"]
+            else:
+                txt_5h = "5h —"
+                fg_5h = t["text_muted"]
+            self._lbl_acc_5h.configure(text=txt_5h, fg=fg_5h)
+
+            if pwk is not None:
+                wk_fast = wk_pace is not None and float(wk_pace) >= 1.5
+                txt_wk = f"· 周 {pwk:.0f}% · 周耗偏快" if wk_fast else f"· 周 {pwk:.0f}%"
+                fg_wk = t["orange"] if (wk_fast or pwk < 20) else t["text_secondary"]
+            else:
+                txt_wk = "· 周 —"
+                fg_wk = t["text_secondary"]
+            self._lbl_acc_wk.configure(text=txt_wk, fg=fg_wk)
+
+            has_other_pool = bool(
+                snap.account.online
+                and other_pool is not None
+                and (other_pool.five_hour_pct is not None or other_pool.weekly_pct is not None)
+            )
+            if has_other_pool:
+                o_name = "Claude/GPT" if other_fam == "3p" else "Gemini"
+                o_parts: List[str] = []
+                if other_pool.five_hour_pct is not None:
+                    o_rem = _format_duration_short(
+                        _resolve_reset_remaining_sec(
+                            getattr(other_pool, "five_hour_reset_in_sec", None),
+                            getattr(other_pool, "five_hour_reset_at", None),
+                            now_ts,
+                        )
+                    )
+                    o_5h = f"5h {other_pool.five_hour_pct:.0f}%" + (f" ({o_rem}重置)" if o_rem else "")
+                    if bool(getattr(other_pool, "will_exhaust_before_reset", False)):
+                        o_5h += " ⚡耗快"
+                    o_parts.append(o_5h)
+                if other_pool.weekly_pct is not None:
+                    o_wk_pace = getattr(other_pool, "weekly_pace_ratio", None)
+                    o_wk = f"周 {other_pool.weekly_pct:.0f}%"
+                    if o_wk_pace is not None and float(o_wk_pace) >= 1.5:
+                        o_wk += " · 周耗偏快"
+                    o_parts.append(o_wk)
+                o_warn = bool(getattr(other_pool, "will_exhaust_before_reset", False)) or (
+                    getattr(other_pool, "weekly_pace_ratio", None) is not None
+                    and float(getattr(other_pool, "weekly_pace_ratio", 0.0)) >= 1.5
+                )
+                self._lbl_pool_secondary.configure(
+                    text=f"{o_name} {' · '.join(o_parts)}",
+                    fg=t["orange"] if o_warn else t["text_muted"],
+                )
+                if not pool_row_was_vis:
+                    self._head_row_pools.pack(fill="x", pady=(0, 4), before=self._head_row_scope)
+                    need_geom_sync = True
+            else:
+                if pool_row_was_vis:
+                    self._head_row_pools.pack_forget()
+                    need_geom_sync = True
 
         self._refresh_range_buttons()
         if snap.is_custom_account_view:
@@ -2576,7 +3124,6 @@ class AntigravityCapsuleApp:
             self._last_slots_pct = slot_pct
             self._last_slots_color = slot_bar_col
             self._draw_slots_progress(self._last_slots_pct, self._last_slots_color)
-            self._slots_hover_text = self._build_slots_tooltip_text(inv)
 
             risk_was_visible = bool(self._slot_risk_frame.winfo_manager())
             if inv.main_at_risk:
@@ -2595,7 +3142,6 @@ class AntigravityCapsuleApp:
             self._last_slots_pct = 0
             self._last_slots_color = t["green"]
             self._draw_slots_progress(0, t["green"])
-            self._slots_hover_text = ""
             if self._slot_risk_frame.winfo_manager():
                 self._slot_risk_frame.pack_forget()
                 need_geom_sync = True
@@ -2616,7 +3162,6 @@ class AntigravityCapsuleApp:
             self._lbl_models_badge.pack(side="left", padx=(5, 0))
         else:
             self._lbl_models_badge.pack_forget()
-        self._speed_hover_text = self._build_model_stats_tooltip_text(snap)
 
         ttft_txt = f"TTFT {disp_ttft:.1f}s" if disp_ttft is not None else "TTFT —"
         self._lbl_ttft.configure(text=ttft_txt, fg=self._ttft_color(disp_ttft))
@@ -2626,9 +3171,9 @@ class AntigravityCapsuleApp:
             self._lbl_tps_big.configure(text="— tok/s", fg=t["text_muted"])
 
         if disp_speed == "slow":
-            self._lbl_speed_badge.configure(text="疑似暗限速", bg=t["orange_bg"], fg=t["orange"])
+            self._lbl_speed_badge.configure(text="响应偏慢", bg=t["orange_bg"], fg=t["orange"])
         elif disp_speed == "ok":
-            self._lbl_speed_badge.configure(text="满速正常", bg=t["green_bg"], fg=t["green"])
+            self._lbl_speed_badge.configure(text="速度正常", bg=t["green_bg"], fg=t["green"])
         else:
             self._lbl_speed_badge.configure(text="待采样", bg=t["card_alt_bg"], fg=t["text_muted"])
 
@@ -2645,14 +3190,13 @@ class AntigravityCapsuleApp:
         else:
             self._lbl_ttft_stats.configure(text="近10步 TTFT 待采样", fg=t["text_muted"])
 
-        # Multi-main-conversation freshness badge + hover summary
+        # Multi-main-conversation freshness badge + hover summary (lazy on <Enter>)
         fresh_list = snap.large_freshness_list
         if len(fresh_list) >= 2:
             self._lbl_fresh_count.configure(text=f"共 {len(fresh_list)} 个 ▾")
             self._lbl_fresh_count.pack(side="right")
         else:
             self._lbl_fresh_count.pack_forget()
-        self._fresh_hover_text = self._build_freshness_tooltip_text(fresh_list, snap.freshness_window_sec)
 
         fresh_label = (
             f"{disp_fresh_conv} {truncate_display_width(disp_fresh_title, 12)}"
@@ -2664,13 +3208,9 @@ class AntigravityCapsuleApp:
             inv_col = t["red"] if is_severe_freshness_invalid(disp_fresh_invalid, disp_fresh_consec) else t["orange"]
             self._lbl_fresh_big.configure(text=disp_fresh_invalid, fg=inv_col)
         elif disp_fresh_sec is not None:
-            self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}（{snap.freshness_window_sec}s窗）")
-            if disp_fresh_sec <= 0:
-                self._lbl_fresh_big.configure(text="已过期", fg=t["orange"])
-            elif disp_fresh_sec <= 60:
-                self._lbl_fresh_big.configure(text=f"剩 {format_countdown(disp_fresh_sec)}", fg=t["orange"])
-            else:
-                self._lbl_fresh_big.configure(text=f"剩 {format_countdown(disp_fresh_sec)}", fg=t["green"])
+            self._lbl_fresh_sub.configure(text=f"{fresh_label} · {format_tokens(disp_fresh_ctx)}（{disp_fresh_window}s窗）")
+            big_txt, big_col_key = format_freshness_status(disp_fresh_sec, invalid_reason="", compact=False)
+            self._lbl_fresh_big.configure(text=big_txt, fg=fresh_col_map.get(big_col_key, t["text_primary"]))
         elif is_nonlive_freshness_view:
             sub_txt = "离线待机" if (snap.grade == "IDLE" and not snap.is_custom_account_view) else "历史回看 (非实时)"
             self._lbl_fresh_sub.configure(text=sub_txt)
@@ -2760,8 +3300,12 @@ class AntigravityCapsuleApp:
             and (snap.max_consec_miss >= T1_CONSEC_MISS_THRESHOLD or snap.max_abnormal_recent10 >= 4)
         )
         if time.monotonic() < self._temp_banner_until and self._temp_banner_text:
-            self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"])
-            self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=self._temp_banner_text)
+            if self._temp_banner_level == "green":
+                self._banner_frame.configure(bg=t["green_bg"], highlightbackground=t["green"], highlightcolor=t["green"])
+                self._lbl_banner.configure(bg=t["green_bg"], fg=t["green"], text=self._temp_banner_text)
+            else:
+                self._banner_frame.configure(bg=t["card_alt_bg"], highlightbackground=t["cyan"], highlightcolor=t["cyan"])
+                self._lbl_banner.configure(bg=t["card_alt_bg"], fg=t["cyan"], text=self._temp_banner_text)
         elif is_severe_cold_banner:
             if snap.is_historical_rating or snap.history_range != "30m":
                 if culprit_summary:
@@ -2815,7 +3359,7 @@ class AntigravityCapsuleApp:
         if (
             self._visible
             and dwin is not None
-            and not self._dragging
+            and not self._is_any_window_dragging()
             and not self._suppress_render_clamp
         ):
             try:
@@ -2928,6 +3472,296 @@ class AntigravityCapsuleApp:
         if fill_w > 0:
             c.create_rectangle(0, 1, fill_w, h - 1, fill=fill_color, outline="")
 
+    # ------------------------------------------------------------------ Lazy hover tooltips
+    @property
+    def _status_hover_text(self) -> str:
+        if self._status_hover_override is not None:
+            return self._status_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_status_tooltip_text(self._latest_snapshot)
+
+    @_status_hover_text.setter
+    def _status_hover_text(self, value: str) -> None:
+        self._status_hover_override = value
+
+    @property
+    def _cache_hover_text(self) -> str:
+        if self._cache_hover_override is not None:
+            return self._cache_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_cache_tooltip_text(self._latest_snapshot)
+
+    @_cache_hover_text.setter
+    def _cache_hover_text(self, value: str) -> None:
+        self._cache_hover_override = value
+
+    @property
+    def _acc_hover_text(self) -> str:
+        if self._acc_hover_override is not None:
+            return self._acc_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_account_tooltip_text(self._latest_snapshot)
+
+    @_acc_hover_text.setter
+    def _acc_hover_text(self, value: str) -> None:
+        self._acc_hover_override = value
+
+    @property
+    def _steps_hover_text(self) -> str:
+        if self._steps_hover_override is not None:
+            return self._steps_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_steps_tooltip_text(self._latest_snapshot)
+
+    @_steps_hover_text.setter
+    def _steps_hover_text(self, value: str) -> None:
+        self._steps_hover_override = value
+
+    @property
+    def _slots_hover_text(self) -> str:
+        if self._slots_hover_override is not None:
+            return self._slots_hover_override
+        if self._latest_snapshot is None or self._latest_snapshot.slot_inventory is None:
+            return ""
+        return self._build_slots_tooltip_text(self._latest_snapshot.slot_inventory)
+
+    @_slots_hover_text.setter
+    def _slots_hover_text(self, value: str) -> None:
+        self._slots_hover_override = value
+
+    @property
+    def _speed_hover_text(self) -> str:
+        if self._speed_hover_override is not None:
+            return self._speed_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_model_stats_tooltip_text(self._latest_snapshot)
+
+    @_speed_hover_text.setter
+    def _speed_hover_text(self, value: str) -> None:
+        self._speed_hover_override = value
+
+    @property
+    def _fresh_hover_text(self) -> str:
+        if self._fresh_hover_override is not None:
+            return self._fresh_hover_override
+        if self._latest_snapshot is None:
+            return ""
+        return self._build_freshness_tooltip_text(
+            self._latest_snapshot.large_freshness_list,
+            self._latest_snapshot.freshness_window_sec,
+        )
+
+    @_fresh_hover_text.setter
+    def _fresh_hover_text(self, value: str) -> None:
+        self._fresh_hover_override = value
+
+    def _build_status_tooltip_text(self, snap: MonitorSnapshot) -> str:
+        grade_explain = {
+            "T0": "运行健康，缓存命中与响应速度都在正常范围内",
+            "WARN": "检测到轻微波动或提醒项，建议留意后续变化",
+            "T1": "出现连续掉缓存，重复冷启动会明显消耗额度",
+            "T2": "服务端繁忙或请求超时，当前可能处于限流排队",
+            "T3": "收到 403 权限拒绝，请核查账号状态",
+            "WAIT": "客户端运行中，正在等待下一拍状态数据",
+            "IDLE": "当前未检测到 Antigravity 运行，已暂停实时告警",
+        }.get(snap.grade, "正在监控当前运行状态")
+        lines = [
+            f"当前整体状态: {snap.headline}",
+            f"  人话说明: {grade_explain}",
+        ]
+        if snap.sub_headline:
+            lines.append(f"  补充摘要: {snap.sub_headline}")
+        if snap.t2_recovery_note:
+            lines.append(f"  恢复观察: {snap.t2_recovery_note}")
+        if getattr(snap, "proxy_outage_note", ""):
+            lines.append(f"  代理线路: {snap.proxy_outage_note}")
+        return "\n".join(lines)
+
+    def _show_status_tooltip(self, event: tk.Event) -> None:
+        if self._closing:
+            return
+        text = self._status_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
+
+    def _build_cache_tooltip_text(self, snap: MonitorSnapshot) -> str:
+        pinned = None
+        if self._pinned_conv_id:
+            pinned = next((c for c in snap.active_conversations if c.conversation_id == self._pinned_conv_id), None)
+        if pinned is not None:
+            hit = pinned.latest_hit_rate
+            reason = pinned.latest_cache_reason or (pinned.recent_steps[-1].reason if pinned.recent_steps else "")
+            target_s = f"已聚焦对话 {pinned.short_id}" + (f" ({truncate_display_width(pinned.title, 18)})" if pinned.title else "")
+        else:
+            hit = snap.primary_hit_rate
+            reason = getattr(snap, "primary_hit_reason", "") or (
+                next((c.recent_steps[-1].reason for c in snap.active_conversations if not c.is_subagent and c.recent_steps), "")
+                if snap.active_conversations
+                else ""
+            )
+            target_s = f"当前主对话 ({snap.active_model})" if snap.active_model else "当前主对话"
+        reason_cn = CACHE_REASON_CN_MAP.get(reason, _CACHE_REASON_CN_FALLBACK.get(reason, reason or "待采样"))
+        explain_map = {
+            "cached": "已有历史前缀顺利复用，请求既快又省额度。",
+            "cached_diluted": "已有前缀已完整命中，比例偏低仅因本步新输入内容较多。",
+            "small_ctx": "当前对话内容还不到 32K 缓存门槛，达到后会自动建缓。",
+            "first_cacheable": "本步首次跨过 32K 正在建立缓存，下一拍起就会命中。",
+            "account_switch": "刚刚切换了账号，服务端缓存按账号隔离，本步重新建缓属正常现象。",
+            "model_switch": "刚刚切换了模型，新模型会独立重建缓存，下一拍起恢复命中。",
+            "compact_reset": "刚刚做完上下文压缩，旧前缀重新整理，下一拍起恢复高命中。",
+            "revert_reset": "刚刚回退了对话进度，需要重建该分叉点后的缓存。",
+            "rule_change": "全局规则发生改动，本步自动重新预热前缀。",
+            "idle_rewarm": "距离上次发言较久，缓存已自然冷却，本步属于正常重新预热。",
+            "partial_miss": "只命中了一小部分前缀，大部分历史缓存丢失，属于异常掉缓存。",
+            "abnormal_zero": "本应命中的历史缓存完全没用上，属于异常掉缓存。",
+        }
+        hit_txt = f"{hit:.1f}%" if hit is not None else "暂无采样"
+        lines = [
+            f"主对话缓存状态（{target_s}）:",
+            f"  最新命中: {hit_txt} · {reason_cn}",
+        ]
+        if reason in explain_map:
+            lines.append(f"  说明: {explain_map[reason]}")
+        if snap.wasted_cold_tokens_total > 0:
+            lines.append(f"  冷算损耗: 近期异常掉缓存额外多耗约 {format_tokens(snap.wasted_cold_tokens_total)} 输入")
+        return "\n".join(lines)
+
+    def _show_cache_tooltip(self, event: tk.Event) -> None:
+        if self._closing:
+            return
+        text = self._cache_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
+
+    def _build_account_tooltip_text(self, snap: MonitorSnapshot) -> str:
+        acc = snap.account
+        now_ts = float(snap.generated_at or time.time())
+        tier_label, _tier_short = self._resolve_account_tier(snap)
+        tier_part = f" · {tier_label} 档" if tier_label else ""
+        if acc.online:
+            head = f"在线账号: {acc.short_label or '已登录'}{tier_part}"
+        elif getattr(snap, "hub_pid_alive", False):
+            head = "账号状态: Antigravity 连接中，等待额度回报"
+        else:
+            head = "账号状态: 当前离线"
+        lines = [head]
+        if snap.is_custom_account_view:
+            lines.append(f"  当前视角: 正在回看 {snap.resolved_account or '全机'}（{snap.history_range_label}），下方仍显示本机在线账号额度")
+
+        def _append_pool_lines(
+            title: str,
+            p5h: Optional[float],
+            pwk: Optional[float],
+            rst5_in: Optional[int],
+            rst5_iso: Optional[str],
+            rstw_in: Optional[int],
+            rstw_iso: Optional[str],
+            burn_h: Optional[float],
+            eta_s: Optional[int],
+            will_exh: bool,
+            wk_pace: Optional[float],
+        ) -> None:
+            if p5h is None and pwk is None:
+                return
+            lines.append(f"  {title}:")
+            if p5h is not None:
+                rem5 = _resolve_reset_remaining_sec(rst5_in, rst5_iso, now_ts)
+                rem5_s = _format_duration_short(rem5)
+                bj5 = _format_beijing_reset_clock(rst5_iso, rem5, now_ts)
+                rst5_tail = ""
+                if rem5_s and bj5:
+                    rst5_tail = f"（约 {rem5_s} 后重置 · 北京时间 {bj5}）"
+                elif rem5_s:
+                    rst5_tail = f"（约 {rem5_s} 后重置）"
+                elif bj5:
+                    rst5_tail = f"（北京时间 {bj5} 重置）"
+                lines.append(f"    5 小时余量: {p5h:.1f}%{rst5_tail}")
+            if burn_h is not None:
+                if float(burn_h) > 0.05:
+                    eta_str = _format_duration_short(eta_s)
+                    if will_exh and eta_str:
+                        lines.append(f"    ⚡ 重置前可能用完: 当前约 {burn_h:.1f}%/小时，预计约 {eta_str} 后用完 5 小时额度，早于下次重置时间")
+                    elif eta_str:
+                        lines.append(f"    当前消耗速度: 约 {burn_h:.1f}%/小时，按此节奏预计可持续约 {eta_str}")
+                    else:
+                        lines.append(f"    当前消耗速度: 约 {burn_h:.1f}%/小时")
+                else:
+                    lines.append("    当前消耗速度: 平稳（近期几乎无扣减）")
+            if pwk is not None:
+                remw = _resolve_reset_remaining_sec(rstw_in, rstw_iso, now_ts)
+                remw_s = _format_duration_short(remw)
+                bjw = _format_beijing_reset_clock(rstw_iso, remw, now_ts)
+                rstw_tail = ""
+                if remw_s and bjw:
+                    rstw_tail = f"（约 {remw_s} 后重置 · 北京时间 {bjw}）"
+                elif remw_s:
+                    rstw_tail = f"（约 {remw_s} 后重置）"
+                elif bjw:
+                    rstw_tail = f"（北京时间 {bjw} 重置）"
+                lines.append(f"    本周余量: {pwk:.1f}%{rstw_tail}")
+                if wk_pace is not None and float(wk_pace) >= 1.5:
+                    used_pct = max(0.0, 100.0 - float(pwk))
+                    elapsed_pct = 0.0
+                    if remw is not None:
+                        elapsed_pct = max(0.0, min(100.0, ((7.0 * 86400.0 - float(remw)) / (7.0 * 86400.0)) * 100.0))
+                    if elapsed_pct > 0.5:
+                        lines.append(
+                            f"    本周消耗偏快 ({wk_pace:.1f}倍速): 本周进度已过 {elapsed_pct:.0f}%，已用周额 {used_pct:.0f}%，周末前可能偏紧"
+                        )
+                    else:
+                        lines.append(f"    本周消耗偏快 ({wk_pace:.1f}倍速): 照此节奏周末前可能偏紧")
+
+        pools = getattr(acc, "pools", None) or {}
+        has_pool_rendered = False
+        if isinstance(pools, dict) and pools:
+            for pname, plabel in (("gemini", "Gemini 池"), ("3p", "Claude / GPT 池")):
+                p = pools.get(pname)
+                if p is not None and (p.five_hour_pct is not None or p.weekly_pct is not None):
+                    has_pool_rendered = True
+                    _append_pool_lines(
+                        plabel,
+                        p.five_hour_pct,
+                        p.weekly_pct,
+                        getattr(p, "five_hour_reset_in_sec", None),
+                        getattr(p, "five_hour_reset_at", None),
+                        getattr(p, "weekly_reset_in_sec", None),
+                        getattr(p, "weekly_reset_at", None),
+                        getattr(p, "burn_pct_per_hour", None),
+                        getattr(p, "eta_exhaust_sec", None),
+                        bool(getattr(p, "will_exhaust_before_reset", False)),
+                        getattr(p, "weekly_pace_ratio", None),
+                    )
+        if not has_pool_rendered and (acc.five_hour_pct is not None or acc.weekly_pct is not None):
+            fam_lbl = "Claude / GPT 池" if str(getattr(acc, "quota_family", "gemini")).lower() == "3p" else "Gemini 池"
+            _append_pool_lines(
+                fam_lbl,
+                acc.five_hour_pct,
+                acc.weekly_pct,
+                getattr(acc, "five_hour_reset_in_sec", None),
+                getattr(acc, "five_hour_reset_at", None),
+                getattr(acc, "weekly_reset_in_sec", None),
+                getattr(acc, "weekly_reset_at", None),
+                getattr(acc, "burn_pct_per_hour", None),
+                getattr(acc, "eta_exhaust_sec", None),
+                bool(getattr(acc, "will_exhaust_before_reset", False)),
+                getattr(acc, "weekly_pace_ratio", None),
+            )
+        if len(lines) == 1:
+            lines.append("  暂无在线额度数据，待客户端连接后自动显示双池余量与重置时间。")
+        return "\n".join(lines)
+
+    def _show_acc_tooltip(self, event: tk.Event) -> None:
+        if self._closing:
+            return
+        text = self._acc_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
+
     def _build_steps_tooltip_text(self, snap: MonitorSnapshot) -> str:
         mode = getattr(snap, "daily_steps_limit_mode", "default")
         note = getattr(snap, "daily_steps_limit_note", "") or "初始建议值"
@@ -2946,12 +3780,43 @@ class AntigravityCapsuleApp:
         eff_tot_sub = int(getattr(snap, "total_subagent_24h_steps", 0)) if has_24h else int(snap.total_subagent_today_steps)
         eff_pk_steps = int(getattr(snap, "peak_hour_steps_24h", 0)) if has_24h else int(snap.peak_hour_steps_today)
         eff_pk_label = getattr(snap, "peak_hour_label_24h", "") if has_24h else snap.peak_hour_label
+        detail_lines = [str(s).strip() for s in (getattr(snap, "steps_detail_lines", ()) or ()) if str(s).strip()]
+        peer_peak = int(getattr(snap, "steps_peer_prior_peak", 0) or 0)
+        peer_weight = int(getattr(snap, "steps_peer_weight_pct", 0) or 0)
+        eff_weighted = int(getattr(snap, "steps_effective_weighted_24h", 0) or 0)
+        gem_24h = int(getattr(snap, "steps_gemini_24h", 0) or 0)
+        p3_24h = int(getattr(snap, "steps_3p_24h", 0) or 0)
+        quota_headroom = getattr(snap, "steps_quota_headroom", None)
+        soft_over = bool(getattr(snap, "steps_soft_over_limit", False))
+        low_q_tight = bool(getattr(snap, "steps_low_quota_tightened", False))
+        tier_label, _tier_short = self._resolve_account_tier(snap)
+
         lines = [
             f"近 24h 请求步数保护线 ({snap.steps_scope_label}):",
-            f"  24h 滑窗: {eff_steps} / {snap.daily_steps_alert} 步（黄线 {snap.daily_steps_warn} / 红线 {snap.daily_steps_alert} · 初始基准 {base_alert}）",
-            f"  调整依据: {note}" + (f"（历史沉淀 24h 纯健康峰值 {hist_peak} 步）" if hist_peak > 0 else ""),
-            f"  近24h拆解: 主对话 {eff_main} 步 / 子代理 {eff_sub} 步 │ 近 1h {snap.last_1h_steps} 步",
+            f"  24h 步数: {eff_steps} / {snap.daily_steps_alert} 步（提醒线 {snap.daily_steps_warn} / 保护线 {snap.daily_steps_alert} · 初始基准 {base_alert}）",
         ]
+        if detail_lines:
+            for dl in detail_lines[:5]:
+                lines.append(f"  · {dl}")
+            if hist_peak > 0 and not any(str(hist_peak) in dl for dl in detail_lines):
+                lines.append(f"  · 近期稳跑记录约 {hist_peak} 步（越近的日子权重越高）")
+        else:
+            lines.append(f"  调整依据: {note}" + (f"（近期稳跑记录约 {hist_peak} 步）" if hist_peak > 0 else ""))
+            if peer_weight > 0 and peer_peak > 0:
+                t_name = tier_label or "同档位"
+                lines.append(f"  同级参考: 结合同为 {t_name} 账号的近期表现（约 {peer_peak} 步，占 {peer_weight}% 参考）")
+            if low_q_tight:
+                lines.append("  额度保护: 当前 5 小时或本周余量偏低，已主动收紧提醒线保护额度")
+            if soft_over:
+                lines.append("  状态提醒: 当前 24 小时步数较多，但剩余额度充裕且状态健康，可放心继续")
+            if quota_headroom is not None and int(quota_headroom) >= 0:
+                lines.append(f"  余量估算: 按当前消耗速度，5 小时余量预计还可跑约 {int(quota_headroom)} 步")
+            if eff_steps > 0 and eff_weighted > int(eff_steps * 1.25):
+                lines.append(f"  算力折算: 近期冷启动/大输入较多，实际算力消耗约折合 {eff_weighted} 步")
+
+        if gem_24h > 0 or p3_24h > 0:
+            lines.append(f"  分池统计: Gemini {gem_24h} 步 / Claude·GPT {p3_24h} 步")
+        lines.append(f"  近24h拆解: 主对话 {eff_main} 步 / 子代理 {eff_sub} 步 │ 近 1h {snap.last_1h_steps} 步")
         if eff_pk_steps > 0 and eff_pk_label:
             lines.append(f"  峰值时段: {eff_pk_label} ({eff_pk_steps} 步)")
         lines.append(
@@ -2970,28 +3835,44 @@ class AntigravityCapsuleApp:
             and snap.resolved_account
             and eff_steps > max(base_alert, snap.daily_steps_alert)
         ):
-            _, next_alert, _, _, _ = compute_adaptive_daily_steps_limits(
-                int(self.config.get("daily_steps_warn", 960)),
-                base_alert,
-                [{"date": "2026-01-01", "safe_steps": eff_steps, "degraded_at": None}],
-            )
+            tier_norm = str(getattr(snap, "account_tier_norm", "") or "")
+            try:
+                from core.adaptive_steps import compute_adaptive_steps_v2
+                sim_now = float(getattr(snap, "observed_at", 0.0) or time.time())
+                sim_h = int((sim_now - 48 * 3600.0) // 3600.0)
+                sim_res = compute_adaptive_steps_v2(
+                    int(self.config.get("daily_steps_warn", 960)),
+                    base_alert,
+                    {sim_h: {"steps": eff_steps}},
+                    now_ts=sim_now,
+                    account_tier=tier_norm,
+                )
+                next_alert = int(sim_res.alert_limit)
+            except Exception:
+                _, next_alert, _, _, _ = compute_adaptive_daily_steps_limits(
+                    int(self.config.get("daily_steps_warn", 960)),
+                    base_alert,
+                    [{"date": "2026-01-01", "safe_steps": eff_steps, "degraded_at": None}],
+                )
             if next_alert > snap.daily_steps_alert:
-                lines.append(f"  沉淀预告: 当前 24h 已健康跑至 {eff_steps} 步，待本批步数完整退出 24h 窗后自动上调红线至 {next_alert} 步")
-        elif mode == "default":
-            lines.append("  说明: 仅依据已完全退出当前 24h 窗的历史沉淀峰值调整，当前滑窗超线仍提醒而不实时追高")
+                lines.append(f"  沉淀预告: 当前 24h 已健康跑至 {eff_steps} 步，待本批步数完整退出 24h 窗后自动上调保护线至 {next_alert} 步")
+        elif mode == "default" and not detail_lines:
+            lines.append("  说明: 仅依据已沉淀的稳跑记录自动调整，当前窗口超线仍友好提醒而不盲目追高")
         return "\n".join(lines)
 
     def _show_steps_tooltip(self, event: tk.Event) -> None:
-        if self._closing or not self._steps_hover_text:
+        if self._closing:
             return
-        self._show_text_tooltip(self._steps_hover_text, event)
+        text = self._steps_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
 
     def _build_slots_tooltip_text(self, inv: SlotInventorySnapshot) -> str:
         auto_s = "开启（离线空闲 / 高水位自动让位）" if self.config.get("slot_auto_clean_enabled", True) else "已关闭"
         mode_map = {"recycle": "Windows 系统回收站（可还原）", "archive": "tar+SHA256 归档后删除", "delete": "直接删除"}
         mode_s = mode_map.get(str(self.config.get("slot_clean_mode", "recycle")), "系统回收站")
         lines = [
-            f"Antigravity 本机 500 会话槽位池（点击展开完整明细）:",
+            "Antigravity 本机 500 会话槽位池（点击展开完整明细）:",
             f"  当前占用: {inv.total_db} / {inv.cap} ({inv.usage_pct:.0f}% · 安全余量 {inv.headroom} 槽 · 约 {format_bytes_human(inv.total_bytes)})",
             f"  主对话: {inv.main_count} 条（永久保护，绝不自动清理）",
             f"  可清理子代理 (>{inv.protect_age_min}m): {inv.cleanable_sub_count} 条（约 {format_bytes_human(inv.cleanable_bytes)}）",
@@ -3007,9 +3888,11 @@ class AntigravityCapsuleApp:
         return "\n".join(lines)
 
     def _show_slots_tooltip(self, event: tk.Event) -> None:
-        if self._closing or not self._slots_hover_text:
+        if self._closing:
             return
-        self._show_text_tooltip(self._slots_hover_text, event)
+        text = self._slots_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
 
     def _ttft_color(self, sec: Optional[float]) -> str:
         t = self.theme
@@ -3024,53 +3907,151 @@ class AntigravityCapsuleApp:
         return t["green"]
 
     def _build_model_stats_tooltip_text(self, snap: MonitorSnapshot) -> str:
-        if not snap.model_stats:
-            return ""
-        lines = [f"{snap.history_range_label}分模型实测 ({snap.log_scope_label}):"]
-        for ms in snap.model_stats[:6]:
-            ttft_s = (
-                f"均 {ms.ttft_avg_sec:4.1f}s / 峰 {ms.ttft_max_sec:4.1f}s"
-                if (ms.ttft_avg_sec is not None and ms.ttft_max_sec is not None)
-                else "TTFT 待采样"
-            )
-            tps_s = f"{ms.tps_avg:3.0f}t/s" if ms.tps_avg is not None else "  — "
-            cacheable = ms.hit_count + ms.abnormal_miss_count
-            hit_s = f"{(ms.hit_count / cacheable) * 100:4.0f}%" if cacheable > 0 else "  — "
-            post_s = f" │ 503后+{ms.steps_after_last_t2}步" if ms.steps_after_last_t2 > 0 else ""
-            cal_s = " [大窗校准]" if getattr(ms, "main_large_ctx_calibrated", False) else ""
-            lines.append(f"  {ms.model:<12} │ {ms.step_count:>2}步 │ 命中 {hit_s} │ TTFT {ttft_s} │ {tps_s}{post_s}{cal_s}")
+        lines: List[str] = []
+        if snap.primary_speed_status == "slow":
+            lines.append("响应偏慢: 首字等待偏久或生成变慢，可能正在排队或限速（已自动按模型基线校准）")
+        elif snap.primary_speed_status == "ok":
+            lines.append("速度正常: 首字等待与生成速度均在当前模型正常范围内")
+        if bool(getattr(snap, "primary_media_ttft_exempted", False)):
+            lines.append("  多模态说明: 当前对话含图片/附件上传耗时，已自动放宽首字判定")
+        large_allow = float(getattr(snap, "primary_large_ctx_ttft_allowance_sec", 0.0) or 0.0)
+        if large_allow >= 10.0:
+            lines.append(f"  大上下文校准: 上下文偏大，首字判定基线已自动放宽 +{large_allow:.0f}s")
+        if snap.model_stats:
+            lines.append(f"{snap.history_range_label}分模型实测 ({snap.log_scope_label}):")
+            for ms in snap.model_stats[:6]:
+                ttft_s = (
+                    f"均 {ms.ttft_avg_sec:4.1f}s / 峰 {ms.ttft_max_sec:4.1f}s"
+                    if (ms.ttft_avg_sec is not None and ms.ttft_max_sec is not None)
+                    else "TTFT 待采样"
+                )
+                tps_s = f"{ms.tps_avg:3.0f}t/s" if ms.tps_avg is not None else "  — "
+                cacheable = ms.hit_count + ms.abnormal_miss_count
+                hit_s = f"{(ms.hit_count / cacheable) * 100:4.0f}%" if cacheable > 0 else "  — "
+                post_s = f" │ 503后+{ms.steps_after_last_t2}步" if ms.steps_after_last_t2 > 0 else ""
+                cal_s = " [大窗校准]" if getattr(ms, "main_large_ctx_calibrated", False) else ""
+                lines.append(f"  {ms.model:<12} │ {ms.step_count:>2}步 │ 命中 {hit_s} │ TTFT {ttft_s} │ {tps_s}{post_s}{cal_s}")
         if snap.t2_recovery_note:
             lines.append(f"恢复判定: {snap.t2_recovery_note}")
         if getattr(snap, "proxy_outage_note", ""):
             lines.append(f"代理状态: {snap.proxy_outage_note}")
+        if not lines:
+            lines.append("实时速度与首字等待: 正在等待下一轮采样")
         return "\n".join(lines)
 
     def _show_speed_tooltip(self, event: tk.Event) -> None:
-        if self._closing or not self._speed_hover_text:
+        if self._closing:
             return
-        self._show_text_tooltip(self._speed_hover_text, event)
+        text = self._speed_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
 
     def _build_freshness_tooltip_text(self, fresh_list: List[Any], window_sec: int) -> str:
         if not fresh_list:
-            return ""
-        lines = [f"全部活跃大上下文主对话 (共 {len(fresh_list)} 个 · {window_sec}s 保鲜窗):"]
+            return "大上下文保鲜监控:\n  当前没有活跃的大上下文主对话，无需担心缓存冷却。"
+        lines = [f"全部活跃大上下文主对话 (共 {len(fresh_list)} 个 · 基准 {window_sec}s 保鲜窗):"]
+        has_rescue = False
+        has_expired = False
         for c in fresh_list:
-            if c.freshness_invalid_reason:
-                st_txt = c.freshness_invalid_reason
-            elif c.freshness_remaining_sec is not None:
-                st_txt = "已过期" if c.freshness_remaining_sec <= 0 else f"剩 {format_countdown(c.freshness_remaining_sec)}"
-            else:
-                st_txt = "闲置"
+            c_win = int(getattr(c, "freshness_window_sec", window_sec) or window_sec)
+            st_txt, _col_key = format_freshness_status(
+                c.freshness_remaining_sec,
+                invalid_reason=c.freshness_invalid_reason,
+                compact=False,
+            )
+            c_zone = str(getattr(c, "freshness_zone", "") or "")
+            if not c_zone and not c.freshness_invalid_reason and c.freshness_remaining_sec is not None:
+                if -FRESHNESS_RESCUE_WINDOW_SEC <= c.freshness_remaining_sec <= 0:
+                    c_zone = "rescue"
+                elif c.freshness_remaining_sec < -FRESHNESS_RESCUE_WINDOW_SEC:
+                    c_zone = "expired"
+            if c_zone == "rescue":
+                has_rescue = True
+            elif c_zone == "expired":
+                has_expired = True
             pin_mk = "📌 " if self._pinned_conv_id == c.conversation_id else "   "
             name_part = f" {truncate_display_width(c.title, 20)}" if getattr(c, "title", "") else ""
-            lines.append(f"{pin_mk}{c.short_id}{name_part} · {c.model} │ {format_tokens(c.context_tokens):>6} │ {st_txt}")
+            lines.append(f"{pin_mk}{c.short_id}{name_part} · {c.model} ({c_win}s) │ {format_tokens(c.context_tokens):>6} │ {st_txt}")
+        if has_rescue:
+            lines.append("临界抢救说明: 缓存刚过安全窗但仍在 90 秒抢救期内，现在发消息大概率还能接上热缓存。")
+        if has_expired:
+            lines.append("已冷却说明: 已超过保鲜抢救期，下次发言需重新预热缓存。")
         lines.append("提示: 右键对话行或点进长线详情可切换主面板聚焦目标")
         return "\n".join(lines)
 
     def _show_freshness_tooltip(self, event: tk.Event) -> None:
-        if self._closing or not self._fresh_hover_text:
+        if self._closing:
             return
-        self._show_text_tooltip(self._fresh_hover_text, event)
+        text = self._fresh_hover_text
+        if text:
+            self._show_text_tooltip(text, event)
+
+    def _build_log_cell_tooltip_text(self, cat: str, snap: Optional[MonitorSnapshot]) -> str:
+        cat_title = _LOG_CELL_TITLES.get(cat, cat)
+        if snap is None:
+            return f"{cat_title}:\n  正在等待日志采样…"
+        by_cat = getattr(snap, "recent_events_by_cat", None)
+        evs: List[Any] = []
+        if isinstance(by_cat, dict) and cat in by_cat and by_cat[cat]:
+            evs = list(by_cat[cat])
+        else:
+            evs = [e for e in (snap.recent_events or []) if getattr(e, "category", "") == cat]
+        evs.sort(key=lambda e: float(getattr(e, "timestamp", 0.0) or 0.0), reverse=True)
+        conv_title_map = {
+            c.conversation_id: (c.title, c.short_id)
+            for c in (snap.active_conversations or [])
+            if getattr(c, "conversation_id", "")
+        }
+        lines = [f"{cat_title}明细（{snap.log_scope_label} · {snap.history_range_label}，新 → 旧）:"]
+        if evs:
+            for ev in evs[:8]:
+                ts = float(getattr(ev, "timestamp", 0.0) or 0.0)
+                hms = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts > 0 else "--:--:--"
+                parts: List[str] = []
+                mod = str(getattr(ev, "model", "") or "").strip()
+                if mod:
+                    parts.append(mod)
+                cid = str(getattr(ev, "culprit_cid", "") or "").strip()
+                if cid:
+                    if cid in conv_title_map:
+                        ctitle, csid = conv_title_map[cid]
+                        parts.append(f"{truncate_display_width(ctitle, 14)}({csid})" if ctitle else csid)
+                    else:
+                        parts.append(cid[:6])
+                summ = str(getattr(ev, "summary", "") or "").strip()
+                if summ:
+                    parts.append(summ)
+                row_txt = f"  [{hms}] {' · '.join(parts)}" if parts else f"  [{hms}] {cat_title}"
+                if cat == "timeout" and bool(getattr(ev, "is_heavy_media_timeout", False)):
+                    row_txt += "（已识别为多图上传耗时，不计入限流）"
+                lines.append(row_txt)
+        else:
+            lines.append("  当前窗口无此类异常，运行平稳")
+        if cat == "retry" and getattr(snap, "proxy_outage_note", ""):
+            lines.append(f"  代理线路: {snap.proxy_outage_note}")
+        lines.append("提示: 左键点击此格可复制该类明细到剪贴板")
+        return "\n".join(lines)
+
+    def _show_log_cell_tooltip(self, cat: str, event: tk.Event) -> None:
+        if self._closing:
+            return
+        text = self._build_log_cell_tooltip_text(cat, self._latest_snapshot)
+        if text:
+            self._show_text_tooltip(text, event)
+
+    def _copy_log_cell_timeline(self, cat: str) -> None:
+        if self._closing:
+            return
+        text = self._build_log_cell_tooltip_text(cat, self._latest_snapshot)
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        self._set_temp_banner_notice("已复制日志明细 ✓", duration_sec=2.5, level="green")
 
     def _build_conv_tooltip_text(self, conv: Any) -> str:
         delta_s = f" ({format_delta_tokens(conv.latest_context_delta)})" if conv.latest_context_delta != 0 else ""
@@ -3155,7 +4136,19 @@ class AntigravityCapsuleApp:
             return
         self._hide_conv_tooltip()
         t = self.theme
+        raw_lines = text.splitlines()
+        if len(raw_lines) > 18:
+            display_text = "\n".join(
+                raw_lines[:18] + ["…（内容较长已折叠）"]
+            )
+        else:
+            display_text = text
         try:
+            vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
+            avail_w = max(320, (vr - vx) - 60)
+            # High-DPI screens (e.g. 150% scaling) need wider wrap bounds so tabular step rows stay on one line
+            cap_px = 1160 if "|" in display_text else 860
+            wrap_px = max(320, min(cap_px, int(avail_w * 0.78), avail_w))
             win = tk.Toplevel(self.root)
             win.overrideredirect(True)
             win.attributes("-topmost", True)
@@ -3165,17 +4158,17 @@ class AntigravityCapsuleApp:
             inner.pack(fill="both", expand=True, padx=1, pady=1)
             lbl = tk.Label(
                 inner,
-                text=text,
+                text=display_text,
                 font=(MONO_FONT, 8),
                 bg=t["panel_bg"],
                 fg=t["text_primary"],
                 justify="left",
                 anchor="w",
+                wraplength=wrap_px,
             )
             lbl.pack()
             win.update_idletasks()
             tw, th = win.winfo_reqwidth(), win.winfo_reqheight()
-            vx, vy, vr, vb = _get_virtual_screen_bounds(self.root)
             px = min(vr - tw - 8, max(vx + 8, event.x_root + 14))
             py = event.y_root + 16
             if py + th > vb - 44:
@@ -3270,20 +4263,29 @@ class AntigravityCapsuleApp:
         if self._detail_win is None or self._detail_win._closed:
             def _on_closed() -> None:
                 self._detail_win = None
+                self._flush_aux_drag_deferred_updates()
 
             # Single-conversation detail modal ALWAYS displays the conversation's full own trajectory
             # (never sliced or fragmented by the dashboard's account/history filter).
-            self._detail_win = ConversationDetailWindow(
-                parent=self.root,
-                theme=self.theme,
-                load_report=self.engine.read_conversation_detail,
-                on_toggle_pin=self._toggle_pin_conversation,
-                is_pinned_fn=lambda cid: self._pinned_conv_id == cid,
-                on_closed=_on_closed,
-                apply_rounding_fn=_apply_win11_rounded_corners,
-                screen_bounds_fn=_get_virtual_screen_bounds,
-                slow_tps_threshold=float(self.config.get("slow_tps_threshold", 35.0)),
-            )
+            dw_kwargs: Dict[str, Any] = {
+                "parent": self.root,
+                "theme": self.theme,
+                "load_report": self.engine.read_conversation_detail,
+                "on_toggle_pin": self._toggle_pin_conversation,
+                "is_pinned_fn": lambda cid: self._pinned_conv_id == cid,
+                "on_closed": _on_closed,
+                "on_drag_state_changed": self._on_aux_window_drag_state,
+                "apply_rounding_fn": _apply_win11_rounded_corners,
+                "screen_bounds_fn": _get_virtual_screen_bounds,
+                "slow_tps_threshold": float(self.config.get("slow_tps_threshold", 40.0)),
+                "async_load": True,
+            }
+            try:
+                self._detail_win = ConversationDetailWindow(**dw_kwargs)
+            except TypeError:
+                dw_kwargs.pop("on_drag_state_changed", None)
+                dw_kwargs.pop("async_load", None)
+                self._detail_win = ConversationDetailWindow(**dw_kwargs)
             self._detail_win.show_conversation(conv_id, place_near_parent=True, initial_snap=self._latest_snapshot)
         else:
             self._detail_win.show_conversation(conv_id, place_near_parent=False, initial_snap=self._latest_snapshot)
@@ -3300,8 +4302,7 @@ class AntigravityCapsuleApp:
         if mode not in ("main", "subagent", "all"):
             return
         self._conv_filter = mode
-        self.config["conv_filter"] = mode
-        self.config_store.save(self.config)
+        self._save_config_patch({"conv_filter": mode})
         if not self._expanded_built:
             return
         self._conv_viewport.yview_moveto(0.0)
@@ -3431,8 +4432,7 @@ class AntigravityCapsuleApp:
                 self._sync_custom_scrollbar()
 
     def _on_resize_end(self, _event: tk.Event) -> None:
-        self.config["conv_list_rows"] = self._conv_list_rows
-        self.config_store.save(self.config)
+        self._save_config_patch({"conv_list_rows": self._conv_list_rows})
         self._clamp_window_to_screen()
 
     def _draw_conversation_bars(self, snap: MonitorSnapshot) -> None:
@@ -3442,14 +4442,24 @@ class AntigravityCapsuleApp:
         all_convs = list(snap.active_conversations)
         main_convs = [c for c in all_convs if not c.is_subagent]
         sub_convs = [c for c in all_convs if c.is_subagent]
-        self._refresh_filter_buttons(len(main_convs), len(sub_convs))
+        total_matched_main = max(len(main_convs), int(getattr(snap, "total_matched_main", 0) or 0))
+        total_matched_sub = max(len(sub_convs), int(getattr(snap, "total_matched_sub", 0) or 0))
+        total_matched_all = max(
+            len(all_convs),
+            int(getattr(snap, "total_matched_conversations", 0) or 0),
+            total_matched_main + total_matched_sub,
+        )
+        self._refresh_filter_buttons(total_matched_main, total_matched_sub)
 
         if self._conv_filter == "main":
             convs = list(main_convs)
+            matched_total = total_matched_main
         elif self._conv_filter == "subagent":
             convs = list(sub_convs)
+            matched_total = total_matched_sub
         else:
             convs = list(all_convs)
+            matched_total = total_matched_all
 
         culprit_summary_str = str(getattr(snap, "cache_culprit_summary", "") or "").strip()
         culprit_sid = culprit_summary_str.split(" ", 1)[0].strip().lower() if culprit_summary_str else ""
@@ -3481,6 +4491,7 @@ class AntigravityCapsuleApp:
                 carry_ids = {c.conversation_id for c in carry_raw}
                 convs = carry_raw + [c for c in convs if c.conversation_id not in carry_ids]
 
+        matched_total = max(matched_total, len(convs))
         convs = convs[:len(self._conv_rows)]
 
         # Build lightweight structural signature so unchanged 2.5s polls skip tearing down & redrawing 48 canvases
@@ -3548,6 +4559,7 @@ class AntigravityCapsuleApp:
             snap.history_range,
             snap.is_custom_account_view,
             culprit_summary_str,
+            matched_total,
             tuple(bar_sig_rows),
         )
         if bar_sig == self._last_conv_bars_sig:
@@ -3563,6 +4575,7 @@ class AntigravityCapsuleApp:
             for row_ui in self._conv_rows:
                 for key in all_keys:
                     row_ui[key].grid_remove()
+            self._lbl_convs_trunc.grid_remove()
             scope_t = snap.history_range_label if (snap.is_custom_account_view or snap.history_range != "30m") else "近期"
             empty_msg = {
                 "main": f"暂无{scope_t}活跃主对话",
@@ -3574,7 +4587,7 @@ class AntigravityCapsuleApp:
             self._convs_table.update_idletasks()
             empty_h = max(28, int(self._convs_table.winfo_reqheight()))
             empty_w = max(1, int(self._convs_table.winfo_reqwidth()))
-            self._conv_viewport.configure(height=empty_h)
+            self._conv_viewport.configure(width=360, height=empty_h)
             self._conv_scrollbar.configure(height=empty_h)
             self._conv_viewport.yview_moveto(0.0)
             self._conv_viewport.configure(scrollregion=(0, 0, empty_w, empty_h))
@@ -3761,17 +4774,28 @@ class AntigravityCapsuleApp:
                     top_y = bar_bot - int(round((bar_bot - bar_top) * h_ratio))
                     c.create_rectangle(x0, top_y, x1, bar_bot, fill=col, outline="")
 
+        trunc_visible = bool(matched_total > len(convs))
+        if trunc_visible:
+            self._lbl_convs_trunc.configure(
+                text=f"已显示最新 {len(convs)} / {matched_total} 条对话（可切换筛选分类或缩短时间范围查看其余对话）"
+            )
+            self._lbl_convs_trunc.grid(row=len(convs), column=0, columnspan=9, sticky="w", pady=(2, 4))
+        else:
+            self._lbl_convs_trunc.grid_remove()
+
         self._convs_table.update_idletasks()
         table_h = self._convs_table.winfo_reqheight()
         if convs:
-            measured_row = max(20, int(round(table_h / float(len(convs)))))
+            denom = float(len(convs) + (1 if trunc_visible else 0))
+            measured_row = max(20, int(round(table_h / denom)))
             self._conv_row_px = measured_row
-        if len(convs) <= self._conv_list_rows:
+        if len(convs) <= self._conv_list_rows and not trunc_visible:
             vp_h = max(28, table_h)
             self._conv_viewport.yview_moveto(0.0)
         else:
             vp_h = max(28, self._conv_list_rows * self._conv_row_px)
-        self._conv_viewport.configure(height=vp_h)
+        table_w = max(360, min(840, int(self._convs_table.winfo_reqwidth())))
+        self._conv_viewport.configure(width=table_w, height=vp_h)
         self._conv_scrollbar.configure(height=vp_h)
         self._update_conv_scrollregion()
 
@@ -3836,6 +4860,8 @@ class AntigravityCapsuleApp:
             self._detail_win.check_drag_watchdog()
         if self._slots_win is not None and not self._slots_win._closed:
             self._slots_win.check_drag_watchdog()
+        if self._settings_win is not None and not getattr(self._settings_win, "_closed", False):
+            self._settings_win.check_drag_watchdog()
         try:
             while True:
                 gen, snap = self._snapshot_queue.get_nowait()
@@ -3862,6 +4888,7 @@ class AntigravityCapsuleApp:
             callbacks={
                 "toggle_visible": self.toggle_visible,
                 "toggle_expand": self.toggle_expand,
+                "open_settings": self.open_settings_window,
                 "theme_midnight": lambda: self.set_theme("midnight_blue"),
                 "theme_obsidian": lambda: self.set_theme("obsidian_dark"),
                 "toggle_topmost": self.toggle_topmost,
@@ -3946,6 +4973,12 @@ class AntigravityCapsuleApp:
         if self._slots_win is not None:
             self._slots_win.close()
             self._slots_win = None
+        if self._settings_win is not None:
+            try:
+                self._settings_win.close()
+            except Exception:
+                pass
+            self._settings_win = None
         if self._details_win is not None:
             try:
                 self._details_win.destroy()

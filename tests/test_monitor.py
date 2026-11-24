@@ -589,7 +589,8 @@ class TestLogMonitorLogic(unittest.TestCase):
 
             summary = format_text_summary(snap2)
             self.assertIn("T1", summary)
-            self.assertIn("490.0K", summary)
+            # v7.3.0 true prefix-loss cold waste formula: min(prev_total, total) - cr = 110K + 115K + 120K + 125K = 470.0K
+            self.assertIn("470.0K", summary)
 
 
 class TestShortcutsAndIcons(unittest.TestCase):
@@ -1494,6 +1495,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             dw.close()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass
@@ -1788,6 +1794,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             dw.close()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass
@@ -2144,6 +2155,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             dw.close()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass
@@ -2756,6 +2772,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             sw.close()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass
@@ -6054,6 +6075,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
             dragger.cancel()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass
@@ -6777,6 +6803,11 @@ class TestShortcutsAndIcons(unittest.TestCase):
                 dragger.cancel()
         finally:
             try:
+                for aid in list(root.tk.splitlist(root.tk.call("after", "info"))):
+                    try:
+                        root.after_cancel(aid)
+                    except tk.TclError:
+                        pass
                 root.destroy()
             except tk.TclError:
                 pass

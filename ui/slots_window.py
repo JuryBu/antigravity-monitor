@@ -16,10 +16,11 @@ from core.slot_manager import (
     SlotInventorySnapshot,
     format_bytes_human,
 )
-from ui.window_drag import SmoothWindowDragger
+from ui.drag_proxy import LightweightProxyDragger, resolve_root_hwnd
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
+_VALID_SORT_MODES = ("time", "size", "steps")
 
 
 class ConversationSlotsWindow:
@@ -36,6 +37,7 @@ class ConversationSlotsWindow:
         get_protect_age_min: Callable[[], int],
         get_clean_mode: Callable[[], str],
         on_closed: Optional[Callable[[], None]] = None,
+        on_drag_state_changed: Optional[Callable[[bool], None]] = None,
         apply_rounding_fn: Optional[Callable[[int], None]] = None,
         screen_bounds_fn: Optional[Callable[[tk.Tk], Tuple[int, int, int, int]]] = None,
         async_refresh: bool = False,
@@ -49,14 +51,20 @@ class ConversationSlotsWindow:
         self._get_protect_age_min = get_protect_age_min
         self._get_clean_mode = get_clean_mode
         self._on_closed = on_closed
+        self._on_drag_state_changed = on_drag_state_changed
         self._apply_rounding_fn = apply_rounding_fn
         self._screen_bounds_fn = screen_bounds_fn
         self._async_refresh = bool(async_refresh)
         self._refresh_busy: bool = False
+        self._pending_refresh: bool = False
         self._last_summary_sig: Optional[Tuple[Any, ...]] = None
 
         self._snapshot: Optional[SlotInventorySnapshot] = None
         self._active_tab: str = "cleanable_sub"  # "cleanable_sub" | "protected_sub" | "main" | "unknown"
+        self._sort_mode: str = "time"  # "time" | "size" | "steps"
+        self._search_query: str = ""
+        self._search_after_id: Optional[str] = None
+        self._search_trace_id: Optional[str] = None
         self._cleaning_busy: bool = False
         self._closed: bool = False
         self._after_ids: List[str] = []
@@ -71,16 +79,20 @@ class ConversationSlotsWindow:
         self.win.overrideredirect(True)
         self.win.resizable(False, False)
         self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.97)
-        self.win.bind("<Escape>", lambda _e: self.close())
+        self.win.bind("<Escape>", self._on_escape_key)
         self.win.bind("<FocusOut>", self._on_focus_out)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
-        self._dragger: Optional[SmoothWindowDragger] = SmoothWindowDragger(
+        self._dragger: Optional[LightweightProxyDragger] = LightweightProxyDragger(
             self.win,
-            move_threshold=0,
+            move_threshold=3,
             on_drag_start=self._on_dragger_started,
             on_drag_end=self._on_dragger_ended,
             on_drag_cancel=self._on_dragger_cancelled,
+            size_provider=self._get_window_size,
+            theme_provider=lambda: self.theme,
+            title_provider=lambda: "500 槽位守护 · 本机对话分布",
+            header_height_provider=self._get_header_height,
+            screen_bounds_fn=self._screen_bounds_fn,
         )
 
         self._outer = tk.Frame(self.win, padx=1, pady=1)
@@ -90,6 +102,23 @@ class ConversationSlotsWindow:
 
         self._build_ui()
         self.apply_theme(theme)
+
+    def _get_window_size(self) -> Tuple[int, int]:
+        try:
+            w = int(self.win.winfo_width())
+            h = int(self.win.winfo_height())
+            if w > 100 and h > 100:
+                return (w, h)
+        except tk.TclError:
+            pass
+        try:
+            self.win.update_idletasks()
+            return (
+                max(840, int(self.win.winfo_reqwidth())),
+                max(480, int(self.win.winfo_reqheight())),
+            )
+        except tk.TclError:
+            return (840, 480)
 
     def _build_ui(self) -> None:
         # Header bar
@@ -138,7 +167,7 @@ class ConversationSlotsWindow:
             ls.pack(fill="x")
             self._kpi_cards.append({"card": card, "title": lt, "val": lv, "sub": ls})
 
-        # Tab bar + column header
+        # Tab bar + toolbar + fixed column header + scrollable table
         self._list_card = tk.Frame(self._surface, padx=8, pady=7, highlightthickness=1)
         self._list_card.pack(fill="both", expand=True, pady=(0, 8))
 
@@ -160,12 +189,64 @@ class ConversationSlotsWindow:
         self._lbl_policy_hint = tk.Label(self._tab_row, text="", font=(UI_FONT, 7), anchor="e")
         self._lbl_policy_hint.pack(side="right")
 
+        # Compact sort & search toolbar below tab bar
+        self._tool_row = tk.Frame(self._list_card)
+        self._tool_row.pack(fill="x", pady=(0, 5))
+
+        self._lbl_sort_prefix = tk.Label(self._tool_row, text="排序:", font=(UI_FONT, 8), anchor="w")
+        self._lbl_sort_prefix.pack(side="left", padx=(0, 4))
+        self._sort_btns: Dict[str, tk.Label] = {}
+        for skey, slbl in (("time", "时间"), ("size", "体积↓"), ("steps", "步数↓")):
+            sb = tk.Label(self._tool_row, text=slbl, font=(UI_FONT, 8), padx=6, pady=1, cursor="hand2")
+            sb.pack(side="left", padx=(0, 4))
+            sb.bind("<Button-1>", lambda _e, m=skey: self._set_sort_mode(m))
+            self._sort_btns[skey] = sb
+
+        self._search_wrap = tk.Frame(self._tool_row, highlightthickness=1, padx=4, pady=1)
+        self._search_wrap.pack(side="right")
+        self._lbl_search_icon = tk.Label(self._search_wrap, text="🔍", font=(UI_FONT, 8))
+        self._lbl_search_icon.pack(side="left", padx=(0, 3))
+        self._search_var = tk.StringVar(master=self.win, value="")
+        self._search_trace_id = self._search_var.trace_add("write", self._on_search_var_changed)
+        self._search_entry = tk.Entry(
+            self._search_wrap,
+            textvariable=self._search_var,
+            font=(UI_FONT, 8),
+            width=24,
+            bd=0,
+            highlightthickness=0,
+        )
+        self._search_entry.pack(side="left")
+        self._btn_clear_search = tk.Label(self._search_wrap, text="×", font=(UI_FONT, 9, "bold"), padx=4, cursor="hand2")
+        self._btn_clear_search.pack(side="left", padx=(2, 0))
+        self._btn_clear_search.bind("<Button-1>", lambda _e: self._clear_search())
+
+        # Fixed table column header
+        self._hdr_row = tk.Frame(self._list_card, pady=3)
+        self._hdr_row.pack(fill="x", pady=(0, 2))
+        self._hdr_row.grid_columnconfigure(1, weight=1)
+        self._col_hdr_lbls: List[tk.Label] = []
+        hdr_specs = (
+            (0, "ID", "w", 8, (6, 6)),
+            (1, "对话名称", "w", 0, (0, 8)),
+            (2, "步数", "e", 6, (0, 8)),
+            (3, "体积 · 最近活跃", "e", 19, (0, 8)),
+            (4, "状态", "e", 18, (0, 17)),
+        )
+        for col_i, col_txt, anc, col_w, pdx in hdr_specs:
+            kw: Dict[str, Any] = {"text": col_txt, "font": (UI_FONT, 7, "bold"), "anchor": anc}
+            if col_w > 0:
+                kw["width"] = col_w
+            hl = tk.Label(self._hdr_row, **kw)
+            hl.grid(row=0, column=col_i, sticky="w" if anc == "w" else "e", padx=pdx)
+            self._col_hdr_lbls.append(hl)
+
         # Scrollable rows viewport
         self._vp_wrap = tk.Frame(self._list_card)
         self._vp_wrap.pack(fill="both", expand=True)
-        self._viewport = tk.Canvas(self._vp_wrap, width=760, height=255, highlightthickness=0, bd=0)
+        self._viewport = tk.Canvas(self._vp_wrap, width=760, height=245, highlightthickness=0, bd=0)
         self._viewport.pack(side="left", fill="both", expand=True)
-        self._scrollbar = tk.Canvas(self._vp_wrap, width=7, height=255, highlightthickness=0, bd=0, cursor="hand2")
+        self._scrollbar = tk.Canvas(self._vp_wrap, width=7, height=245, highlightthickness=0, bd=0, cursor="hand2")
         self._scrollbar.pack(side="right", fill="y", padx=(4, 0))
         self._scrollbar.bind("<ButtonPress-1>", self._on_scrollbar_press)
         self._scrollbar.bind("<B1-Motion>", self._on_scrollbar_drag)
@@ -185,7 +266,12 @@ class ConversationSlotsWindow:
         # Status strip
         self._status_box = tk.Frame(self._surface, padx=8, pady=5, highlightthickness=1)
         self._status_box.pack(fill="x", pady=(0, 8))
-        self._lbl_status = tk.Label(self._status_box, text="纯只读盘点就绪 · 仅在显式触发或自动让位开启时安全清理超期已结束子代理", font=(UI_FONT, 8), anchor="w")
+        self._lbl_status = tk.Label(
+            self._status_box,
+            text="纯只读盘点就绪 · 仅在显式触发或自动让位开启时安全清理超期已结束子代理",
+            font=(UI_FONT, 8),
+            anchor="w",
+        )
         self._lbl_status.pack(fill="x")
 
         # Bottom action buttons
@@ -199,7 +285,15 @@ class ConversationSlotsWindow:
         ]
         for idx, (k, txt, cmd) in enumerate(actions):
             self._act_row.grid_columnconfigure(idx, weight=2 if k == "clean" else 1, uniform="sact")
-            btn = tk.Label(self._act_row, text=txt, font=(UI_FONT, 8, "bold" if k == "clean" else "normal"), padx=8, pady=5, cursor="hand2", highlightthickness=1)
+            btn = tk.Label(
+                self._act_row,
+                text=txt,
+                font=(UI_FONT, 8, "bold" if k == "clean" else "normal"),
+                padx=8,
+                pady=5,
+                cursor="hand2",
+                highlightthickness=1,
+            )
             btn.grid(row=0, column=idx, sticky="ew", padx=(0 if idx == 0 else 4, 0 if idx == 2 else 4))
             btn.bind("<Button-1>", lambda _e, fn=cmd: fn())
             btn.bind("<Enter>", lambda _e, b=btn: b.configure(bg=self.theme["btn_hover"]))
@@ -226,6 +320,21 @@ class ConversationSlotsWindow:
         self._list_card.configure(bg=t["card_bg"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
         self._tab_row.configure(bg=t["card_bg"])
         self._lbl_policy_hint.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._tool_row.configure(bg=t["card_bg"])
+        self._lbl_sort_prefix.configure(bg=t["card_bg"], fg=t["text_muted"])
+        self._search_wrap.configure(bg=t["card_alt_bg"], highlightbackground=t["border_soft"], highlightcolor=t["cyan"])
+        self._lbl_search_icon.configure(bg=t["card_alt_bg"], fg=t["text_muted"])
+        self._search_entry.configure(
+            bg=t["card_alt_bg"],
+            fg=t["text_primary"],
+            insertbackground=t["cyan"],
+            selectbackground=t["btn_active"],
+            selectforeground=t["text_primary"],
+        )
+        self._btn_clear_search.configure(bg=t["card_alt_bg"], fg=t["text_muted"])
+        self._hdr_row.configure(bg=t["card_bg"])
+        for hl in self._col_hdr_lbls:
+            hl.configure(bg=t["card_bg"], fg=t["text_muted"])
         self._vp_wrap.configure(bg=t["card_bg"])
         self._viewport.configure(bg=t["card_alt_bg"])
         self._scrollbar.configure(bg=t["card_bg"])
@@ -237,6 +346,7 @@ class ConversationSlotsWindow:
             btn.configure(bg=t["btn_bg"], fg=t["btn_text"], highlightbackground=t["border_soft"], highlightcolor=t["border_soft"])
         self._sync_auto_button()
         self._refresh_tab_buttons()
+        self._refresh_sort_buttons()
         if self._snapshot is not None:
             self._render_snapshot()
 
@@ -244,7 +354,7 @@ class ConversationSlotsWindow:
         if self._closed:
             return
         if self._dragger is not None:
-            self._dragger.finish_or_cancel(commit=self._dragger.moved)
+            self._dragger.finish_or_cancel(commit=self._dragger.moved, force=True)
         self.win.deiconify()
         self.win.lift()
         self.refresh()
@@ -253,9 +363,25 @@ class ConversationSlotsWindow:
             self._place_window()
         if self._apply_rounding_fn is not None:
             try:
-                self._apply_rounding_fn(int(self.win.winfo_id()))
+                self._apply_rounding_fn(resolve_root_hwnd(self.win))
             except Exception:
                 pass
+        if self._dragger is not None and not getattr(self._dragger, "_proxy_warmed", False):
+            try:
+                aid = self.win.after(40, self._warm_up_drag_proxy)
+                self._after_ids.append(aid)
+            except tk.TclError:
+                pass
+
+    def _warm_up_drag_proxy(self) -> None:
+        if not self._closed and self._dragger is not None:
+            self._dragger.warm_up()
+
+    def _get_header_height(self) -> int:
+        try:
+            return max(24, int(self._hdr.winfo_height()))
+        except tk.TclError:
+            return 28
 
     def _place_window(self) -> None:
         self.win.update_idletasks()
@@ -277,9 +403,24 @@ class ConversationSlotsWindow:
         y = max(vy + 12, min(vb - h - 48, py))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _on_focus_out(self, _event: tk.Event) -> None:
-        if self._dragger is not None:
-            self._dragger.finish_or_cancel(commit=self._dragger.moved)
+    def _on_escape_key(self, _event: tk.Event) -> Optional[str]:
+        if self._search_var.get().strip():
+            self._clear_search()
+            return "break"
+        self.close()
+        return "break"
+
+    def _on_focus_out(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self.win:
+            return
+        if self._dragger is None or self._dragger.proxy_swapping:
+            return
+        try:
+            if self.win.focus_displayof() is not None:
+                return
+        except tk.TclError:
+            pass
+        self._dragger.finish_or_cancel(commit=self._dragger.moved)
 
     def _on_drag_start(self, event: tk.Event) -> None:
         if self._dragger is not None:
@@ -293,21 +434,31 @@ class ConversationSlotsWindow:
         if self._dragger is not None:
             self._dragger.on_end(event)
 
+    def _notify_drag_state(self, active: bool) -> None:
+        if self._on_drag_state_changed is not None:
+            try:
+                self._on_drag_state_changed(bool(active))
+            except Exception:
+                pass
+
     def _on_dragger_started(self) -> None:
         self._dragging = True
+        self._notify_drag_state(True)
 
     def _flush_pending_sync(self) -> None:
+        was_dragging = self._dragging
         self._dragging = False
         pending_loaded = self._pending_loaded_snapshot
         self._pending_loaded_snapshot = None
         pending_summary = self._pending_sync_summary
         self._pending_sync_summary = None
-        if self._closed:
-            return
-        if pending_loaded is not None:
-            self._apply_loaded_snapshot(pending_loaded)
-        if pending_summary is not None:
-            self.sync_from_summary(pending_summary)
+        if not self._closed:
+            if pending_loaded is not None:
+                self._apply_loaded_snapshot(pending_loaded)
+            if pending_summary is not None:
+                self.sync_from_summary(pending_summary)
+        if was_dragging:
+            self._notify_drag_state(False)
 
     def _on_dragger_ended(self, _moved: bool) -> None:
         self._flush_pending_sync()
@@ -338,6 +489,65 @@ class ConversationSlotsWindow:
         self._viewport.yview_moveto(0.0)
         self._refresh_tab_buttons()
         self._render_table()
+
+    def _set_sort_mode(self, mode: str) -> None:
+        if mode not in _VALID_SORT_MODES:
+            return
+        self._sort_mode = mode
+        self._viewport.yview_moveto(0.0)
+        self._refresh_sort_buttons()
+        self._render_table()
+
+    def _refresh_sort_buttons(self) -> None:
+        t = self.theme
+        for k, btn in self._sort_btns.items():
+            active = k == self._sort_mode
+            btn.configure(
+                bg=t["btn_hover"] if active else t["card_alt_bg"],
+                fg=t["cyan"] if active else t["text_muted"],
+                font=(UI_FONT, 8, "bold") if active else (UI_FONT, 8),
+            )
+
+    def _cancel_search_debounce(self) -> None:
+        if self._search_after_id is not None:
+            aid = self._search_after_id
+            self._search_after_id = None
+            try:
+                self.win.after_cancel(aid)
+            except tk.TclError:
+                pass
+
+    def _on_search_var_changed(self, *_args: Any) -> None:
+        if self._closed:
+            return
+        self._cancel_search_debounce()
+        try:
+            self._search_after_id = self.win.after(120, self._apply_search_filter)
+        except tk.TclError:
+            self._search_after_id = None
+
+    def _apply_search_filter(self) -> None:
+        self._search_after_id = None
+        if self._closed:
+            return
+        new_q = self._search_var.get().strip().lower()
+        if new_q == self._search_query:
+            return
+        self._search_query = new_q
+        self._viewport.yview_moveto(0.0)
+        self._render_table()
+
+    def _clear_search(self) -> None:
+        if self._closed:
+            return
+        self._cancel_search_debounce()
+        if self._search_var.get():
+            self._search_var.set("")
+            self._cancel_search_debounce()
+        if self._search_query != "":
+            self._search_query = ""
+            self._viewport.yview_moveto(0.0)
+            self._render_table()
 
     def _refresh_tab_buttons(self) -> None:
         t = self.theme
@@ -403,8 +613,10 @@ class ConversationSlotsWindow:
             self._apply_loaded_snapshot(loader())
             return
         if self._refresh_busy:
+            self._pending_refresh = True
             return
         self._refresh_busy = True
+        self._pending_refresh = False
         if self._snapshot is None:
             self.set_status_message("正在后台盘点本机对话目录与磁盘占用…", "text_secondary")
 
@@ -419,17 +631,25 @@ class ConversationSlotsWindow:
             def _apply() -> None:
                 self._refresh_busy = False
                 if self._closed:
+                    self._pending_refresh = False
                     return
                 if loaded is not None:
                     self._apply_loaded_snapshot(loaded)
                 elif err:
                     self.set_status_message(f"盘点失败: {err}", "red")
+                if self._pending_refresh and not self._closed:
+                    self._pending_refresh = False
+                    self.refresh()
 
             try:
                 if not self._closed:
                     self.win.after(0, _apply)
+                else:
+                    self._refresh_busy = False
+                    self._pending_refresh = False
             except (tk.TclError, RuntimeError):
                 self._refresh_busy = False
+                self._pending_refresh = False
 
         threading.Thread(target=_bg_load, name="SlotsInventoryLoadThread", daemon=True).start()
 
@@ -518,7 +738,36 @@ class ConversationSlotsWindow:
                         fg=t["text_secondary"],
                     )
         self._refresh_tab_buttons()
+        self._refresh_sort_buttons()
         self._render_table()
+
+    def _get_filtered_sorted_rows(self) -> List[SlotConversationItem]:
+        snap = self._snapshot
+        if snap is None:
+            return []
+        rows = [it for it in snap.items if it.category == self._active_tab]
+        q = self._search_query
+        if q:
+            rows = [
+                it
+                for it in rows
+                if (
+                    q in (it.title or "").lower()
+                    or q in (it.short_id or "").lower()
+                    or q in (it.agent_name or "").lower()
+                    or q in (it.conversation_id or "").lower()
+                )
+            ]
+        if self._sort_mode == "size":
+            rows.sort(key=lambda x: (int(x.disk_bytes), float(x.last_active_ts)), reverse=True)
+        elif self._sort_mode == "steps":
+            rows.sort(key=lambda x: (int(x.step_count), int(x.disk_bytes)), reverse=True)
+        else:
+            if self._active_tab == "cleanable_sub":
+                rows.sort(key=lambda x: x.last_active_ts)
+            else:
+                rows.sort(key=lambda x: x.last_active_ts, reverse=True)
+        return rows
 
     def _render_table(self) -> None:
         t = self.theme
@@ -527,24 +776,21 @@ class ConversationSlotsWindow:
         snap = self._snapshot
         if snap is None:
             return
-        rows = [it for it in snap.items if it.category == self._active_tab]
+        rows = self._get_filtered_sorted_rows()
         if not rows:
-            empty_txt = {
-                "cleanable_sub": "当前没有超过保护期的已结束子代理，槽位很干净",
-                "protected_sub": "当前没有运行中或保护期内的子代理",
-                "main": "当前未检测到本地主对话 .db 文件",
-                "unknown": "无未登记的未知 .db 文件（全部已在摘要库核验）",
-            }.get(self._active_tab, "暂无记录")
+            if self._search_query:
+                empty_txt = f"未找到匹配「{self._search_query}」的对话，可点击 × 清空搜索条件"
+            else:
+                empty_txt = {
+                    "cleanable_sub": "当前没有超过保护期的已结束子代理，槽位很干净",
+                    "protected_sub": "当前没有运行中或保护期内的子代理",
+                    "main": "当前未检测到本地主对话 .db 文件",
+                    "unknown": "无未登记的未知 .db 文件（全部已在摘要库核验）",
+                }.get(self._active_tab, "暂无记录")
             lbl = tk.Label(self._table, text=empty_txt, font=(UI_FONT, 8), bg=t["card_alt_bg"], fg=t["text_muted"], padx=8, pady=12, anchor="w")
             lbl.grid(row=0, column=0, columnspan=5, sticky="w")
             self._update_scrollregion()
             return
-
-        # Display up to 160 newest/oldest rows cleanly (cleanable shows oldest first; others newest first)
-        if self._active_tab == "cleanable_sub":
-            rows.sort(key=lambda x: x.last_active_ts)
-        else:
-            rows.sort(key=lambda x: x.last_active_ts, reverse=True)
 
         shown = rows[:160]
         now = snap.observed_at
@@ -564,11 +810,11 @@ class ConversationSlotsWindow:
                 else (t["cyan"] if it.category == "main" else (t["orange"] if it.category == "unknown" else t["text_secondary"]))
             )
             bg = t["card_alt_bg"]
-            tk.Label(self._table, text=it.short_id, font=(MONO_FONT, 8, "bold"), bg=bg, fg=t["text_primary"], anchor="w").grid(row=idx, column=0, sticky="w", padx=(6, 6), pady=2)
+            tk.Label(self._table, text=it.short_id, font=(MONO_FONT, 8, "bold"), bg=bg, fg=t["text_primary"], anchor="w", width=8).grid(row=idx, column=0, sticky="w", padx=(6, 6), pady=2)
             tk.Label(self._table, text=name, font=(UI_FONT, 8), bg=bg, fg=t["text_primary"], anchor="w").grid(row=idx, column=1, sticky="w", padx=(0, 8), pady=2)
             tk.Label(self._table, text=f"{it.step_count}步" if it.step_count > 0 else "—", font=(MONO_FONT, 8), bg=bg, fg=t["text_muted"], anchor="e", width=6).grid(row=idx, column=2, sticky="e", padx=(0, 8), pady=2)
-            tk.Label(self._table, text=f"{sz_s:>8} · {age_s}", font=(MONO_FONT, 8), bg=bg, fg=t["text_secondary"], anchor="e").grid(row=idx, column=3, sticky="e", padx=(0, 8), pady=2)
-            tk.Label(self._table, text=st_s, font=(UI_FONT, 8), bg=bg, fg=st_col, anchor="e").grid(row=idx, column=4, sticky="e", padx=(0, 6), pady=2)
+            tk.Label(self._table, text=f"{sz_s:>8} · {age_s}", font=(MONO_FONT, 8), bg=bg, fg=t["text_secondary"], anchor="e", width=19).grid(row=idx, column=3, sticky="e", padx=(0, 8), pady=2)
+            tk.Label(self._table, text=st_s, font=(UI_FONT, 8), bg=bg, fg=st_col, anchor="e", width=18).grid(row=idx, column=4, sticky="e", padx=(0, 6), pady=2)
 
         if len(rows) > len(shown):
             tk.Label(
@@ -583,6 +829,25 @@ class ConversationSlotsWindow:
         for child in self._table.winfo_children():
             child.bind("<MouseWheel>", self._on_mousewheel)
         self._update_scrollregion()
+
+    def _format_cleanup_done_message(self, res: SlotCleanupResult) -> Tuple[str, str]:
+        if res.error:
+            return (f"清理中止: {res.error}", "red")
+        skip_parts: List[str] = []
+        rec_unavail = int(getattr(res, "skipped_recycle_unavailable_count", 0) or 0)
+        if rec_unavail > 0:
+            skip_parts.append(f"回收站不可用跳过 {rec_unavail} 条（可在设置切换为归档模式）")
+        if res.skipped_locked_count:
+            skip_parts.append(f"文件占用跳过 {res.skipped_locked_count} 条")
+        if res.skipped_changed_count:
+            skip_parts.append(f"变动跳过 {res.skipped_changed_count} 条")
+        skip_part = f"（{'；'.join(skip_parts)}）" if skip_parts else ""
+        msg = (
+            f"已完成清理：移出 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，"
+            f"当前剩余 {res.remaining_db_count} 槽{skip_part}"
+        )
+        col_key = "orange" if (rec_unavail > 0 and res.removed_count == 0) else "green"
+        return (msg, col_key)
 
     def _handle_clean_click(self) -> None:
         if self._closed or self._cleaning_busy:
@@ -605,7 +870,7 @@ class ConversationSlotsWindow:
             ),
             parent=self.win,
         )
-        if not ok:
+        if not ok or self._closed:
             return
         self._cleaning_busy = True
         self._act_btns["clean"].configure(text="清理中，请稍候…", fg=self.theme["orange"])
@@ -615,16 +880,8 @@ class ConversationSlotsWindow:
             if self._closed:
                 return
             self._cleaning_busy = False
-            if res.error:
-                self._lbl_status.configure(text=f"清理中止: {res.error}", fg=self.theme["red"])
-            else:
-                skip_part = ""
-                if res.skipped_locked_count or res.skipped_changed_count:
-                    skip_part = f"（跳过占用 {res.skipped_locked_count} / 变动 {res.skipped_changed_count}）"
-                self._lbl_status.configure(
-                    text=f"已完成清理：移出 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，当前剩余 {res.remaining_db_count} 槽{skip_part}",
-                    fg=self.theme["green"],
-                )
+            msg, col_key = self._format_cleanup_done_message(res)
+            self._lbl_status.configure(text=msg, fg=self.theme.get(col_key, self.theme["green"]))
             self.refresh()
 
         self._on_clean_now(_on_done)
@@ -689,26 +946,31 @@ class ConversationSlotsWindow:
         if self._closed:
             return
         self._closed = True
+        was_dragging = self._dragging
         self._dragging = False
         self._snapshot = None
         self._pending_sync_summary = None
         self._pending_loaded_snapshot = None
         self._last_summary_sig = None
+        self._cancel_search_debounce()
+        if self._search_trace_id is not None:
+            try:
+                self._search_var.trace_remove("write", self._search_trace_id)
+            except tk.TclError:
+                pass
+            self._search_trace_id = None
         dragger = self._dragger
         self._dragger = None
         if dragger is not None:
-            dragger.cancel()
-            dragger._on_drag_start = None
-            dragger._on_drag_end = None
-            dragger._on_drag_cancel = None
-            dragger._size_provider = None
-            dragger._win = None  # type: ignore[assignment]
+            dragger.destroy_proxy()
         for aid in list(self._after_ids):
             try:
                 self.win.after_cancel(aid)
             except tk.TclError:
                 pass
         self._after_ids.clear()
+        if was_dragging:
+            self._notify_drag_state(False)
         try:
             for child in self._table.winfo_children():
                 child.destroy()
@@ -721,6 +983,8 @@ class ConversationSlotsWindow:
                 pass
         self._kpi_cards.clear()
         self._tab_btns.clear()
+        self._sort_btns.clear()
+        self._col_hdr_lbls.clear()
         self._act_btns.clear()
         try:
             self.win.destroy()
@@ -736,6 +1000,7 @@ class ConversationSlotsWindow:
         self._get_clean_mode = None  # type: ignore[assignment]
         self._apply_rounding_fn = None
         self._screen_bounds_fn = None
+        self._on_drag_state_changed = None
         if cb is not None:
             try:
                 cb()

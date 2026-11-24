@@ -38,6 +38,18 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 _DATACLASS_SLOTS: Dict[str, Any] = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 from core.account_ledger import AccountSwitchLedger, _mask_short
+try:
+    from core.account_ledger import normalize_account_tier as _ledger_normalize_account_tier
+except ImportError:
+    _ledger_normalize_account_tier = None  # type: ignore[assignment]
+try:
+    from core.adaptive_steps import (
+        AdaptiveStepsResult,
+        compute_adaptive_steps_v2 as _imported_compute_adaptive_steps_v2,
+    )
+except ImportError:
+    AdaptiveStepsResult = None  # type: ignore[assignment,misc]
+    _imported_compute_adaptive_steps_v2 = None  # type: ignore[assignment]
 from core.config_store import DEFAULT_CONFIG, sanitize_config
 from core.slot_manager import (
     MIN_PROTECT_AGE_MIN,
@@ -152,12 +164,67 @@ def is_severe_freshness_invalid(reason: str, consec_miss: int = 0) -> bool:
     return False
 
 
-def _pick_preferred_deg_at(a: Optional[int], b: Optional[int]) -> Optional[int]:
-    """Pick the most informative degradation step load: prefer smallest high-load (>=400), else smallest cold-start."""
+def _normalize_tier_norm(raw_tier: str) -> str:
+    if _ledger_normalize_account_tier is not None:
+        return _ledger_normalize_account_tier(raw_tier)
+    low = (raw_tier or "").strip().lower()
+    if not low:
+        return ""
+    if "ultra" in low:
+        return "ultra"
+    if "pro" in low:
+        return "pro"
+    if "free" in low:
+        return "free"
+    return ""
+
+
+def _get_compute_adaptive_steps_v2() -> Optional[Callable[..., Any]]:
+    global _imported_compute_adaptive_steps_v2, AdaptiveStepsResult
+    if _imported_compute_adaptive_steps_v2 is not None:
+        return _imported_compute_adaptive_steps_v2
+    try:
+        from core.adaptive_steps import (
+            AdaptiveStepsResult as _asr,
+            compute_adaptive_steps_v2 as _fn,
+        )
+        AdaptiveStepsResult = _asr
+        _imported_compute_adaptive_steps_v2 = _fn
+        return _fn
+    except ImportError:
+        return None
+
+
+_DEG_KIND_RANK: Dict[str, int] = {
+    "": 0,
+    "t1_single": 1,
+    "t1_multi": 2,
+    "t2": 3,
+    "t3": 4,
+}
+
+
+def _pick_more_severe_deg_kind(a: str, b: str) -> str:
+    ka = a if a in _DEG_KIND_RANK else ""
+    kb = b if b in _DEG_KIND_RANK else ""
+    return ka if _DEG_KIND_RANK[ka] >= _DEG_KIND_RANK[kb] else kb
+
+
+def _tier_deg_min(tier_norm: str) -> int:
+    if tier_norm == "pro":
+        return 50
+    if tier_norm == "free":
+        return 30
+    return 400
+
+
+def _pick_preferred_deg_at(a: Optional[int], b: Optional[int], deg_min: int = 400) -> Optional[int]:
+    """Pick the most informative degradation step load: prefer smallest high-load (>=deg_min), else smallest cold-start."""
     vals = [int(v) for v in (a, b) if v is not None and int(v) > 0]
     if not vals:
         return None
-    high = [v for v in vals if v >= 400]
+    dm = max(1, int(deg_min or 400))
+    high = [v for v in vals if v >= dm]
     return min(high) if high else min(vals)
 
 
@@ -417,6 +484,10 @@ IGNORED_LOG_SOURCES = (
 NON_INFERENCE_RPC_MARKERS = (
     "recordtrajectoryanalytics",
     "recording trajectory segment analytics",
+    "writetrajectoryacls",
+    "readtrajectoryacls",
+    "trajectoryacls",
+    "conversationgrants",
     "listexperiments",
     "fetchconfig",
     "loadcodeassist",
@@ -465,7 +536,12 @@ MODEL_ENUM_FALLBACK_MAP: Dict[str, str] = {
     "MODEL_PLACEHOLDER_M320": "Gemini 3.8 Flash (Low)",
     "MODEL_PLACEHOLDER_M26": "Claude Opus 4.6 (Thinking)",
     "MODEL_PLACEHOLDER_M35": "Claude Sonnet 4.6 (Thinking)",
+    "MODEL_PLACEHOLDER_M400": "Claude Opus 5.5 (Low)",
+    "MODEL_PLACEHOLDER_M401": "Claude Opus 5.5 (Medium)",
     "MODEL_PLACEHOLDER_M402": "Claude Opus 5.5 (High)",
+    "MODEL_PLACEHOLDER_M403": "Claude Sonnet 5.5 (Low)",
+    "MODEL_PLACEHOLDER_M404": "Claude Sonnet 5.5 (Medium)",
+    "MODEL_PLACEHOLDER_M405": "Claude Sonnet 5.5 (High)",
     "MODEL_OPENAI_GPT_OSS_120B_MEDIUM": "GPT-OSS 120B (Medium)",
 }
 
@@ -622,6 +698,170 @@ def resolve_model_label(raw: str, enum_map: Optional[Dict[str, str]] = None) -> 
     return clean
 
 
+def normalize_model_compare_key(
+    raw: str,
+    enum_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """将枚举/显示名/slug 归一为统一小写比较键（空串返 ""），防同模型不同写法误判切模。"""
+    resolved = resolve_model_label(raw, enum_map=enum_map)
+    if not resolved:
+        return ""
+    norm = _NORM_MODEL_RE.sub("-", resolved.strip().lower()).strip("-")
+    if "hydrogen-tiered-" in norm:
+        norm = norm.replace("hydrogen-tiered-", "hydrogen-")
+    return norm
+
+
+@dataclass(frozen=True, **_DATACLASS_SLOTS)
+class ModelSpeedThresholds:
+    family: str                  # "carbon" | "neon" | "light" | "3p" | "default"
+    slow_tps: float
+    slow_ttft: float
+    full_speed_tps: float
+    t2_deg_median: float
+    t2_healthy_median: float
+    t2_latest_spike: float
+    t2_extreme_spike: float
+
+
+def classify_speed_model_family(
+    model_name: str,
+    enum_map: Optional[Dict[str, str]] = None,
+) -> str:
+    low = resolve_model_label(model_name, enum_map=enum_map).lower() if model_name else ""
+    if not low:
+        return "default"
+    if "carbon" in low:
+        return "carbon"
+    if "neon" in low or "argon" in low:
+        return "neon"
+    if "hydrogen" in low or "flash" in low:
+        return "light"
+    if any(k in low for k in ("claude", "opus", "sonnet", "fable", "gpt")):
+        return "3p"
+    return "default"
+
+
+def resolve_model_speed_thresholds(
+    model_name: str,
+    cfg_slow_tps: float = 40.0,
+    cfg_slow_ttft: float = 45.0,
+    enum_map: Optional[Dict[str, str]] = None,
+) -> ModelSpeedThresholds:
+    fam = classify_speed_model_family(model_name, enum_map=enum_map)
+    c_tps = max(5.0, float(cfg_slow_tps or 40.0))
+    c_ttft = max(10.0, float(cfg_slow_ttft or 45.0))
+    if fam == "carbon":
+        s_tps = max(25.0, round(c_tps * 0.875, 2))
+        s_ttft = max(55.0, round(c_ttft * (60.0 / 45.0), 2))
+        fs_tps = max(70.0, round(s_tps * 2.0, 2))
+        base_deg, base_ok, base_spk, base_ext = 60.0, 40.0, 75.0, 180.0
+    elif fam == "light":
+        s_tps = max(60.0, round(c_tps * 1.75, 2))
+        s_ttft = min(c_ttft, max(25.0, round(c_ttft * (35.0 / 45.0), 2)))
+        fs_tps = max(120.0, round(s_tps * 1.8, 2))
+        base_deg, base_ok, base_spk, base_ext = 35.0, 25.0, 50.0, 120.0
+    elif fam == "3p":
+        s_tps = max(20.0, round(c_tps * 0.625, 2))
+        s_ttft = c_ttft
+        fs_tps = max(55.0, round(s_tps * 2.0, 2))
+        base_deg, base_ok, base_spk, base_ext = 45.0, 30.0, 60.0, 150.0
+    else:  # "neon" | "default"
+        s_tps = c_tps
+        s_ttft = c_ttft
+        fs_tps = max(80.0, round(s_tps * 2.0, 2))
+        base_deg, base_ok, base_spk, base_ext = 45.0, 30.0, 60.0, 150.0
+
+    scale = c_ttft / 45.0
+
+    def _clamp_t2(val: float) -> float:
+        return round(max(20.0, min(300.0, val)), 2)
+
+    extreme = _clamp_t2(base_ext * scale)
+    spike = _clamp_t2(base_spk * scale)
+    deg_med = _clamp_t2(base_deg * scale)
+    ok_med = _clamp_t2(base_ok * scale)
+    # 强制严格保序 ok_med < deg_med < spike < extreme（同时保持在 [20, 300] 区间内）
+    if spike >= extreme:
+        spike = round(extreme - 15.0, 2)
+    if deg_med >= spike:
+        deg_med = round(spike - 10.0, 2)
+    if ok_med >= deg_med:
+        ok_med = round(deg_med - 5.0, 2)
+    if ok_med < 20.0:
+        ok_med = 20.0
+    if deg_med <= ok_med:
+        deg_med = round(ok_med + 5.0, 2)
+    if spike <= deg_med:
+        spike = round(deg_med + 10.0, 2)
+    if extreme <= spike:
+        extreme = round(spike + 15.0, 2)
+
+    return ModelSpeedThresholds(
+        family=fam,
+        slow_tps=s_tps,
+        slow_ttft=s_ttft,
+        full_speed_tps=fs_tps,
+        t2_deg_median=deg_med,
+        t2_healthy_median=ok_med,
+        t2_latest_spike=spike,
+        t2_extreme_spike=extreme,
+    )
+
+
+FRESHNESS_RESCUE_WINDOW_SEC: int = 90  # 临界抢救窗: 0s 到 -90s
+
+
+def resolve_model_freshness_window_sec(
+    model_name: str,
+    base_window_sec: int = 210,
+) -> int:
+    """按真机实测缓存衰减率返回分模型安全保鲜窗（Carbon 180s / Neon&3P 240s / Hydrogen&默认 210s）。"""
+    base = max(60, min(900, int(base_window_sec or 210)))
+    fam = classify_speed_model_family(model_name)
+    if fam == "carbon":
+        val = int(round(base * (180.0 / 210.0)))
+    elif fam in ("neon", "3p"):
+        val = int(round(base * (240.0 / 210.0)))
+    else:
+        val = base
+    return max(60, min(900, val))
+
+
+def _compute_freshness_zone(
+    remaining_sec: Optional[int],
+    invalid_reason: str = "",
+    rescue_window_sec: int = FRESHNESS_RESCUE_WINDOW_SEC,
+) -> str:
+    if invalid_reason:
+        return "invalid"
+    if remaining_sec is None:
+        return ""
+    rem = int(remaining_sec)
+    rescue_w = max(1, int(rescue_window_sec or FRESHNESS_RESCUE_WINDOW_SEC))
+    if rem > 60:
+        return "safe"
+    if rem > 0:
+        return "warn"
+    if rem >= -rescue_w:
+        return "rescue"
+    return "expired"
+
+
+def resolve_tier_display(tier_id: str) -> Tuple[str, str]:
+    """严格解析 userTier.id -> (tier_label, tier_short)。"""
+    low = (tier_id or "").strip().lower()
+    if not low:
+        return ("", "")
+    if "ultra" in low:
+        return ("Ultra", "[U]")
+    if "pro" in low:
+        return ("Pro", "[P]")
+    if "free" in low:
+        return ("Free", "[F]")
+    return ("", "")
+
+
 def format_model_name(raw: str, enum_map: Optional[Dict[str, str]] = None) -> str:
     resolved = resolve_model_label(raw, enum_map=enum_map)
     if not resolved:
@@ -691,6 +931,37 @@ def format_countdown(seconds: Optional[int]) -> str:
         return "已过期"
     mins, secs = divmod(int(seconds), 60)
     return f"{mins}:{secs:02d}"
+
+
+def format_freshness_status(
+    remaining_sec: Optional[int],
+    invalid_reason: str = "",
+    rescue_window_sec: int = FRESHNESS_RESCUE_WINDOW_SEC,
+    compact: bool = False,
+) -> Tuple[str, str]:
+    """返回 (大白话短文案, 语义色键 'green'|'orange'|'red'|'muted')。"""
+    if invalid_reason:
+        color = "red" if is_severe_freshness_invalid(invalid_reason) else "orange"
+        return ("已失效" if compact else invalid_reason, color)
+    if remaining_sec is None:
+        return ("闲置", "muted")
+    rem = int(remaining_sec)
+    rescue_w = max(1, int(rescue_window_sec or FRESHNESS_RESCUE_WINDOW_SEC))
+    if rem > 60:
+        return (f"剩 {format_countdown(rem)}", "green")
+    if rem > 0:
+        return (
+            f"快冷 {format_countdown(rem)}" if compact else f"即将冷却 剩 {format_countdown(rem)}",
+            "orange",
+        )
+    if rem >= -rescue_w:
+        rescue_left = max(0, rescue_w + rem)
+        left_str = format_countdown(rescue_left) if rescue_left > 0 else "0:00"
+        return (
+            f"抢救 {left_str}" if compact else f"临界抢救 剩 {left_str}",
+            "red",
+        )
+    return ("已冷却", "orange")
 
 
 def truncate_display_width(text: str, max_cols: int = 18) -> str:
@@ -1014,6 +1285,7 @@ class StepRecord:
     is_account_switch: bool = False
     active_media_count: int = 0
     active_media_bytes: int = 0
+    wasted_cold_tokens: int = 0
 
 
 @dataclass
@@ -1062,6 +1334,12 @@ class ConversationSummary:
     large_ctx_ttft_allowance_sec: float = 0.0
     tail_consec_hits_after_abnormal: int = 0
     last_abnormal_ts: float = 0.0
+    scoped_wasted_cold_tokens: int = 0
+    sustained_slow: bool = False
+    effective_slow_tps_th: float = 40.0
+    effective_slow_ttft_th: float = 45.0
+    freshness_window_sec: int = 210
+    freshness_zone: str = ""  # "" | "invalid" | "rescue" | "warn" | "safe" | "expired"
     _scoped_steps_all: List[StepRecord] = field(default_factory=list, repr=False, compare=False)
     _scoped_gens_all: List[Optional[Any]] = field(default_factory=list, repr=False, compare=False)
 
@@ -1173,6 +1451,16 @@ class QuotaPoolInfo:
     five_hour_reset_at: Optional[str] = None
     weekly_reset_at: Optional[str] = None
     model_count: int = 0
+    five_hour_fraction: Optional[float] = None
+    weekly_fraction: Optional[float] = None
+    five_hour_reset_in_sec: Optional[int] = None
+    weekly_reset_in_sec: Optional[int] = None
+    burn_pct_per_hour: Optional[float] = None
+    eta_exhaust_sec: Optional[int] = None
+    will_exhaust_before_reset: bool = False
+    weekly_burn_pct_per_hour: Optional[float] = None
+    weekly_eta_exhaust_sec: Optional[int] = None
+    weekly_pace_ratio: Optional[float] = None
 
 
 @dataclass
@@ -1189,6 +1477,14 @@ class AccountQuotaInfo:
     five_hour_reset_at: Optional[str] = None
     weekly_reset_at: Optional[str] = None
     pools: Dict[str, QuotaPoolInfo] = field(default_factory=dict)
+    tier_label: str = ""
+    tier_short: str = ""
+    five_hour_reset_in_sec: Optional[int] = None
+    weekly_reset_in_sec: Optional[int] = None
+    burn_pct_per_hour: Optional[float] = None
+    eta_exhaust_sec: Optional[int] = None
+    will_exhaust_before_reset: bool = False
+    weekly_pace_ratio: Optional[float] = None
 
 
 @dataclass
@@ -1290,6 +1586,211 @@ class MonitorSnapshot:
     primary_hit_is_revert: bool = False
     cache_culprit_summary: str = ""
     log_session_start_ts: float = 0.0
+    min_freshness_window_sec: int = 210
+    min_freshness_zone: str = ""
+    expiring_soon_count: int = 0
+    recent_events_by_cat: Dict[str, List[LogEvent]] = field(default_factory=dict)
+    total_matched_conversations: int = 0
+    total_matched_main: int = 0
+    total_matched_sub: int = 0
+    primary_sustained_slow: bool = False
+    primary_effective_slow_tps_th: float = 40.0
+    primary_effective_slow_ttft_th: float = 45.0
+    primary_media_ttft_exempted: bool = False
+    primary_large_ctx_ttft_allowance_sec: float = 0.0
+    steps_detail_lines: Tuple[str, ...] = ()
+    steps_peer_prior_peak: int = 0
+    steps_peer_weight_pct: int = 0
+    steps_effective_weighted_24h: int = 0
+    steps_pool_24h: int = 0
+    steps_gemini_24h: int = 0
+    steps_3p_24h: int = 0
+    steps_quota_headroom: Optional[int] = None
+    steps_soft_over_limit: bool = False
+    steps_low_quota_tightened: bool = False
+    account_tier_norm: str = ""
+
+
+def _freshness_sort_key(c: ConversationSummary) -> Tuple[int, float, int, float]:
+    if c.freshness_invalid_reason:
+        return (0, -float(c.consec_miss), -c.context_tokens, -c.latest_timestamp)
+    rem = c.freshness_remaining_sec
+    if rem is None or rem < -FRESHNESS_RESCUE_WINDOW_SEC:
+        return (3, 0.0, -c.context_tokens, -c.latest_timestamp)
+    size_bonus = 35.0 if c.context_tokens >= 300_000 else (15.0 if c.context_tokens >= 200_000 else 0.0)
+    if rem <= 60:  # rescue (-90..0) 与 warn (1..60) 同属高优先抢救桶
+        return (1, float(rem) - size_bonus, -c.context_tokens, -c.latest_timestamp)
+    return (2, float(rem) - size_bonus * 0.8, -c.context_tokens, -c.latest_timestamp)
+
+
+def compute_quota_pool_velocity(
+    pool: QuotaPoolInfo,
+    samples: List[Tuple[float, Optional[float], Optional[float], str, str]],
+    now_ts: float,
+) -> None:
+    """原地填充 pool 的 *_reset_in_sec / burn_pct_per_hour / eta_exhaust_sec / will_exhaust_before_reset / weekly_pace_ratio。"""
+    fh_reset_in: Optional[int] = None
+    if pool.five_hour_reset_at:
+        r_ts = parse_iso_timestamp(pool.five_hour_reset_at)
+        if r_ts is not None:
+            fh_reset_in = max(0, int(round(r_ts - now_ts)))
+    wk_reset_in: Optional[int] = None
+    if pool.weekly_reset_at:
+        w_ts = parse_iso_timestamp(pool.weekly_reset_at)
+        if w_ts is not None:
+            wk_reset_in = max(0, int(round(w_ts - now_ts)))
+    pool.five_hour_reset_in_sec = fh_reset_in
+    pool.weekly_reset_in_sec = wk_reset_in
+
+    def _calc_window_burn(
+        idx_val: int,
+        idx_rst: int,
+        cur_pct: Optional[float],
+    ) -> Tuple[Optional[float], Optional[int]]:
+        pts = [
+            (float(s[0]), float(s[idx_val]), str(s[idx_rst] or ""))
+            for s in samples
+            if len(s) >= 5 and s[idx_val] is not None and math.isfinite(float(s[idx_val]))
+        ]
+        if len(pts) < 2:
+            return None, None
+        pts.sort(key=lambda x: x[0])
+        seg_rev = [pts[-1]]
+        for i in range(len(pts) - 2, -1, -1):
+            _nt, newer_v, newer_r = seg_rev[-1]
+            _ot, older_v, older_r = pts[i]
+            if newer_v > older_v + 0.20:
+                break
+            if newer_r and older_r and newer_r != older_r:
+                # Tolerate upstream ±1~2s resetTime jitter; only treat >120s shift as a new reset cycle
+                t_new_r = parse_iso_timestamp(newer_r)
+                t_old_r = parse_iso_timestamp(older_r)
+                if t_new_r is None or t_old_r is None or abs(t_new_r - t_old_r) > 120.0:
+                    break
+            seg_rev.append(pts[i])
+        seg = list(reversed(seg_rev))
+        if len(seg) < 2:
+            return None, None
+        end_ts, end_v, _ = seg[-1]
+        win60 = [p for p in seg if p[0] >= end_ts - 3600.0]
+        chosen = win60
+        span60 = (win60[-1][0] - win60[0][0]) if len(win60) >= 2 else 0.0
+        if len(win60) < 2 or span60 < 300.0:
+            win120 = [p for p in seg if p[0] >= end_ts - 7200.0]
+            span120 = (win120[-1][0] - win120[0][0]) if len(win120) >= 2 else 0.0
+            if len(win120) >= 2 and span120 > span60:
+                chosen = win120
+        if len(chosen) < 2:
+            return None, None
+        start_ts, start_v, _ = chosen[0]
+        dt = end_ts - start_ts
+        if dt < 60.0:
+            return None, None
+        delta = max(0.0, start_v - end_v)
+        if delta < 0.01:
+            return 0.0, None
+        burn = round(delta / (dt / 3600.0), 2)
+        if burn <= 0.0:
+            return 0.0, None
+        eff_cur = cur_pct if cur_pct is not None else end_v
+        eta = min(7 * 86400, max(0, int(round((max(0.0, eff_cur) / burn) * 3600.0))))
+        return burn, eta
+
+    cur_fh_hi = (
+        pool.five_hour_fraction * 100.0
+        if pool.five_hour_fraction is not None
+        else pool.five_hour_pct
+    )
+    cur_wk_hi = (
+        pool.weekly_fraction * 100.0
+        if pool.weekly_fraction is not None
+        else pool.weekly_pct
+    )
+    burn_5h, eta_5h = _calc_window_burn(1, 3, cur_fh_hi)
+    pool.burn_pct_per_hour = burn_5h
+    pool.eta_exhaust_sec = eta_5h
+    pool.will_exhaust_before_reset = bool(
+        eta_5h is not None
+        and fh_reset_in is not None
+        and fh_reset_in > 0
+        and eta_5h < fh_reset_in
+    )
+
+    burn_wk, eta_wk = _calc_window_burn(2, 4, cur_wk_hi)
+    pool.weekly_burn_pct_per_hour = burn_wk
+    pool.weekly_eta_exhaust_sec = eta_wk
+
+    wk_pace: Optional[float] = None
+    if cur_wk_hi is not None and wk_reset_in is not None:
+        wk_rem = max(0.0, min(7.0 * 86400.0, float(wk_reset_in)))
+        elapsed = max(0.0, 7.0 * 86400.0 - wk_rem)
+        if elapsed >= 1800.0 and cur_wk_hi < 99.5:
+            used_frac = max(0.0, (100.0 - cur_wk_hi) / 100.0)
+            time_frac = elapsed / (7.0 * 86400.0)
+            if time_frac > 0.0:
+                wk_pace = round(used_frac / time_frac, 2)
+        elif burn_wk is not None and burn_wk > 0.0:
+            wk_pace = round((burn_wk * (wk_rem / 3600.0)) / max(0.1, cur_wk_hi), 2)
+    pool.weekly_pace_ratio = wk_pace
+
+
+def reconcile_model_switches_from_gens(
+    steps: List[StepRecord],
+    aligned_gens: List[Optional[Any]],
+    enum_map: Optional[Dict[str, str]] = None,
+) -> Tuple[List[StepRecord], bool]:
+    """仅依据 SQLite 真实 gen_metadata.model_label（绝不采信展示兜底 fallback）修订跨空模型边界的 model_switch。"""
+    if not steps or not aligned_gens:
+        return list(steps), False
+    # 尾对齐：适配快路径 aligned_gens 仅末尾 <=10 步
+    s_off = len(steps) - len(aligned_gens)
+    out: List[StepRecord] = []
+    changed = False
+    last_real_key = ""
+    prev_ts: Optional[float] = None
+    for idx, st in enumerate(steps):
+        is_delayed_ooo = (
+            prev_ts is not None
+            and st.timestamp > 0.0
+            and prev_ts > 0.0
+            and st.timestamp < prev_ts - 5.0
+        )
+        real_m = st.model
+        if not real_m:
+            gi = idx - s_off
+            g = aligned_gens[gi] if 0 <= gi < len(aligned_gens) else None
+            g_lbl = getattr(g, "model_label", "") if g is not None else ""
+            if g_lbl:
+                real_m = resolve_model_label(g_lbl, enum_map=enum_map)
+        cur_real_key = normalize_model_compare_key(real_m, enum_map=enum_map) if real_m else ""
+
+        if (
+            (not is_delayed_ooo)
+            and st.classification == "abnormal_miss"
+            and st.reason in ("abnormal_zero", "partial_miss")
+            and cur_real_key
+            and last_real_key
+            and cur_real_key != last_real_key
+        ):
+            out.append(
+                replace(
+                    st,
+                    model=real_m,
+                    classification="expected_cold",
+                    reason="model_switch",
+                    wasted_cold_tokens=0,
+                )
+            )
+            changed = True
+        else:
+            out.append(st)
+
+        if not is_delayed_ooo:
+            if cur_real_key:
+                last_real_key = cur_real_key
+            if st.timestamp > 0.0:
+                prev_ts = st.timestamp if prev_ts is None else max(prev_ts, st.timestamp)
+    return (out if changed else list(steps)), changed
 
 
 HISTORY_RANGE_SPECS: Dict[str, Tuple[str, str]] = {
@@ -1417,11 +1918,14 @@ def classify_steps(
     min_cacheable_tokens: int = 32000,
     account_switches: Optional[List[float]] = None,
     rule_change_timestamps: Optional[List[float]] = None,
+    enum_map: Optional[Dict[str, str]] = None,
+    use_model_adaptive_idle: bool = False,
 ) -> List[StepRecord]:
     """Classify consecutive PLANNER_RESPONSE steps, filtering normal zero/partial-cache causes."""
     classified: List[StepRecord] = []
     prev_ts: Optional[float] = None
     prev_model: Optional[str] = None
+    prev_model_key: str = ""
     prev_total: Optional[int] = None
     prev_step_idx: Optional[int] = None
     prev_cls: str = ""
@@ -1473,6 +1977,7 @@ def classify_steps(
             continue
         step_idx = int(raw_si) if raw_si is not None else idx
         hit_rate = (cr / total) * 100.0
+        cur_model_key = normalize_model_compare_key(model, enum_map=enum_map) if model else ""
 
         # Identify delayed out-of-order steps BEFORE classification so they never trigger rule_change or pollute state
         is_delayed_ooo = prev_ts is not None and ts > 0.0 and prev_ts > 0.0 and ts < prev_ts - 5.0
@@ -1522,16 +2027,25 @@ def classify_steps(
             and prev_total >= min_cacheable_tokens
             and ((after_checkpoint and total < prev_total * 0.85) or (total < prev_total * 0.75))
         )
-        is_expected_partial = (
+        is_partial_drop = (
             cr > 0
             and prev_total is not None
             and prev_total >= min_cacheable_tokens
-            and cr < prev_total * 0.50
-            and hit_rate < 50.0
+            and (prev_total - cr) >= 8192
+            and (
+                (cr < prev_total * 0.50 and hit_rate < 50.0)
+                or (cr < prev_total * 0.75 and hit_rate < 75.0 and (prev_total - cr) >= 16384)
+            )
         )
+        is_expected_partial = is_partial_drop
         is_expected_cold_candidate = (cr == 0) or is_expected_partial
-        is_idle_rewarm = prev_ts is not None and ts > 0 and prev_ts > 0 and (ts - prev_ts) >= idle_rewarm_sec
-        is_model_switch = bool(prev_model and model and model.lower() != prev_model.lower())
+        eff_idle_sec = (
+            resolve_model_freshness_window_sec(prev_model or model, int(idle_rewarm_sec))
+            if use_model_adaptive_idle
+            else int(idle_rewarm_sec)
+        )
+        is_idle_rewarm = prev_ts is not None and ts > 0 and prev_ts > 0 and (ts - prev_ts) >= eff_idle_sec
+        is_model_switch = bool(prev_model_key and cur_model_key and cur_model_key != prev_model_key)
         is_rule_change_eligible = (
             not is_delayed_ooo
             and latest_t_rule is not None
@@ -1580,12 +2094,7 @@ def classify_steps(
             cls, reason = "expected_cold", "rule_change"
         elif cr == 0:
             cls, reason = "abnormal_miss", "abnormal_zero"
-        elif (
-            prev_total is not None
-            and prev_total >= 50000
-            and cr < prev_total * 0.50
-            and hit_rate < 50.0
-        ):
+        elif is_partial_drop:
             cls, reason = "abnormal_miss", "partial_miss"
         elif prev_total is not None and prev_total > 0 and cr >= prev_total * 0.85 and hit_rate < 70.0:
             cls, reason = "hit", "cached_diluted"
@@ -1593,6 +2102,11 @@ def classify_steps(
             cls, reason = "hit", "cached"
 
         ctx_delta = (total - prev_total) if prev_total is not None else 0
+        step_wasted = (
+            max(0, min(prev_total, total) - cr)
+            if (cls == "abnormal_miss" and prev_total is not None)
+            else 0
+        )
         classified.append(
             StepRecord(
                 step_index=step_idx,
@@ -1611,6 +2125,7 @@ def classify_steps(
                 is_account_switch=crossed_switch,
                 active_media_count=media_cnt,
                 active_media_bytes=media_bytes,
+                wasted_cold_tokens=step_wasted,
             )
         )
         # Do not let an out-of-order delayed historical step clobber the forward cursor or rule watermark
@@ -1631,7 +2146,9 @@ def classify_steps(
             if first_non_ooo_ts is None and ts > 0.0:
                 first_non_ooo_ts = ts
             prev_ts = ts if (prev_ts is None or ts <= 0.0) else max(prev_ts, ts)
-            prev_model = model
+            if cur_model_key:
+                prev_model = model
+                prev_model_key = cur_model_key
             prev_total = total
             prev_step_idx = step_idx
             prev_cls = cls
@@ -2308,6 +2825,32 @@ class LanguageServerLogTailer:
             return recent, today, (in_window_notable[-max_notable:] if max_notable > 0 else [])
         return recent, today, in_window_notable
 
+    def get_category_events(
+        self,
+        now_ts: float,
+        window_min: int,
+        category: str,
+        *,
+        account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
+        limit: int = 12,
+    ) -> List[LogEvent]:
+        """Return up to ``limit`` most recent events of a specific category inside the active account & window."""
+        win_end = range_end_ts if range_end_ts is not None else now_ts
+        default_start = win_end - max(1, window_min) * 60
+        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
+        matched: List[LogEvent] = []
+        for ev in self._events:
+            if ev.category != category:
+                continue
+            if account_filter_fn is not None and not account_filter_fn(ev.timestamp):
+                continue
+            if cutoff <= ev.timestamp <= win_end + 2.0:
+                matched.append(ev)
+        return matched[-limit:] if limit > 0 else matched
+
     def get_proxy_outage_info(
         self,
         now_ts: float,
@@ -2525,7 +3068,10 @@ class AntigravityMonitorEngine:
         self._last_titles_poll_ts: float = 0.0
         self._last_weekly_poll_ts: float = 0.0
         self._last_weekly_email: str = ""
-        self._last_weekly_pools: Dict[str, Tuple[Optional[float], Optional[str], Optional[float], Optional[str]]] = {}
+        self._last_weekly_pools: Dict[
+            str,
+            Tuple[Optional[float], Optional[str], Optional[float], Optional[str], Optional[float], Optional[str]],
+        ] = {}
         self._cockpit_weekly_cache_key: Tuple[Any, ...] = ()
         self._cockpit_weekly_cache_rows: Dict[str, Tuple[Any, float, Any]] = {}
         self._last_quota_family: str = "gemini"
@@ -2535,6 +3081,8 @@ class AntigravityMonitorEngine:
         self._recorded_deg_anchors: "OrderedDict[Tuple[str, int], Optional[int]]" = OrderedDict()
         self._media_size_cache: "OrderedDict[str, int]" = OrderedDict()
         self._model_enum_map: "OrderedDict[str, str]" = OrderedDict()
+        self._model_enum_map_version: int = 0
+        self._quota_sample_rings: "OrderedDict[Tuple[str, str], Deque[Tuple[float, Optional[float], Optional[float], str, str]]]" = OrderedDict()
 
     def set_should_yield_fn(self, fn: Optional[Callable[[], bool]]) -> None:
         """Register an optional predicate (e.g. UI dragging flag) so long scan loops yield the GIL."""
@@ -2715,11 +3263,26 @@ class AntigravityMonitorEngine:
                 stop_event=stop_event,
                 update_summary=False,
             )
-            if not res2.error and res2.removed_count > 0:
+            if not res2.error and (
+                res2.removed_count > 0
+                or getattr(res2, "skipped_recycle_unavailable_count", 0) > 0
+                or res2.skipped_locked_count > 0
+                or res2.skipped_changed_count > 0
+            ):
                 res.removed_count += res2.removed_count
                 res.freed_bytes += res2.freed_bytes
                 res.skipped_locked_count += res2.skipped_locked_count
                 res.skipped_changed_count += res2.skipped_changed_count
+                if hasattr(res, "skipped_recycle_unavailable_count"):
+                    res.skipped_recycle_unavailable_count += int(
+                        getattr(res2, "skipped_recycle_unavailable_count", 0) or 0
+                    )
+                if (
+                    getattr(res2, "last_skip_reason", "")
+                    and hasattr(res, "last_skip_reason")
+                    and not getattr(res, "last_skip_reason", "")
+                ):
+                    res.last_skip_reason = getattr(res2, "last_skip_reason", "")
                 res.remaining_db_count = res2.remaining_db_count
                 res.removed_cids.extend(res2.removed_cids)
             elif res2.error and not res.error and res.removed_count == 0:
@@ -2803,7 +3366,8 @@ class AntigravityMonitorEngine:
         rule_sig = tuple(round(t, 1) for t in rule_ts[-64:])
         idle_sec = int(self.config["idle_rewarm_sec"])
         min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
-        cache_sig = (t_stamp, len(raw_steps), sw_sig, rule_sig, idle_sec, min_cache_tok)
+        enum_sig = (self._model_enum_map_version, tuple(sorted(self._model_enum_map.items())))
+        cache_sig = (t_stamp, len(raw_steps), sw_sig, rule_sig, idle_sec, min_cache_tok, enum_sig)
         cached_slot = self._classified_cache.get(conv_id)
         if cached_slot is not None and cached_slot[0] == cache_sig:
             self._classified_cache.move_to_end(conv_id)
@@ -2814,6 +3378,8 @@ class AntigravityMonitorEngine:
             min_cacheable_tokens=min_cache_tok,
             account_switches=switch_timestamps,
             rule_change_timestamps=rule_ts,
+            enum_map=self._model_enum_map,
+            use_model_adaptive_idle=True,
         )
         self._classified_cache[conv_id] = (cache_sig, steps)
         self._classified_cache.move_to_end(conv_id)
@@ -2838,6 +3404,15 @@ class AntigravityMonitorEngine:
         while len(self._subagent_hint_cache) > 512:
             self._subagent_hint_cache.popitem(last=False)
         return hint
+
+    @staticmethod
+    def _step_wasted_cold(s: StepRecord) -> int:
+        if s.classification != "abnormal_miss":
+            return 0
+        if s.wasted_cold_tokens > 0:
+            return int(s.wasted_cold_tokens)
+        est_prev = max(0, int(s.total_tokens) - int(s.context_delta))
+        return max(0, min(est_prev, int(s.total_tokens)) - int(s.cache_read_tokens))
 
     @staticmethod
     def _compute_eval_window_stats(
@@ -2867,11 +3442,13 @@ class AntigravityMonitorEngine:
                     break
                 if s.classification == "hit":
                     tail_hits_after_abn += 1
+        _sw = AntigravityMonitorEngine._step_wasted_cold
         return {
             "consec_miss": consec_miss,
             "consec_miss_start_step": consec_start_step,
             "single_miss": consec_miss == 1,
-            "wasted_cold_tokens": sum(s.input_tokens for s in eval_recent10 if s.classification == "abnormal_miss"),
+            "wasted_cold_tokens": sum(_sw(s) for s in eval_recent10),
+            "scoped_wasted_cold_tokens": sum(_sw(s) for s in eval_steps),
             "abnormal_in_recent10": abnormal_r10,
             "cacheable_in_recent10": cacheable_r10,
             "recent10_hit_ratio": hit_ratio_r10,
@@ -2891,14 +3468,19 @@ class AntigravityMonitorEngine:
         c.consec_miss_start_step = st["consec_miss_start_step"]
         c.single_miss = st["single_miss"]
         c.wasted_cold_tokens = st["wasted_cold_tokens"]
+        c.scoped_wasted_cold_tokens = st["scoped_wasted_cold_tokens"]
         c.abnormal_in_recent10 = st["abnormal_in_recent10"]
         c.cacheable_in_recent10 = st["cacheable_in_recent10"]
         c.recent10_hit_ratio = st["recent10_hit_ratio"]
         c.first_abnormal_step_in_recent10 = st["first_abnormal_step_in_recent10"]
         c.tail_consec_hits_after_abnormal = st["tail_consec_hits_after_abnormal"]
         c.last_abnormal_ts = st["last_abnormal_ts"]
-        if c.freshness_invalid_reason:
+        latest_st = c.recent_steps[-1] if c.recent_steps else (c._scoped_steps_all[-1] if c._scoped_steps_all else None)
+        if latest_st is not None and latest_st.classification != "abnormal_miss":
+            c.freshness_invalid_reason = ""
+        elif c.freshness_invalid_reason:
             c.freshness_invalid_reason = _format_freshness_invalid_reason(c.consec_miss, c.latest_cache_reason)
+        c.freshness_zone = _compute_freshness_zone(c.freshness_remaining_sec, c.freshness_invalid_reason)
 
     @staticmethod
     def _count_steps_in_window(c: ConversationSummary, lo_ts: float, hi_ts: float) -> Tuple[int, int]:
@@ -2986,23 +3568,45 @@ class AntigravityMonitorEngine:
                 ta += oa
             return th, ta
 
+        def _main_has_active_cache_issue(m: ConversationSummary) -> bool:
+            if m.consec_miss >= 2:
+                return True
+            if win10_stats.get(m.conversation_id, (0, 0))[1] > 0:
+                return True
+            if m.abnormal_in_recent10 >= 2:
+                need_h = 3 if m.abnormal_in_recent10 == 2 else 4
+                if m.tail_consec_hits_after_abnormal < need_h:
+                    return True
+            if m.consec_miss == 1 or m.single_miss:
+                if not is_live_aging:
+                    return True
+                if m.last_abnormal_ts <= 0.0 or (anchor_ts - m.last_abnormal_ts) < 600.0:
+                    return True
+                other_h, other_a = _other_pool_health(eval_mains, m.conversation_id)
+                if not (other_h >= 2 and other_a == 0):
+                    return True
+            return False
+
         has_verified_healthy_main = False
         for m in eval_mains:
-            if m.abnormal_in_recent10 != 0:
+            if _main_has_active_cache_issue(m):
                 continue
             if not is_historical_rating:
                 if win10_stats.get(m.conversation_id, (0, 0))[0] >= 1:
                     has_verified_healthy_main = True
                     break
             else:
-                # m.abnormal_in_recent10 == 0 is already guaranteed; cacheable_in_recent10 >= 1 proves >=1 in-window hit!
                 if m.cacheable_in_recent10 >= 1:
                     has_verified_healthy_main = True
                     break
 
-        all_mains_zero_abn = bool(eval_mains) and all(m.abnormal_in_recent10 == 0 for m in eval_mains)
         all_mains_win10_abn = sum(win10_stats.get(m.conversation_id, (0, 0))[1] for m in eval_mains)
-        mains_fully_healthy = has_verified_healthy_main and all_mains_zero_abn and (all_mains_win10_abn == 0)
+        mains_fully_healthy = (
+            has_verified_healthy_main
+            and bool(eval_mains)
+            and (all_mains_win10_abn == 0)
+            and not any(_main_has_active_cache_issue(m) for m in eval_mains)
+        )
         allow_sub_single_denoise = mains_fully_healthy and (not is_all_accounts_mixed)
 
         def _is_single_miss_aged_out(c: ConversationSummary, pool: List[ConversationSummary]) -> bool:
@@ -3030,15 +3634,25 @@ class AntigravityMonitorEngine:
             if c.single_miss and not _is_single_miss_aged_out(c, eval_subs)
         ]
         # Concurrent subagent burst check counts distinct subagents with recent (<10m) single_miss
-        recent_sub_single_count = sum(
-            1
+        recent_sub_single_convs = [
+            c
             for c in active_sub_single_convs
             if c.last_abnormal_ts <= 0.0 or (anchor_ts - c.last_abnormal_ts) < 600.0
+        ]
+        recent_sub_single_count = len(recent_sub_single_convs)
+        all_recent_sub_light = bool(recent_sub_single_convs) and all(
+            _is_light_immune_model(c.model_raw or c.model) for c in recent_sub_single_convs
         )
         if active_main_single:
             any_single_miss = True
         elif recent_sub_single_count >= 2:
-            any_single_miss = True
+            if allow_sub_single_denoise and all_recent_sub_light and len(eval_subs) >= 6:
+                any_single_miss = bool(
+                    recent_sub_single_count >= 3
+                    and (recent_sub_single_count / float(len(eval_subs))) >= 0.25
+                )
+            else:
+                any_single_miss = True
         elif active_sub_single_convs and not allow_sub_single_denoise:
             any_single_miss = True
         else:
@@ -3136,6 +3750,7 @@ class AntigravityMonitorEngine:
         consec_start_step = st["consec_miss_start_step"]
         single_miss = st["single_miss"]
         wasted_cold = st["wasted_cold_tokens"]
+        scoped_wasted_cold = st["scoped_wasted_cold_tokens"]
         abnormal_r10 = st["abnormal_in_recent10"]
         cacheable_r10 = st["cacheable_in_recent10"]
         hit_ratio_r10 = st["recent10_hit_ratio"]
@@ -3143,11 +3758,21 @@ class AntigravityMonitorEngine:
         tail_hits_after_abn = st["tail_consec_hits_after_abnormal"]
         last_abn_ts = st["last_abnormal_ts"]
 
+        model_raw_resolved = resolve_model_label(latest.model, enum_map=self._model_enum_map) or latest.model
+        model_display = format_model_name(latest.model, enum_map=self._model_enum_map)
+        base_fw = int(self.config.get("freshness_window_sec", 210))
+        conv_fw = resolve_model_freshness_window_sec(model_raw_resolved or model_display, base_fw)
+        eff_sp_th = resolve_model_speed_thresholds(
+            model_raw_resolved or model_display,
+            float(self.config["slow_tps_threshold"]),
+            float(self.config["slow_ttft_threshold_sec"]),
+        )
+
         fresh_rem: Optional[int] = None
         fresh_invalid = ""
         if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
             age = now - latest.timestamp
-            if age <= self.config["freshness_window_sec"] + 300:
+            if age <= conv_fw + 300:
                 if latest.classification == "abnormal_miss" and (
                     account_filter_fn is not None
                     or current_acct_since_ts <= 0.0
@@ -3159,13 +3784,14 @@ class AntigravityMonitorEngine:
                     or current_acct_since_ts <= 0.0
                     or latest.timestamp >= current_acct_since_ts - 2.0
                 ):
-                    fresh_rem = int(self.config["freshness_window_sec"] - age)
+                    fresh_rem = int(conv_fw - age)
+        fresh_zone = _compute_freshness_zone(fresh_rem, fresh_invalid)
 
         summary = ConversationSummary(
             conversation_id=conv_id,
             short_id=conv_id[:6],
-            model=format_model_name(latest.model, enum_map=self._model_enum_map),
-            model_raw=resolve_model_label(latest.model, enum_map=self._model_enum_map) or latest.model,
+            model=model_display,
+            model_raw=model_raw_resolved,
             context_tokens=latest.total_tokens,
             max_context_tokens=0,
             latest_hit_rate=latest.hit_rate,
@@ -3194,6 +3820,11 @@ class AntigravityMonitorEngine:
             active_media_bytes=latest.active_media_bytes,
             tail_consec_hits_after_abnormal=tail_hits_after_abn,
             last_abnormal_ts=last_abn_ts,
+            scoped_wasted_cold_tokens=scoped_wasted_cold,
+            effective_slow_tps_th=eff_sp_th.slow_tps,
+            effective_slow_ttft_th=eff_sp_th.slow_ttft,
+            freshness_window_sec=conv_fw,
+            freshness_zone=fresh_zone,
             _scoped_steps_all=scoped_steps,
         )
         return summary, all_steps, scoped_indices
@@ -3282,6 +3913,129 @@ class AntigravityMonitorEngine:
             c.model_raw = latest_m or fallback_lbl
             c.model = format_model_name(c.model_raw, enum_map=self._model_enum_map)
 
+    def _refresh_conv_freshness(
+        self,
+        c: ConversationSummary,
+        *,
+        now: Optional[float] = None,
+        eval_since_ts: float = 0.0,
+        account_scoped: bool = False,
+        reconciled_changed: bool = False,
+    ) -> None:
+        base_fw = int(self.config.get("freshness_window_sec", 210))
+        conv_fw = resolve_model_freshness_window_sec(c.model_raw or c.model, base_fw)
+        c.freshness_window_sec = conv_fw
+        eff_th = resolve_model_speed_thresholds(
+            c.model_raw or c.model,
+            float(self.config["slow_tps_threshold"]),
+            float(self.config["slow_ttft_threshold_sec"]),
+        )
+        c.effective_slow_tps_th = eff_th.slow_tps
+        c.effective_slow_ttft_th = eff_th.slow_ttft
+
+        latest = c.recent_steps[-1] if c.recent_steps else (c._scoped_steps_all[-1] if c._scoped_steps_all else None)
+        if latest is None:
+            return
+        if reconciled_changed and latest.classification != "abnormal_miss":
+            c.freshness_invalid_reason = ""
+        if now is None:
+            c.freshness_zone = _compute_freshness_zone(c.freshness_remaining_sec, c.freshness_invalid_reason)
+            return
+
+        fresh_rem: Optional[int] = None
+        fresh_invalid = ""
+        if latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
+            age = now - latest.timestamp
+            if age <= conv_fw + 300:
+                in_eval_scope = bool(
+                    account_scoped
+                    or eval_since_ts <= 0.0
+                    or latest.timestamp >= eval_since_ts - 2.0
+                )
+                if in_eval_scope:
+                    if latest.classification == "abnormal_miss":
+                        fresh_invalid = _format_freshness_invalid_reason(c.consec_miss, latest.reason)
+                    else:
+                        fresh_rem = int(conv_fw - age)
+        c.freshness_remaining_sec = fresh_rem
+        c.freshness_invalid_reason = fresh_invalid
+        c.freshness_zone = _compute_freshness_zone(fresh_rem, fresh_invalid)
+
+    def _evaluate_conv_speed_window(
+        self,
+        c: ConversationSummary,
+        pairs: List[Tuple[Optional[StepRecord], Any]],
+    ) -> None:
+        """Evaluate up to the latest 5 aligned (step, gen) pairs using per-model speed thresholds & sustained_slow."""
+        cfg_tps = float(self.config["slow_tps_threshold"])
+        cfg_ttft = float(self.config["slow_ttft_threshold_sec"])
+        max_ctx = int(c.max_context_tokens or 0) or 512000
+        evaluated: List[Dict[str, Any]] = []
+        for st, g in pairs[-5:]:
+            if g is None:
+                continue
+            m_str = (st.model if (st is not None and st.model) else (c.model_raw or c.model))
+            ctx_tok = st.total_tokens if st is not None else c.context_tokens
+            mc = st.active_media_count if st is not None else c.active_media_count
+            mb = st.active_media_bytes if st is not None else c.active_media_bytes
+            sp_st, med_ex = self._classify_speed_ex(
+                g.output_tokens,
+                g.tps,
+                g.ttft_sec,
+                ctx_tok,
+                streaming_sec=g.streaming_sec,
+                active_media_count=mc,
+                active_media_bytes=mb,
+                model=m_str,
+                max_context_tokens=max_ctx,
+            )
+            th = resolve_model_speed_thresholds(m_str, cfg_tps, cfg_ttft)
+            is_low_tps = bool(
+                g.output_tokens >= 500
+                and (g.streaming_sec is None or g.streaming_sec >= 1.5)
+                and g.tps is not None
+                and g.tps < th.slow_tps
+            )
+            is_severe_tps = bool(is_low_tps and g.tps is not None and g.tps < th.slow_tps * 0.75)
+            ctx_allow = compute_large_ctx_ttft_allowance(ctx_tok, max_ctx)
+            media_mb = max(0.0, float(mb)) / (1024.0 * 1024.0)
+            media_grace = min(120.0, max(0, int(mc)) * 3.0 + media_mb * 10.0)
+            is_extreme_ttft = bool(
+                g.ttft_sec is not None
+                and g.ttft_sec >= max(120.0, th.slow_ttft * 2.0 + ctx_allow + media_grace)
+            )
+            evaluated.append(
+                {
+                    "status": sp_st,
+                    "media_ex": med_ex,
+                    "th": th,
+                    "is_low_tps": is_low_tps,
+                    "is_severe_tps": is_severe_tps,
+                    "is_extreme_ttft": is_extreme_ttft,
+                }
+            )
+        if not evaluated:
+            return
+        last_ev = evaluated[-1]
+        c.speed_status = last_ev["status"]
+        c.media_ttft_exempted = last_ev["media_ex"]
+        c.effective_slow_tps_th = last_ev["th"].slow_tps
+        c.effective_slow_ttft_th = last_ev["th"].slow_ttft
+
+        measured = [r for r in evaluated if r["status"] != "unknown"]
+        if not measured or measured[-1]["status"] != "slow":
+            c.sustained_slow = False
+            return
+        lat = measured[-1]
+        slow_cnt = sum(1 for r in measured if r["status"] == "slow")
+        c.sustained_slow = bool(
+            lat["is_severe_tps"]
+            or lat["is_extreme_ttft"]
+            or (len(measured) >= 2 and measured[-2]["status"] == "slow")
+            or slow_cnt >= 3
+            or (len(measured) == 1 and lat["is_low_tps"])
+        )
+
     def _enrich_conv_from_db(
         self,
         c: ConversationSummary,
@@ -3289,6 +4043,8 @@ class AntigravityMonitorEngine:
         scoped_indices: Optional[List[int]] = None,
         account_scoped: bool = False,
         need_full_window_gens: bool = False,
+        eval_since_ts: float = 0.0,
+        now: Optional[float] = None,
     ) -> None:
         snap: Optional[ConversationDbSnapshot] = self._db_reader.read(c.conversation_id)
         if not snap:
@@ -3350,7 +4106,34 @@ class AntigravityMonitorEngine:
                 aligned_recent = scoped_gens[-len(c.recent_steps):] if c.recent_steps else []
 
         if any(g is not None for g in aligned_recent):
+            reconciled_changed = False
+            gens_for_reconcile = c._scoped_gens_all if c._scoped_gens_all else aligned_recent
+            if (
+                c._scoped_steps_all
+                and gens_for_reconcile
+                and any(not s.model for s in c._scoped_steps_all)
+                and any(s.classification == "abnormal_miss" for s in c._scoped_steps_all)
+            ):
+                reconciled_all, reconciled_changed = reconcile_model_switches_from_gens(
+                    c._scoped_steps_all,
+                    gens_for_reconcile,
+                    enum_map=self._model_enum_map,
+                )
+                if reconciled_changed:
+                    c._scoped_steps_all = reconciled_all
+                    c.recent_steps = reconciled_all[-10:]
+                    if c.recent_steps:
+                        c.latest_cache_reason = c.recent_steps[-1].reason
+                    self._recompute_conv_eval_stats(c, eval_since_ts)
+
             self._backfill_conv_models_from_gens(c, aligned_recent, tail_gens)
+            self._refresh_conv_freshness(
+                c,
+                now=now,
+                eval_since_ts=eval_since_ts,
+                account_scoped=account_scoped,
+                reconciled_changed=reconciled_changed,
+            )
             c.recent_ttfts = [g.ttft_sec if g is not None else None for g in aligned_recent]
             c.recent_tps_list = [g.tps if g is not None else None for g in aligned_recent]
             valid_ttfts = [t for t in c.recent_ttfts if t is not None]
@@ -3368,22 +4151,35 @@ class AntigravityMonitorEngine:
                     display_tps = next((t for t in reversed(c.recent_tps_list) if t is not None), None)
                 c.tps = display_tps
                 c.shard_tag = latest_gen.shard_tag
-                c.speed_status, c.media_ttft_exempted = self._classify_speed_ex(
-                    latest_gen.output_tokens,
-                    latest_gen.tps,
-                    latest_gen.ttft_sec,
-                    c.context_tokens,
-                    streaming_sec=latest_gen.streaming_sec,
-                    active_media_count=c.active_media_count,
-                    active_media_bytes=c.active_media_bytes,
-                )
+                r_off = len(c.recent_steps) - len(aligned_recent)
+                speed_pairs: List[Tuple[Optional[StepRecord], Any]] = []
+                for idx_r, st_r in enumerate(c.recent_steps):
+                    gi_r = idx_r - r_off
+                    g_r = aligned_recent[gi_r] if 0 <= gi_r < len(aligned_recent) else None
+                    if g_r is not None:
+                        speed_pairs.append((st_r, g_r))
+                if not speed_pairs:
+                    speed_pairs.append((c.recent_steps[-1] if c.recent_steps else None, latest_gen))
+                self._evaluate_conv_speed_window(c, speed_pairs[-5:])
             return
 
         if account_scoped or is_tail_truncated:
             self._backfill_conv_models_from_gens(c, [], tail_gens)
+            self._refresh_conv_freshness(
+                c,
+                now=now,
+                eval_since_ts=eval_since_ts,
+                account_scoped=account_scoped,
+            )
             return
 
         self._backfill_conv_models_from_gens(c, [], tail_gens)
+        self._refresh_conv_freshness(
+            c,
+            now=now,
+            eval_since_ts=eval_since_ts,
+            account_scoped=account_scoped,
+        )
         valid_gens = tail_gens[-10:]
         c.recent_ttfts = [g.ttft_sec for g in valid_gens]
         c.recent_tps_list = [g.tps for g in valid_gens]
@@ -3400,15 +4196,10 @@ class AntigravityMonitorEngine:
                 display_tps = next((t for t in reversed(c.recent_tps_list) if t is not None), None)
             c.tps = display_tps
             c.shard_tag = gen.shard_tag
-            c.speed_status, c.media_ttft_exempted = self._classify_speed_ex(
-                gen.output_tokens,
-                gen.tps,
-                gen.ttft_sec,
-                c.context_tokens,
-                streaming_sec=gen.streaming_sec,
-                active_media_count=c.active_media_count,
-                active_media_bytes=c.active_media_bytes,
-            )
+            fb_gens = valid_gens[-5:] if valid_gens else [gen]
+            if fb_gens[-1] is not gen:
+                fb_gens = fb_gens[-4:] + [gen]
+            self._evaluate_conv_speed_window(c, [(None, g) for g in fb_gens])
 
     def poll(
         self,
@@ -3746,6 +4537,16 @@ class AntigravityMonitorEngine:
                 if prev_acct_label and self._account_cache.short_label.lower() != prev_acct_label.lower():
                     hint_ts = self._find_recent_cold_switch_hint(max(prev_poll_ts, now - 60.0), now)
                 self._ledger.observe_online(self._account_cache.short_label, now, hint_switch_ts=hint_ts)
+                if self._account_cache.tier and hasattr(self._ledger, "observe_account_tier"):
+                    self._ledger.observe_account_tier(self._account_cache.short_label, self._account_cache.tier, now)
+        elif self._account_cache.online:
+            if self._account_cache.pools:
+                self._record_and_compute_quota_velocity(self._account_cache, now, record_sample=False)
+                self._sync_account_active_pool(self._account_cache, self._account_cache.quota_family or self._last_quota_family)
+            else:
+                self._account_cache.tier_label, self._account_cache.tier_short = resolve_tier_display(self._account_cache.tier)
+            if self._account_cache.short_label and self._account_cache.tier and hasattr(self._ledger, "observe_account_tier"):
+                self._ledger.observe_account_tier(self._account_cache.short_label, self._account_cache.tier, now)
 
         today_start = datetime.datetime.fromtimestamp(now).replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -3856,14 +4657,21 @@ class AntigravityMonitorEngine:
         total_24h_steps = 0
         total_main_24h_steps = 0
         total_subagent_24h_steps = 0
+        total_p3_24h_steps = 0
         account_24h_steps = 0
         account_main_24h_steps = 0
         account_subagent_24h_steps = 0
+        account_p3_24h_steps = 0
         range_steps = 0
         last_1h_steps = 0
+        matched_in_eff_range_total = 0
+        matched_in_eff_range_main = 0
+        matched_in_eff_range_sub = 0
         hourly_counts: Dict[int, int] = {}
         hourly_24h_local_counts: Dict[Tuple[int, int, int, int], int] = {}
         account_24h_utc_buckets: Dict[int, int] = {}
+        # Per-hour [m, sub, lt, p3, uc_raw_tokens]
+        account_24h_utc_meta: Dict[int, List[int]] = {}
         one_hour_cutoff = now - 3600.0
         step_upper_bound = now + 5.0
         eff_range_step_cutoff = range_start_ts if range_start_ts > 0.0 else (now - win_sec)
@@ -3882,6 +4690,7 @@ class AntigravityMonitorEngine:
             int(self.config["idle_rewarm_sec"]),
             int(self.config.get("min_cacheable_tokens", 32000)),
             int(self.config.get("large_context_threshold", 60000)),
+            self._model_enum_map_version,
             len(self._model_enum_map),
         )
 
@@ -3973,13 +4782,22 @@ class AntigravityMonitorEngine:
                 total_24h_steps += cached_agg["d_total_24h"]
                 total_main_24h_steps += cached_agg["d_total_main_24h"]
                 total_subagent_24h_steps += cached_agg["d_total_sub_24h"]
+                total_p3_24h_steps += int(cached_agg.get("d_total_p3_24h", 0) or 0)
                 account_today_steps += cached_agg["d_acct_today"]
                 account_main_today_steps += cached_agg["d_acct_main_today"]
                 account_subagent_today_steps += cached_agg["d_acct_sub_today"]
                 account_24h_steps += cached_agg["d_acct_24h"]
                 account_main_24h_steps += cached_agg["d_acct_main_24h"]
                 account_subagent_24h_steps += cached_agg["d_acct_sub_24h"]
-                range_steps += cached_agg["d_range_steps"]
+                account_p3_24h_steps += int(cached_agg.get("d_acct_p3_24h", 0) or 0)
+                c_range_s = cached_agg["d_range_steps"]
+                range_steps += c_range_s
+                if c_range_s > 0:
+                    matched_in_eff_range_total += 1
+                    if is_sub_conv:
+                        matched_in_eff_range_sub += 1
+                    else:
+                        matched_in_eff_range_main += 1
                 last_1h_steps += cached_agg["d_last_1h_steps"]
                 for hr_k, cnt_v in cached_agg["d_hourly_counts"]:
                     hourly_counts[hr_k] = hourly_counts.get(hr_k, 0) + cnt_v
@@ -3987,6 +4805,16 @@ class AntigravityMonitorEngine:
                     hourly_24h_local_counts[lkey_k] = hourly_24h_local_counts.get(lkey_k, 0) + cnt_v
                 for hk_k, cnt_v in cached_agg["d_acct_24h_utc"]:
                     account_24h_utc_buckets[hk_k] = account_24h_utc_buckets.get(hk_k, 0) + cnt_v
+                for hk_k, m_tup in cached_agg.get("d_acct_24h_utc_meta", ()):
+                    dst_m = account_24h_utc_meta.get(hk_k)
+                    if dst_m is None:
+                        account_24h_utc_meta[hk_k] = [m_tup[0], m_tup[1], m_tup[2], m_tup[3], m_tup[4]]
+                    else:
+                        dst_m[0] += m_tup[0]
+                        dst_m[1] += m_tup[1]
+                        dst_m[2] += m_tup[2]
+                        dst_m[3] += m_tup[3]
+                        dst_m[4] += m_tup[4]
 
                 if not want_summary:
                     continue
@@ -4035,22 +4863,26 @@ class AntigravityMonitorEngine:
             d_total_24h = 0
             d_total_main_24h = 0
             d_total_sub_24h = 0
+            d_total_p3_24h = 0
             d_acct_today = 0
             d_acct_main_today = 0
             d_acct_sub_today = 0
             d_acct_24h = 0
             d_acct_main_24h = 0
             d_acct_sub_24h = 0
+            d_acct_p3_24h = 0
             d_range_steps = 0
             d_last_1h_steps = 0
             d_hourly: Dict[int, int] = {}
             d_hourly_24h: Dict[Tuple[int, int, int, int], int] = {}
             d_acct_utc: Dict[int, int] = {}
+            d_acct_utc_meta: Dict[int, List[int]] = {}
             c_min_ts: Optional[float] = None
             c_max_ts: Optional[float] = None
 
             for s in raw_steps:
-                sts = float(s.timestamp if isinstance(s, _RawStepSlot) else (s.get("timestamp", 0.0) or 0.0))
+                is_slot_s = isinstance(s, _RawStepSlot)
+                sts = float(s.timestamp if is_slot_s else (s.get("timestamp", 0.0) or 0.0))
                 if sts <= 0.0 or sts > step_upper_bound:
                     continue
                 if c_min_ts is None or sts < c_min_ts:
@@ -4063,12 +4895,24 @@ class AntigravityMonitorEngine:
                         d_total_sub_today += 1
                     else:
                         d_total_main_today += 1
-                if sts >= rolling_24h_cutoff:
+                is_24h = sts >= rolling_24h_cutoff
+                is_lt_s = False
+                is_p3_s = False
+                raw_in_s = 0
+                if is_24h:
                     d_total_24h += 1
                     if is_sub_conv:
                         d_total_sub_24h += 1
                     else:
                         d_total_main_24h += 1
+                    raw_m_s = str(s.model if is_slot_s else (s.get("model", "") or "")).strip()
+                    raw_in_s = max(0, int(s.input_tokens if is_slot_s else (s.get("input_tokens", 0) or 0)))
+                    if raw_m_s:
+                        res_m_s = resolve_model_label(raw_m_s, enum_map=self._model_enum_map)
+                        is_lt_s = _is_light_immune_model(res_m_s)
+                        is_p3_s = self._classify_model_pool(res_m_s, raw_m_s) == "3p"
+                        if is_p3_s:
+                            d_total_p3_24h += 1
 
                 in_scope = True if acct_filter_fn is None else acct_filter_fn(sts)
                 if not in_scope:
@@ -4087,15 +4931,30 @@ class AntigravityMonitorEngine:
                             d_acct_main_today += 1
                     hr = datetime.datetime.fromtimestamp(sts).hour
                     d_hourly[hr] = d_hourly.get(hr, 0) + 1
-                if sts >= rolling_24h_cutoff:
+                if is_24h:
                     if resolved_account:
                         d_acct_24h += 1
                         if is_sub_conv:
                             d_acct_sub_24h += 1
                         else:
                             d_acct_main_24h += 1
+                        if is_p3_s:
+                            d_acct_p3_24h += 1
                         hk_utc = int(sts // 3600)
                         d_acct_utc[hk_utc] = d_acct_utc.get(hk_utc, 0) + 1
+                        mslot = d_acct_utc_meta.get(hk_utc)
+                        if mslot is None:
+                            mslot = [0, 0, 0, 0, 0]
+                            d_acct_utc_meta[hk_utc] = mslot
+                        if is_sub_conv:
+                            mslot[1] += 1
+                        else:
+                            mslot[0] += 1
+                        if is_lt_s:
+                            mslot[2] += 1
+                        if is_p3_s:
+                            mslot[3] += 1
+                        mslot[4] += raw_in_s
                     dt_s = datetime.datetime.fromtimestamp(sts)
                     lkey = (dt_s.year, dt_s.month, dt_s.day, dt_s.hour)
                     d_hourly_24h[lkey] = d_hourly_24h.get(lkey, 0) + 1
@@ -4106,13 +4965,21 @@ class AntigravityMonitorEngine:
             total_24h_steps += d_total_24h
             total_main_24h_steps += d_total_main_24h
             total_subagent_24h_steps += d_total_sub_24h
+            total_p3_24h_steps += d_total_p3_24h
             account_today_steps += d_acct_today
             account_main_today_steps += d_acct_main_today
             account_subagent_today_steps += d_acct_sub_today
             account_24h_steps += d_acct_24h
             account_main_24h_steps += d_acct_main_24h
             account_subagent_24h_steps += d_acct_sub_24h
+            account_p3_24h_steps += d_acct_p3_24h
             range_steps += d_range_steps
+            if d_range_steps > 0:
+                matched_in_eff_range_total += 1
+                if is_sub_conv:
+                    matched_in_eff_range_sub += 1
+                else:
+                    matched_in_eff_range_main += 1
             last_1h_steps += d_last_1h_steps
             for hr_k, cnt_v in d_hourly.items():
                 hourly_counts[hr_k] = hourly_counts.get(hr_k, 0) + cnt_v
@@ -4120,6 +4987,16 @@ class AntigravityMonitorEngine:
                 hourly_24h_local_counts[lkey_k] = hourly_24h_local_counts.get(lkey_k, 0) + cnt_v
             for hk_k, cnt_v in d_acct_utc.items():
                 account_24h_utc_buckets[hk_k] = account_24h_utc_buckets.get(hk_k, 0) + cnt_v
+            for hk_k, mslot in d_acct_utc_meta.items():
+                dst_m = account_24h_utc_meta.get(hk_k)
+                if dst_m is None:
+                    account_24h_utc_meta[hk_k] = [mslot[0], mslot[1], mslot[2], mslot[3], mslot[4]]
+                else:
+                    dst_m[0] += mslot[0]
+                    dst_m[1] += mslot[1]
+                    dst_m[2] += mslot[2]
+                    dst_m[3] += mslot[3]
+                    dst_m[4] += mslot[4]
 
             summary_cache_ent: Any = None
             built = None
@@ -4170,17 +5047,20 @@ class AntigravityMonitorEngine:
                             "d_total_24h": d_total_24h,
                             "d_total_main_24h": d_total_main_24h,
                             "d_total_sub_24h": d_total_sub_24h,
+                            "d_total_p3_24h": d_total_p3_24h,
                             "d_acct_today": d_acct_today,
                             "d_acct_main_today": d_acct_main_today,
                             "d_acct_sub_today": d_acct_sub_today,
                             "d_acct_24h": d_acct_24h,
                             "d_acct_main_24h": d_acct_main_24h,
                             "d_acct_sub_24h": d_acct_sub_24h,
+                            "d_acct_p3_24h": d_acct_p3_24h,
                             "d_range_steps": d_range_steps,
                             "d_last_1h_steps": d_last_1h_steps,
                             "d_hourly_counts": tuple(d_hourly.items()),
                             "d_hourly_24h_local": tuple(d_hourly_24h.items()),
                             "d_acct_24h_utc": tuple(d_acct_utc.items()),
+                            "d_acct_24h_utc_meta": tuple((hk, tuple(v)) for hk, v in d_acct_utc_meta.items()),
                             "summary_entry": summary_cache_ent,
                         },
                     )
@@ -4245,6 +5125,7 @@ class AntigravityMonitorEngine:
 
         is_acct_scoped = acct_filter_fn is not None
         need_wide_gens = hr_key != "30m"
+        enrich_eval_since = 0.0 if is_acct_scoped else current_acct_since_ts
         for idx_tb, (c, all_st, sc_idx) in enumerate(top_bundles):
             if not c.title:
                 c.title = self._resolve_conv_title(c.conversation_id)
@@ -4258,6 +5139,8 @@ class AntigravityMonitorEngine:
                 scoped_indices=sc_idx,
                 account_scoped=is_acct_scoped,
                 need_full_window_gens=use_wide_for_c,
+                eval_since_ts=enrich_eval_since,
+                now=now,
             )
         target_conv: Optional[ConversationSummary] = target_bundle[0] if target_bundle is not None else None
         if target_conv is not None and not target_conv.title:
@@ -4268,6 +5151,8 @@ class AntigravityMonitorEngine:
                 all_steps=target_bundle[1],
                 scoped_indices=target_bundle[2],
                 account_scoped=False,
+                eval_since_ts=0.0,
+                now=now,
             )
 
         top_convs = [b[0] for b in top_bundles]
@@ -4288,6 +5173,8 @@ class AntigravityMonitorEngine:
                 self._refresh_account_cache(now, active_family)
                 if self._account_cache.online and self._account_cache.short_label:
                     self._ledger.observe_online(self._account_cache.short_label, now)
+                    if self._account_cache.tier and hasattr(self._ledger, "observe_account_tier"):
+                        self._ledger.observe_account_tier(self._account_cache.short_label, self._account_cache.tier, now)
 
         if resolved_account:
             steps_scope_label = resolved_account
@@ -4298,6 +5185,8 @@ class AntigravityMonitorEngine:
             rolling_24h_steps = account_24h_steps
             main_24h_steps = account_main_24h_steps
             subagent_24h_steps = account_subagent_24h_steps
+            steps_3p_24h_live = account_p3_24h_steps
+            steps_gemini_24h_live = max(0, account_24h_steps - account_p3_24h_steps)
         else:
             steps_scope_label = "全机"
             log_scope_label = "全机"
@@ -4307,6 +5196,8 @@ class AntigravityMonitorEngine:
             rolling_24h_steps = total_24h_steps
             main_24h_steps = total_main_24h_steps
             subagent_24h_steps = total_subagent_24h_steps
+            steps_3p_24h_live = total_p3_24h_steps
+            steps_gemini_24h_live = max(0, total_24h_steps - total_p3_24h_steps)
 
         peak_hour_steps = 0
         peak_hour_label = ""
@@ -4334,18 +5225,16 @@ class AntigravityMonitorEngine:
                 for c in convs
                 if (not c.is_subagent) and (c.freshness_remaining_sec is not None or c.freshness_invalid_reason)
             ]
-            large_freshness.sort(
-                key=lambda c: (
-                    0 if c.freshness_invalid_reason else (1 if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else 2),
-                    c.freshness_remaining_sec if (c.freshness_remaining_sec is not None and c.freshness_remaining_sec > 0) else (-c.latest_timestamp),
-                )
-            )
+            large_freshness.sort(key=_freshness_sort_key)
 
         min_fresh_sec: Optional[int] = None
         min_fresh_conv = ""
         min_fresh_title = ""
         min_fresh_ctx = 0
         min_fresh_invalid = ""
+        min_fresh_window_sec = int(self.config.get("freshness_window_sec", 210))
+        min_fresh_zone = ""
+        expiring_soon_count = 0
         if large_freshness:
             for _fc in large_freshness[:12]:
                 if not _fc.title:
@@ -4356,6 +5245,11 @@ class AntigravityMonitorEngine:
             min_fresh_title = head_f.title
             min_fresh_ctx = head_f.context_tokens
             min_fresh_invalid = head_f.freshness_invalid_reason
+            min_fresh_window_sec = head_f.freshness_window_sec
+            min_fresh_zone = head_f.freshness_zone
+            expiring_soon_count = sum(
+                1 for fc in large_freshness if fc.freshness_zone in ("invalid", "rescue", "warn")
+            )
 
         machine_today_log = self._log_tailer.get_machine_today_counts(now)
 
@@ -4530,11 +5424,36 @@ class AntigravityMonitorEngine:
             ) or now
             historical_tag = f"{hr_label}汇总"
 
-        # Refresh top-level min_freshness_invalid_reason after _recompute_conv_eval_stats so it always matches consec_miss & grade!
+        # Refresh top-level freshness fields after _recompute_conv_eval_stats so sorting & zone always match consec_miss & grade!
         if large_freshness:
-            min_fresh_invalid = large_freshness[0].freshness_invalid_reason
+            large_freshness.sort(key=_freshness_sort_key)
+            for _fc in large_freshness[:12]:
+                if not _fc.title:
+                    _fc.title = self._resolve_conv_title(_fc.conversation_id)
+            head_f = large_freshness[0]
+            min_fresh_sec = head_f.freshness_remaining_sec
+            min_fresh_conv = head_f.short_id
+            min_fresh_title = head_f.title
+            min_fresh_ctx = head_f.context_tokens
+            min_fresh_invalid = head_f.freshness_invalid_reason
+            min_fresh_window_sec = head_f.freshness_window_sec
+            min_fresh_zone = head_f.freshness_zone
+            expiring_soon_count = sum(
+                1 for fc in large_freshness if fc.freshness_zone in ("invalid", "rescue", "warn")
+            )
 
         eval_mains = [c for c in recent_active if not c.is_subagent]
+        eval_subs = [c for c in recent_active if c.is_subagent]
+        if is_historical_rating and hr_key == "30m" and (not is_custom_account_view):
+            matched_anchor_convs = [c for c in convs if c.latest_timestamp >= eval_cutoff_ts]
+            total_matched_main = max(len(eval_mains), sum(1 for c in matched_anchor_convs if not c.is_subagent))
+            total_matched_sub = max(len(eval_subs), sum(1 for c in matched_anchor_convs if c.is_subagent))
+            total_matched_conversations = max(len(matched_anchor_convs), total_matched_main + total_matched_sub)
+        else:
+            total_matched_main = max(matched_in_eff_range_main, len(eval_mains))
+            total_matched_sub = max(matched_in_eff_range_sub, len(eval_subs))
+            total_matched_conversations = max(matched_in_eff_range_total, total_matched_main + total_matched_sub)
+
         eval_primary = eval_mains[0] if eval_mains else (recent_active[0] if recent_active else None)
         active_model = eval_primary.model if eval_primary else "等待请求"
         primary_hit = eval_primary.latest_hit_rate if eval_primary else None
@@ -4546,6 +5465,19 @@ class AntigravityMonitorEngine:
         primary_tps = eval_primary.tps if eval_primary else None
         primary_ttft = eval_primary.ttft_sec if eval_primary else None
         primary_speed = eval_primary.speed_status if eval_primary else "unknown"
+        primary_sustained_slow = bool(eval_primary.sustained_slow) if eval_primary else False
+        primary_eff_tps_th = (
+            float(eval_primary.effective_slow_tps_th)
+            if eval_primary is not None
+            else float(self.config["slow_tps_threshold"])
+        )
+        primary_eff_ttft_th = (
+            float(eval_primary.effective_slow_ttft_th)
+            if eval_primary is not None
+            else float(self.config["slow_ttft_threshold_sec"])
+        )
+        primary_media_ttft_exempted = bool(eval_primary.media_ttft_exempted) if eval_primary else False
+        primary_large_ctx_allow = float(eval_primary.large_ctx_ttft_allowance_sec) if eval_primary else 0.0
 
         # Build read-only carryover previews for main windows active in the last 10m under a prior account
         # (strictly excluded from active_conversations, health rating, freshness, steps, and model_stats).
@@ -4571,10 +5503,18 @@ class AntigravityMonitorEngine:
                 )
                 if co_built is not None:
                     co_c = co_built[0]
-                    self._enrich_conv_from_db(co_c, all_steps=co_built[1], scoped_indices=co_built[2], account_scoped=False)
+                    self._enrich_conv_from_db(
+                        co_c,
+                        all_steps=co_built[1],
+                        scoped_indices=co_built[2],
+                        account_scoped=False,
+                        eval_since_ts=0.0,
+                        now=now,
+                    )
                     co_c.is_carryover_preview = True
                     co_c.freshness_remaining_sec = None
                     co_c.freshness_invalid_reason = ""
+                    co_c.freshness_zone = ""
                     carryover_convs.append(co_c)
                     if len(carryover_convs) >= 2:
                         break
@@ -4591,13 +5531,36 @@ class AntigravityMonitorEngine:
                 is_all_accounts_mixed=(raw_view == "__all__"),
             )
         )
-        any_slow = any(c.speed_status == "slow" for c in recent_active[:2])
-        wasted_total = sum(c.wasted_cold_tokens for c in recent_active)
+        slow_targets = eval_mains[:2] if eval_mains else recent_active[:2]
+        any_slow = any(c.sustained_slow for c in slow_targets)
+        wasted_total = (
+            sum(c.wasted_cold_tokens for c in recent_active)
+            if hr_key == "30m"
+            else sum(
+                c.scoped_wasted_cold_tokens if c.scoped_wasted_cold_tokens > 0 else c.wasted_cold_tokens
+                for c in recent_active
+            )
+        )
         max_abnormal_r10 = max((c.abnormal_in_recent10 for c in recent_active), default=0)
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
         annotated_notable = self._annotate_log_events_with_conversations(notable_events, top_convs)
+        recent_retry_evs = self._log_tailer.get_category_events(
+            now,
+            self.config["log_sliding_window_min"],
+            "retry",
+            account_filter_fn=acct_filter_fn,
+            range_start_ts=eval_cutoff_ts,
+            range_end_ts=eval_end_ts,
+            limit=12,
+        )
+        recent_events_by_cat: Dict[str, List[LogEvent]] = {
+            "503": [ev for ev in annotated_notable if ev.category == "503"][-12:],
+            "timeout": [ev for ev in annotated_notable if ev.category == "timeout"][-12:],
+            "403": [ev for ev in annotated_notable if ev.category == "403"][-12:],
+            "retry": list(recent_retry_evs[-12:]),
+        }
         heavy_media_timeout_count = sum(
             1 for ev in annotated_notable if ev.category == "timeout" and ev.is_heavy_media_timeout
         )
@@ -4609,6 +5572,15 @@ class AntigravityMonitorEngine:
                 if ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout)
             ),
             default=0.0,
+        )
+        t2_affected_model = next(
+            (
+                ev.model
+                for ev in reversed(annotated_notable)
+                if (ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout))
+                and ev.model
+            ),
+            "",
         )
         notable_events = annotated_notable[-3:]
         latest_server_timeout_ev = next(
@@ -4703,9 +5675,16 @@ class AntigravityMonitorEngine:
                 if is_live_30m:
                     age_since_outage = now - outage_e
                     if age_since_outage <= 15.0 * 60.0:
+                        non_light_mains = [
+                            c for c in recent_active
+                            if (not c.is_subagent) and (not _is_light_immune_model(c.model_raw or c.model))
+                        ]
+                        outage_recov_convs = (
+                            non_light_mains if non_light_mains else [c for c in recent_active if not c.is_subagent]
+                        )
                         post_outage_steps = sum(
                             1
-                            for c in recent_active
+                            for c in outage_recov_convs
                             for s in c._scoped_steps_all
                             if s.timestamp > outage_e + 1.0
                         )
@@ -4722,7 +5701,7 @@ class AntigravityMonitorEngine:
                     proxy_outage_recent = outage_cnt
                     proxy_outage_note = f"{hm_outage} 曾发生 {outage_cnt} 次跨接口代理断连"
 
-        # Module 5: Per-account adaptive daily step protection limits (strictly from completed prior days)
+        # Module 5: Next-generation adaptive sliding-window daily step protection limits (v7.3.0)
         today_str = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
         base_steps_warn = int(self.config["daily_steps_warn"])
         base_steps_alert = int(self.config["daily_steps_alert"])
@@ -4731,9 +5710,61 @@ class AntigravityMonitorEngine:
         steps_limit_mode = "default"
         steps_limit_note = "初始建议值"
         acct_hist_safe_peak = 0
+        steps_detail_lines: Tuple[str, ...] = ()
+        steps_peer_prior_peak = 0
+        steps_peer_weight_pct = 0
+        steps_effective_weighted_24h = rolling_24h_steps
+        steps_gemini_24h = steps_gemini_24h_live
+        steps_3p_24h = steps_3p_24h_live
+        steps_pool_24h = steps_3p_24h if active_family == "3p" else steps_gemini_24h
+        steps_quota_headroom: Optional[int] = None
+        steps_soft_over_limit = False
+        steps_low_quota_tightened = False
+        account_tier_norm = ""
+
+        def _is_isolated_t1_in_convs(culprit_cid: str, t1_ts_val: float) -> bool:
+            """Causal window [t1_ts-120s, t1_ts+600s] check: another main conv has >=1 hit >= t1_ts & (>=10 hits or >=80%)."""
+            lo_w = t1_ts_val - 120.0
+            hi_w = t1_ts_val + 600.0
+            other_hits = 0
+            other_hits_after = 0
+            other_abns = 0
+            for c_other in convs:
+                if c_other.is_subagent or c_other.conversation_id == culprit_cid:
+                    continue
+                src_st = c_other._scoped_steps_all or c_other.recent_steps
+                for st_o in src_st:
+                    if lo_w <= st_o.timestamp <= hi_w:
+                        if st_o.classification == "hit":
+                            other_hits += 1
+                            if st_o.timestamp >= t1_ts_val:
+                                other_hits_after += 1
+                        elif st_o.classification == "abnormal_miss":
+                            other_abns += 1
+            if other_hits_after < 1:
+                return False
+            return bool(other_hits >= 10 or (other_hits / float(other_hits + other_abns)) >= 0.80)
+
         hist_days: List[Dict[str, Any]] = []
         recent_recov_steps = 0
+        own_hourly_v2: Dict[int, Dict[str, Any]] = {}
+        peer_hourly_v2: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        peer_tiers_v2: Dict[str, str] = {}
+        live_quota_for_v2: Tuple[Optional[float], Optional[float], Optional[float], bool] = (None, None, None, False)
+        adaptive_v2_fn = _get_compute_adaptive_steps_v2()
+
         if resolved_account:
+            is_live_resolved_acct = bool(
+                self._account_cache.online
+                and self._account_cache.short_label
+                and self._account_cache.short_label.lower() == resolved_account.lower()
+            )
+            if is_live_resolved_acct and self._account_cache.tier:
+                account_tier_norm = _normalize_tier_norm(self._account_cache.tier)
+            elif hasattr(self._ledger, "get_account_tier"):
+                account_tier_norm = self._ledger.get_account_tier(resolved_account)
+            acct_deg_min = _tier_deg_min(account_tier_norm)
+
             hist_days = self._get_account_completed_daily_history(
                 account_label=resolved_account,
                 now=now,
@@ -4745,23 +5776,51 @@ class AntigravityMonitorEngine:
             merged_acct_hourly = self._merge_account_hourly_buckets(
                 self._ledger.get_account_hourly_buckets(resolved_account),
                 self._hist_hourly_buckets_cache.get(resolved_account.lower(), {}),
+                deg_min=acct_deg_min,
             )
-            recov_hourly = dict(merged_acct_hourly)
+            own_hourly_v2 = {hk: dict(rec) for hk, rec in merged_acct_hourly.items()}
             live_cur_h = int(now // 3600)
             live_left_h = int(rolling_24h_cutoff // 3600)
             for hk_live, cnt_live in account_24h_utc_buckets.items():
-                if cnt_live > 0 and live_left_h < hk_live < live_cur_h:
-                    prev_r = recov_hourly.get(hk_live)
-                    if prev_r is None:
-                        recov_hourly[hk_live] = {"steps": cnt_live, "degraded": False, "degraded_24h_at": None}
-                    elif cnt_live > int(prev_r.get("steps", 0) or 0):
-                        recov_hourly[hk_live] = {
-                            "steps": cnt_live,
-                            "degraded": bool(prev_r.get("degraded", False)),
-                            "degraded_24h_at": prev_r.get("degraded_24h_at"),
-                        }
-            # Reflect today's live T1 degradations even under --readonly / cold-start before ledger persistence
-            today_live_deg_hours: set[int] = set()
+                if cnt_live <= 0:
+                    continue
+                if hk_live <= live_left_h and hk_live in own_hourly_v2 and int(own_hourly_v2[hk_live].get("steps", 0) or 0) >= cnt_live:
+                    continue
+                m_arr = account_24h_utc_meta.get(hk_live)
+                lm = m_arr[0] if m_arr else 0
+                lsub = m_arr[1] if m_arr else 0
+                llt = m_arr[2] if m_arr else 0
+                lp3 = m_arr[3] if m_arr else 0
+                luc = int(round(m_arr[4] / 1000.0)) if m_arr else 0
+                prev_r = own_hourly_v2.get(hk_live)
+                if prev_r is None:
+                    own_hourly_v2[hk_live] = {
+                        "steps": cnt_live,
+                        "degraded": False,
+                        "degraded_24h_at": None,
+                        "dk": "",
+                        "m": lm,
+                        "sub": lsub,
+                        "lt": min(cnt_live, llt),
+                        "p3": min(cnt_live, lp3),
+                        "uc": luc,
+                    }
+                else:
+                    merged_s = max(int(prev_r.get("steps", 0) or 0), cnt_live)
+                    own_hourly_v2[hk_live] = {
+                        "steps": merged_s,
+                        "degraded": bool(prev_r.get("degraded", False)),
+                        "degraded_24h_at": prev_r.get("degraded_24h_at"),
+                        "dk": str(prev_r.get("dk", "") or ""),
+                        "m": max(int(prev_r.get("m", 0) or 0), lm),
+                        "sub": max(int(prev_r.get("sub", 0) or 0), lsub),
+                        "lt": min(merged_s, max(int(prev_r.get("lt", 0) or 0), llt)),
+                        "p3": min(merged_s, max(int(prev_r.get("p3", 0) or 0), lp3)),
+                        "uc": max(int(prev_r.get("uc", 0) or 0), luc),
+                    }
+
+            # Reflect today's live T1 degradations with [t1_ts-120s, t1_ts+600s] causal t1_single vs t1_multi classification
+            live_t1_by_hk: Dict[int, List[Tuple[str, float]]] = {}
             for c_live in convs:
                 steps_live = c_live._scoped_steps_all or c_live.recent_steps
                 consec_abn = 0
@@ -4769,38 +5828,161 @@ class AntigravityMonitorEngine:
                     if st_live.classification == "abnormal_miss":
                         consec_abn += 1
                         if consec_abn >= T1_CONSEC_MISS_THRESHOLD and st_live.timestamp >= today_start:
-                            today_live_deg_hours.add(int(st_live.timestamp // 3600))
+                            live_t1_by_hk.setdefault(int(st_live.timestamp // 3600), []).append(
+                                (c_live.conversation_id, st_live.timestamp)
+                            )
                     elif st_live.classification == "hit":
                         consec_abn = 0
-                if (
-                    c_live is severe_frequent_miss_conv
-                    and c_live.last_abnormal_ts >= today_start
-                ):
-                    today_live_deg_hours.add(int(c_live.last_abnormal_ts // 3600))
-            for deg_hk in today_live_deg_hours:
-                prev_r = recov_hourly.get(deg_hk)
-                recov_hourly[deg_hk] = {
-                    "steps": max(
-                        int(prev_r.get("steps", 0) or 0) if prev_r else 0,
-                        int(account_24h_utc_buckets.get(deg_hk, 0) or 0),
-                        1,
-                    ),
-                    "degraded": True,
-                    "degraded_24h_at": prev_r.get("degraded_24h_at") if prev_r else None,
+                if c_live is severe_frequent_miss_conv and c_live.last_abnormal_ts >= today_start:
+                    live_t1_by_hk.setdefault(int(c_live.last_abnormal_ts // 3600), []).append(
+                        (c_live.conversation_id, c_live.last_abnormal_ts)
+                    )
+
+            for deg_hk, t1_items in live_t1_by_hk.items():
+                distinct_cids = {cid_i for cid_i, _ in t1_items}
+                is_single_t1 = (
+                    len(distinct_cids) == 1
+                    and _is_isolated_t1_in_convs(next(iter(distinct_cids)), max(ts_i for _, ts_i in t1_items))
+                )
+                prev_r = own_hourly_v2.get(deg_hk)
+                steps_for_hk = max(
+                    int(prev_r.get("steps", 0) or 0) if prev_r else 0,
+                    int(account_24h_utc_buckets.get(deg_hk, 0) or 0),
+                    1,
+                )
+                prev_deg = bool(prev_r.get("degraded", False)) if prev_r else False
+                prev_dk = str(prev_r.get("dk", "") or "") if prev_r else ""
+                if is_single_t1:
+                    new_deg_v = prev_deg
+                    if new_deg_v:
+                        # Never let t1_single whitewash an existing account-wide degradation in the same hour
+                        new_dk_v = "" if prev_dk.strip().lower() == "t1_single" else prev_dk
+                    else:
+                        new_dk_v = _pick_more_severe_deg_kind(prev_dk, "t1_single")
+                else:
+                    new_deg_v = True
+                    new_dk_v = _pick_more_severe_deg_kind(prev_dk, "t1_multi")
+                own_hourly_v2[deg_hk] = {
+                    "steps": steps_for_hk,
+                    "degraded": new_deg_v,
+                    "degraded_24h_at": prev_r.get("degraded_24h_at") if (prev_r and new_deg_v) else None,
+                    "dk": new_dk_v,
+                    "m": int(prev_r.get("m", 0) or 0) if prev_r else 0,
+                    "sub": int(prev_r.get("sub", 0) or 0) if prev_r else 0,
+                    "lt": int(prev_r.get("lt", 0) or 0) if prev_r else 0,
+                    "p3": int(prev_r.get("p3", 0) or 0) if prev_r else 0,
+                    "uc": int(prev_r.get("uc", 0) or 0) if prev_r else 0,
                 }
-            recent_recov_steps = self._compute_recent_unsettled_recovery_steps(recov_hourly, now)
-            (
-                eff_steps_warn,
-                eff_steps_alert,
-                steps_limit_mode,
-                steps_limit_note,
-                acct_hist_safe_peak,
-            ) = compute_adaptive_daily_steps_limits(
-                base_steps_warn,
-                base_steps_alert,
-                hist_days,
-                recent_recovery_steps=recent_recov_steps,
-            )
+
+            live_wk_burn_v2: Optional[float] = None
+            if is_live_resolved_acct:
+                live_quota_for_v2 = (
+                    self._account_cache.five_hour_pct,
+                    self._account_cache.weekly_pct,
+                    self._account_cache.burn_pct_per_hour,
+                    bool(self._account_cache.will_exhaust_before_reset),
+                )
+                act_p_obj = self._account_cache.pools.get(active_family)
+                if act_p_obj is not None:
+                    live_wk_burn_v2 = getattr(act_p_obj, "weekly_burn_pct_per_hour", None)
+
+            if adaptive_v2_fn is not None:
+                if hasattr(self._ledger, "get_all_account_tiers"):
+                    peer_tiers_v2 = self._ledger.get_all_account_tiers()
+                if account_tier_norm:
+                    peer_tiers_v2[resolved_account] = account_tier_norm
+                peer_tiers_low = {k.lower(): v for k, v in peer_tiers_v2.items()}
+                if hasattr(self._ledger, "get_all_hourly_step_buckets"):
+                    peer_hourly_v2 = self._ledger.get_all_hourly_step_buckets()
+                for scan_acct_low, scan_hmap in self._hist_hourly_buckets_cache.items():
+                    if not scan_hmap:
+                        continue
+                    match_k = next((k for k in peer_hourly_v2 if k.lower() == scan_acct_low), None)
+                    if match_k is None:
+                        peer_hourly_v2[scan_acct_low] = {hk: dict(v) for hk, v in scan_hmap.items()}
+                    else:
+                        p_dm = _tier_deg_min(peer_tiers_low.get(scan_acct_low, ""))
+                        peer_hourly_v2[match_k] = self._merge_account_hourly_buckets(
+                            peer_hourly_v2[match_k], scan_hmap, deg_min=p_dm
+                        )
+
+                def _apply_adaptive_v2(grade_hint: str) -> None:
+                    nonlocal eff_steps_warn, eff_steps_alert, steps_limit_mode, steps_limit_note
+                    nonlocal acct_hist_safe_peak, steps_detail_lines, steps_peer_prior_peak
+                    nonlocal steps_peer_weight_pct, steps_effective_weighted_24h
+                    nonlocal steps_pool_24h, steps_gemini_24h, steps_3p_24h
+                    nonlocal steps_quota_headroom, steps_soft_over_limit, steps_low_quota_tightened
+                    res_v2 = adaptive_v2_fn(
+                        base_steps_warn,
+                        base_steps_alert,
+                        own_hourly_v2,
+                        now_ts=now,
+                        account_tier=account_tier_norm,
+                        pool_family=active_family,
+                        peer_hourly_by_account=peer_hourly_v2,
+                        peer_tiers=peer_tiers_v2,
+                        account_label=resolved_account,
+                        live_grade=grade_hint,
+                        live_24h_raw_steps=rolling_24h_steps,
+                        live_5h_pct=live_quota_for_v2[0],
+                        live_weekly_pct=live_quota_for_v2[1],
+                        burn_pct_per_hour=live_quota_for_v2[2],
+                        weekly_burn_pct_per_hour=live_wk_burn_v2,
+                        will_exhaust_before_reset=live_quota_for_v2[3],
+                        last_1h_steps=last_1h_steps,
+                    )
+                    eff_steps_warn = res_v2.warn_limit
+                    eff_steps_alert = res_v2.alert_limit
+                    steps_limit_mode = res_v2.mode
+                    steps_limit_note = res_v2.note
+                    acct_hist_safe_peak = res_v2.hist_safe_peak
+                    steps_detail_lines = tuple(res_v2.detail_lines)
+                    steps_peer_prior_peak = res_v2.peer_prior_peak
+                    steps_peer_weight_pct = res_v2.peer_weight_pct
+                    steps_effective_weighted_24h = (
+                        res_v2.effective_weighted_steps if res_v2.effective_weighted_steps > 0 else rolling_24h_steps
+                    )
+                    # Keep pool breakdown strictly aligned with rolling_24h_steps basis (fallback to ledger bucket sum only when live == 0)
+                    if (steps_gemini_24h_live + steps_3p_24h_live) > 0 or rolling_24h_steps > 0:
+                        steps_gemini_24h = steps_gemini_24h_live
+                        steps_3p_24h = steps_3p_24h_live
+                    else:
+                        steps_gemini_24h = int(getattr(res_v2, "gemini_24h_steps", 0) or 0)
+                        steps_3p_24h = int(getattr(res_v2, "third_party_24h_steps", 0) or 0)
+                    steps_pool_24h = steps_3p_24h if active_family == "3p" else steps_gemini_24h
+                    steps_quota_headroom = res_v2.quota_headroom_steps
+                    steps_soft_over_limit = bool(res_v2.soft_over_limit)
+                    steps_low_quota_tightened = bool(res_v2.low_quota_tightened)
+
+                _apply_adaptive_v2("T0")
+                # Fallback to legacy daily_step_profiles ONLY when zero hourly buckets exist yet
+                if (not own_hourly_v2) and hist_days and steps_limit_mode == "default":
+                    (
+                        eff_steps_warn,
+                        eff_steps_alert,
+                        steps_limit_mode,
+                        steps_limit_note,
+                        acct_hist_safe_peak,
+                    ) = compute_adaptive_daily_steps_limits(
+                        base_steps_warn,
+                        base_steps_alert,
+                        hist_days,
+                        recent_recovery_steps=0,
+                    )
+            else:
+                recent_recov_steps = self._compute_recent_unsettled_recovery_steps(own_hourly_v2, now)
+                (
+                    eff_steps_warn,
+                    eff_steps_alert,
+                    steps_limit_mode,
+                    steps_limit_note,
+                    acct_hist_safe_peak,
+                ) = compute_adaptive_daily_steps_limits(
+                    base_steps_warn,
+                    base_steps_alert,
+                    hist_days,
+                    recent_recovery_steps=recent_recov_steps,
+                )
 
         hub_pid_alive_val = bool(self._account_cache.online or self._any_hub_pid_alive)
         level, grade, headline, sub_headline, t2_recovery_note = self._evaluate_health(
@@ -4836,35 +6018,38 @@ class AntigravityMonitorEngine:
             hub_pid_alive=hub_pid_alive_val,
             cache_culprit_summary=cache_culprit_summary,
             downgraded_stale_t1=downgraded_stale_t1,
+            t2_affected_model=t2_affected_model,
         )
 
-        # If the live frame itself is actively degraded (T1/T2/T3), NEVER lift a prior adaptive_down tightening
-        # based on unsettled pre-degradation hours (covers --readonly, cold-start, and first degraded tick).
+        # Lock adaptive thresholds against live non-T0 grades (T1/T2/T3 forbids relaxation/unban; non-T0 clears soft_over_limit)
         if (
             resolved_account
             and (not is_historical_rating)
             and (not is_custom_account_view)
-            and grade in ("T1", "T2", "T3")
-            and recent_recov_steps > 0
+            and grade != "T0"
         ):
-            (
-                eff_steps_warn,
-                eff_steps_alert,
-                steps_limit_mode,
-                steps_limit_note,
-                acct_hist_safe_peak,
-            ) = compute_adaptive_daily_steps_limits(
-                base_steps_warn,
-                base_steps_alert,
-                hist_days,
-                recent_recovery_steps=0,
-            )
+            if adaptive_v2_fn is not None:
+                _apply_adaptive_v2(grade)
+            elif grade in ("T1", "T2", "T3") and recent_recov_steps > 0:
+                (
+                    eff_steps_warn,
+                    eff_steps_alert,
+                    steps_limit_mode,
+                    steps_limit_note,
+                    acct_hist_safe_peak,
+                ) = compute_adaptive_daily_steps_limits(
+                    base_steps_warn,
+                    base_steps_alert,
+                    hist_days,
+                    recent_recovery_steps=0,
+                )
 
         # Ensure IDLE offline state never leaks stale log/outage/T2 error fields
         if grade == "IDLE" and not is_custom_account_view:
             recent_log = {"503": 0, "timeout": 0, "403": 0, "retry": 0}
             notable_events = []
             annotated_notable = []
+            recent_events_by_cat = {"503": [], "timeout": [], "403": [], "retry": []}
             heavy_media_timeout_count = 0
             last_t2_error_ts = 0.0
             t2_recovery_note = ""
@@ -4877,17 +6062,16 @@ class AntigravityMonitorEngine:
             # Resolve true degradation timestamp once for both hourly buckets and daily compatibility profile (never fall back to blind `now`!)
             is_deg_grade = grade in ("T1", "T2", "T3")
             deg_ts = 0.0
+            t1_culprit_convs: List[ConversationSummary] = []
             if is_deg_grade:
                 if grade == "T1":
-                    t1_ts = max(
-                        (
-                            c.last_abnormal_ts
-                            for c in recent_active
-                            if c.last_abnormal_ts > 0.0
-                            and (c.consec_miss >= T1_CONSEC_MISS_THRESHOLD or c is severe_frequent_miss_conv)
-                        ),
-                        default=0.0,
-                    )
+                    t1_culprit_convs = [
+                        c
+                        for c in recent_active
+                        if c.last_abnormal_ts > 0.0
+                        and (c.consec_miss >= T1_CONSEC_MISS_THRESHOLD or c is severe_frequent_miss_conv)
+                    ]
+                    t1_ts = max((c.last_abnormal_ts for c in t1_culprit_convs), default=0.0)
                     if t1_ts > 0.0:
                         deg_ts = t1_ts
                 elif grade == "T2" and last_t2_error_ts > 0.0:
@@ -4897,9 +6081,39 @@ class AntigravityMonitorEngine:
                     if t3_ts > 0.0:
                         deg_ts = t3_ts
 
+            is_live_t1_isolated_single = False
+            if grade == "T1" and deg_ts > 0.0:
+                deg_h_chk = int(deg_ts // 3600)
+                same_hour_t1_cids = {
+                    c.conversation_id
+                    for c in t1_culprit_convs
+                    if int(c.last_abnormal_ts // 3600) == deg_h_chk
+                }
+                # Also check all convs in the same hour for any second T1 culprit
+                for c_chk in convs:
+                    if c_chk.conversation_id in same_hour_t1_cids:
+                        continue
+                    steps_chk = c_chk._scoped_steps_all or c_chk.recent_steps
+                    ca = 0
+                    for st_chk in steps_chk:
+                        if st_chk.classification == "abnormal_miss":
+                            ca += 1
+                            if ca >= T1_CONSEC_MISS_THRESHOLD and int(st_chk.timestamp // 3600) == deg_h_chk:
+                                same_hour_t1_cids.add(c_chk.conversation_id)
+                                break
+                        elif st_chk.classification == "hit":
+                            ca = 0
+                if len(same_hour_t1_cids) == 1:
+                    is_live_t1_isolated_single = _is_isolated_t1_in_convs(next(iter(same_hour_t1_cids)), deg_ts)
+
             if today_steps > 0:
-                # Never attribute a prior-day lingering degradation (e.g. 23:55 T2 persisting at 00:02) to today's daily profile!
-                is_today_degraded = is_deg_grade and (deg_ts > 0.0) and (deg_ts >= today_start)
+                # Never attribute a prior-day lingering degradation or isolated t1_single drift to today's daily profile!
+                is_today_degraded = (
+                    is_deg_grade
+                    and (not is_live_t1_isolated_single)
+                    and (deg_ts > 0.0)
+                    and (deg_ts >= today_start)
+                )
                 self._ledger.record_daily_step_profile(
                     short_label=resolved_account,
                     date_str=today_str,
@@ -4911,6 +6125,7 @@ class AntigravityMonitorEngine:
             left_edge_h = int(rolling_24h_cutoff // 3600)
             persist_buckets = {hk: cnt for hk, cnt in account_24h_utc_buckets.items() if hk > left_edge_h and cnt > 0}
             degraded_hours: Optional[Dict[int, Optional[int]]] = None
+            degraded_kinds: Optional[Dict[int, str]] = None
             if is_deg_grade and deg_ts > 0.0:
                 deg_h = int(deg_ts // 3600)
                 target_deg_h: Optional[int] = None
@@ -4930,31 +6145,61 @@ class AntigravityMonitorEngine:
                             if cand_hs:
                                 target_deg_h = max(cand_hs)
                 if target_deg_h is not None:
-                    anchor_key = (resolved_account.lower(), int(round(deg_ts)))
-                    if anchor_key in self._recorded_deg_anchors:
-                        # Reuse frozen initial load for this exact degradation event (prevents write storms & load drift as old steps slide out!)
-                        frozen_at = self._recorded_deg_anchors[anchor_key]
-                        self._recorded_deg_anchors.move_to_end(anchor_key)
-                    else:
-                        # Only record live rolling_24h_steps when observed within 120s of the degradation event;
-                        # for stale pre-restart degradations pass None so historical two-pointer scan restores exact load.
-                        if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
-                            frozen_at = int(rolling_24h_steps)
-                        else:
-                            frozen_at = None
-                        self._recorded_deg_anchors[anchor_key] = frozen_at
-                        while len(self._recorded_deg_anchors) > 64:
-                            self._recorded_deg_anchors.popitem(last=False)
-                    degraded_hours = {target_deg_h: frozen_at}
                     if target_deg_h not in persist_buckets and account_24h_utc_buckets.get(target_deg_h, 0) > 0:
                         persist_buckets[target_deg_h] = account_24h_utc_buckets[target_deg_h]
-            if persist_buckets or degraded_hours:
-                self._ledger.record_hourly_step_buckets(
-                    short_label=resolved_account,
-                    hour_counts=persist_buckets,
-                    degraded_hours=degraded_hours,
-                    now_ts=now,
-                )
+                    if grade == "T1" and is_live_t1_isolated_single:
+                        # Isolated single-conversation T1 persists cleanly as d=False, dk="t1_single"
+                        degraded_hours = None
+                        degraded_kinds = {target_deg_h: "t1_single"}
+                    else:
+                        anchor_key = (resolved_account.lower(), int(round(deg_ts)))
+                        if anchor_key in self._recorded_deg_anchors:
+                            # Reuse frozen initial load for this exact degradation event (prevents write storms & load drift as old steps slide out!)
+                            frozen_at = self._recorded_deg_anchors[anchor_key]
+                            self._recorded_deg_anchors.move_to_end(anchor_key)
+                        else:
+                            # Only record live rolling_24h_steps when observed within 120s of the degradation event;
+                            # for stale pre-restart degradations pass None so historical two-pointer scan restores exact load.
+                            if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
+                                frozen_at = int(rolling_24h_steps)
+                            else:
+                                frozen_at = None
+                            self._recorded_deg_anchors[anchor_key] = frozen_at
+                            while len(self._recorded_deg_anchors) > 64:
+                                self._recorded_deg_anchors.popitem(last=False)
+                        degraded_hours = {target_deg_h: frozen_at}
+                        dk_code = "t3" if grade == "T3" else ("t2" if grade == "T2" else "t1_multi")
+                        degraded_kinds = {target_deg_h: dk_code}
+
+            persist_meta: Dict[int, Dict[str, Any]] = {}
+            for hk_p in persist_buckets:
+                m_arr = account_24h_utc_meta.get(hk_p)
+                if m_arr is not None:
+                    persist_meta[hk_p] = {
+                        "m": m_arr[0],
+                        "sub": m_arr[1],
+                        "lt": m_arr[2],
+                        "p3": m_arr[3],
+                        "uc": int(round(m_arr[4] / 1000.0)),
+                    }
+            if persist_buckets or degraded_hours or degraded_kinds:
+                try:
+                    self._ledger.record_hourly_step_buckets(
+                        short_label=resolved_account,
+                        hour_counts=persist_buckets,
+                        degraded_hours=degraded_hours,
+                        now_ts=now,
+                        hour_meta=persist_meta or None,
+                        degraded_kinds=degraded_kinds,
+                        deg_min=_tier_deg_min(account_tier_norm),
+                    )
+                except TypeError:
+                    self._ledger.record_hourly_step_buckets(
+                        short_label=resolved_account,
+                        hour_counts=persist_buckets,
+                        degraded_hours=degraded_hours,
+                        now_ts=now,
+                    )
 
         # Compute thread-safe current-24h degradation indicator inside engine lock for UI tooltip preview
         current_24h_has_degradation = grade in ("T1", "T2", "T3")
@@ -5053,7 +6298,10 @@ class AntigravityMonitorEngine:
             recent_events=notable_events,
             wasted_cold_tokens_total=wasted_total,
             max_consec_miss=max_consec_miss,
-            account=replace(self._account_cache, pools=dict(self._account_cache.pools)),
+            account=replace(
+                self._account_cache,
+                pools={pn: replace(pl) for pn, pl in self._account_cache.pools.items()},
+            ),
             sliding_window_min=self.config["log_sliding_window_min"],
             freshness_window_sec=self.config["freshness_window_sec"],
             alerts=alerts,
@@ -5123,6 +6371,29 @@ class AntigravityMonitorEngine:
             primary_hit_is_revert=primary_hit_is_revert,
             cache_culprit_summary=cache_culprit_summary,
             log_session_start_ts=self._log_tailer.get_session_start_ts(),
+            min_freshness_window_sec=min_fresh_window_sec,
+            min_freshness_zone=min_fresh_zone,
+            expiring_soon_count=expiring_soon_count,
+            recent_events_by_cat=recent_events_by_cat,
+            total_matched_conversations=total_matched_conversations,
+            total_matched_main=total_matched_main,
+            total_matched_sub=total_matched_sub,
+            primary_sustained_slow=primary_sustained_slow,
+            primary_effective_slow_tps_th=primary_eff_tps_th,
+            primary_effective_slow_ttft_th=primary_eff_ttft_th,
+            primary_media_ttft_exempted=primary_media_ttft_exempted,
+            primary_large_ctx_ttft_allowance_sec=primary_large_ctx_allow,
+            steps_detail_lines=steps_detail_lines,
+            steps_peer_prior_peak=steps_peer_prior_peak,
+            steps_peer_weight_pct=steps_peer_weight_pct,
+            steps_effective_weighted_24h=steps_effective_weighted_24h,
+            steps_pool_24h=steps_pool_24h,
+            steps_gemini_24h=steps_gemini_24h,
+            steps_3p_24h=steps_3p_24h,
+            steps_quota_headroom=steps_quota_headroom,
+            steps_soft_over_limit=steps_soft_over_limit,
+            steps_low_quota_tightened=steps_low_quota_tightened,
+            account_tier_norm=account_tier_norm,
         )
 
     @staticmethod
@@ -5151,7 +6422,7 @@ class AntigravityMonitorEngine:
         upper_hist_ts = max(today_start, float(settled_end_h) * 3600.0)
         hist_rules = self._observe_and_get_rule_timestamps(now, since_ts=hist_cutoff)
         hist_rule_sig = tuple(round(t, 1) for t in hist_rules[-64:])
-        idle_sec = int(self.config.get("idle_rewarm_sec", 180))
+        idle_sec = int(self.config.get("idle_rewarm_sec", 210))
         min_cache_tok = int(self.config.get("min_cacheable_tokens", 32000))
         last_tl = timeline[-1] if timeline else None
         cache_key = (
@@ -5203,14 +6474,19 @@ class AntigravityMonitorEngine:
             cands = []
         cands.sort(key=lambda x: x[0], reverse=True)
 
-        acct_all_events: Dict[str, List[Tuple[float, bool]]] = {}
+        # Event tuple: (ts, is_t1, cid, is_sub, is_hit, is_abn, is_lt, is_p3, uc_tokens)
+        acct_all_events: Dict[str, List[Tuple[float, bool, str, bool, bool, bool, bool, bool, int]]] = {}
         processed_hist_convs = 0
         for _mtime, cid, tp in cands[:600]:
             self._maybe_yield_for_ui()
             cached = self._transcript_cache.get(cid)
-            raw_steps: List[Dict[str, Any]]
+            raw_steps: List[Any]
+            has_ue_h = False
+            has_sm_h = False
             if cached is not None:
                 raw_steps = cached[1]
+                has_ue_h = bool(cached[2])
+                has_sm_h = bool(cached[3])
                 if not raw_steps or float(raw_steps[0].get("timestamp", 0.0) or 0.0) >= upper_hist_ts:
                     continue
             else:
@@ -5220,6 +6496,10 @@ class AntigravityMonitorEngine:
                 try:
                     with tp.open("rb") as fh:
                         for raw_line in fh:
+                            if not has_ue_h and b'"USER_EXPLICIT"' in raw_line:
+                                has_ue_h = True
+                            elif not has_ue_h and not has_sm_h and (b'"SUBAGENT"' in raw_line or b'subagent' in raw_line[:320].lower() or b'<swarm_worker>' in raw_line[:320]):
+                                has_sm_h = True
                             has_pr = b'"PLANNER_RESPONSE"' in raw_line
                             if not has_pr:
                                 if b'"CHECKPOINT"' in raw_line:
@@ -5303,12 +6583,15 @@ class AntigravityMonitorEngine:
             processed_hist_convs += 1
             if processed_hist_convs > 240:
                 break
+            is_sub_hist = (not has_ue_h) and (has_sm_h or self._check_subagent_hint_cached(cid))
             steps = classify_steps(
                 raw_steps,
                 idle_rewarm_sec=idle_sec,
                 min_cacheable_tokens=min_cache_tok,
                 account_switches=hist_switches,
                 rule_change_timestamps=hist_rules,
+                enum_map=self._model_enum_map,
+                use_model_adaptive_idle=True,
             )
             consec = 0
             win10: Deque[str] = deque(maxlen=10)
@@ -5346,31 +6629,129 @@ class AntigravityMonitorEngine:
                     continue
                 if not acct_low:
                     continue
-                acct_all_events.setdefault(acct_low, []).append((st_rec.timestamp, is_t1_step))
+                res_m = resolve_model_label(st_rec.model, enum_map=self._model_enum_map) if st_rec.model else ""
+                is_lt = _is_light_immune_model(res_m) if res_m else False
+                is_p3 = (self._classify_model_pool(res_m, st_rec.model) == "3p") if res_m else False
+                acct_all_events.setdefault(acct_low, []).append(
+                    (
+                        st_rec.timestamp,
+                        is_t1_step,
+                        cid,
+                        is_sub_hist,
+                        st_rec.classification == "hit",
+                        st_rec.classification == "abnormal_miss",
+                        is_lt,
+                        is_p3,
+                        int(st_rec.input_tokens),
+                    )
+                )
 
         for acct_low, ev_all in acct_all_events.items():
             ev_all.sort(key=lambda x: x[0])
+            acct_tier = (
+                self._ledger.get_account_tier(acct_low)
+                if hasattr(self._ledger, "get_account_tier")
+                else ""
+            )
+            deg_min = _tier_deg_min(acct_tier)
+
+            main_hit_ts: List[float] = []
+            main_hit_cids: List[str] = []
+            main_abn_ts: List[float] = []
+            main_abn_cids: List[str] = []
+            for ts_v, _is_t1, cid_e, is_sub_e, is_hit_e, is_abn_e, _is_lt, _is_p3, _uc in ev_all:
+                if not is_sub_e:
+                    if is_hit_e:
+                        main_hit_ts.append(ts_v)
+                        main_hit_cids.append(cid_e)
+                    elif is_abn_e:
+                        main_abn_ts.append(ts_v)
+                        main_abn_cids.append(cid_e)
+
             hmap: Dict[int, Dict[str, Any]] = {}
-            day_events: Dict[str, List[bool]] = {}
+            hk_t1_events: Dict[int, List[Tuple[float, str, int]]] = {}
             left = 0
-            for idx_e, (ts_v, is_t1) in enumerate(ev_all):
+            for idx_e, (ts_v, is_t1, cid_e, is_sub_e, _is_hit, _is_abn, is_lt, is_p3, uc_tok) in enumerate(ev_all):
                 while left < idx_e and (ts_v - ev_all[left][0]) > 86400.0:
                     left += 1
                 win_24h_load = idx_e - left + 1
                 hk = int(ts_v // 3600)
                 slot = hmap.get(hk)
                 if slot is None:
-                    slot = {"steps": 0, "degraded": False, "degraded_24h_at": None}
+                    slot = {
+                        "steps": 0,
+                        "degraded": False,
+                        "degraded_24h_at": None,
+                        "dk": "",
+                        "m": 0,
+                        "sub": 0,
+                        "lt": 0,
+                        "p3": 0,
+                        "uc_raw": 0,
+                    }
                     hmap[hk] = slot
                 slot["steps"] += 1
+                if is_sub_e:
+                    slot["sub"] += 1
+                else:
+                    slot["m"] += 1
+                if is_lt:
+                    slot["lt"] += 1
+                if is_p3:
+                    slot["p3"] += 1
+                slot["uc_raw"] += uc_tok
                 if is_t1:
-                    slot["degraded"] = True
-                    slot["degraded_24h_at"] = _pick_preferred_deg_at(slot["degraded_24h_at"], win_24h_load)
+                    hk_t1_events.setdefault(hk, []).append((ts_v, cid_e, win_24h_load))
 
+            t1_single_hours: set[int] = set()
+            for hk, t1_list in hk_t1_events.items():
+                slot = hmap[hk]
+                t1_cids = {c for _, c, _ in t1_list}
+                is_isolated_single = False
+                if len(t1_cids) == 1:
+                    culprit_cid = next(iter(t1_cids))
+                    t1_ts = max(t for t, _, _ in t1_list)
+                    lo_w = t1_ts - 120.0
+                    hi_w = t1_ts + 600.0
+                    hi_l = bisect.bisect_left(main_hit_ts, lo_w)
+                    hi_r = bisect.bisect_right(main_hit_ts, hi_w)
+                    other_hits = 0
+                    other_hits_after = 0
+                    for j in range(hi_l, hi_r):
+                        if main_hit_cids[j] != culprit_cid:
+                            other_hits += 1
+                            if main_hit_ts[j] >= t1_ts:
+                                other_hits_after += 1
+                    if other_hits_after >= 1:
+                        ab_l = bisect.bisect_left(main_abn_ts, lo_w)
+                        ab_r = bisect.bisect_right(main_abn_ts, hi_w)
+                        other_abns = sum(1 for j in range(ab_l, ab_r) if main_abn_cids[j] != culprit_cid)
+                        if other_hits >= 10 or (other_hits / float(other_hits + other_abns)) >= 0.80:
+                            is_isolated_single = True
+                if is_isolated_single:
+                    t1_single_hours.add(hk)
+                    slot["degraded"] = False
+                    slot["dk"] = "t1_single"
+                    slot["degraded_24h_at"] = None
+                else:
+                    slot["degraded"] = True
+                    slot["dk"] = "t1_multi"
+                    for _, _, load_v in t1_list:
+                        slot["degraded_24h_at"] = _pick_preferred_deg_at(
+                            slot["degraded_24h_at"], load_v, deg_min=deg_min
+                        )
+
+            for slot in hmap.values():
+                uc_raw_v = int(slot.pop("uc_raw", 0) or 0)
+                slot["uc"] = int(round(uc_raw_v / 1000.0))
+
+            day_events: Dict[str, List[bool]] = {}
+            for ts_v, is_t1, _cid_e, _is_sub, _is_hit, _is_abn, _is_lt, _is_p3, _uc in ev_all:
                 if ts_v < today_start:
                     d_str = datetime.datetime.fromtimestamp(ts_v).strftime("%Y-%m-%d")
                     if d_str < today_str:
-                        day_events.setdefault(d_str, []).append(is_t1)
+                        eff_t1 = bool(is_t1 and (int(ts_v // 3600) not in t1_single_hours))
+                        day_events.setdefault(d_str, []).append(eff_t1)
 
             if hmap:
                 hist_hourly[acct_low] = hmap
@@ -5379,8 +6760,8 @@ class AntigravityMonitorEngine:
                 deg_at: Optional[int] = None
                 for step_ord, is_t1 in enumerate(flags, 1):
                     if is_t1:
-                        deg_at = _pick_preferred_deg_at(deg_at, step_ord)
-                        if deg_at is not None and deg_at >= 400:
+                        deg_at = _pick_preferred_deg_at(deg_at, step_ord, deg_min=deg_min)
+                        if deg_at is not None and deg_at >= deg_min:
                             break
                 profiles.setdefault(acct_low, {})[d_str] = {
                     "safe_steps": total_s if deg_at is None else max(0, deg_at - 1),
@@ -5409,9 +6790,11 @@ class AntigravityMonitorEngine:
     def _merge_account_hourly_buckets(
         ledger_hourly: Dict[int, Dict[str, Any]],
         scan_hourly: Dict[int, Dict[str, Any]],
+        deg_min: int = 400,
     ) -> Dict[int, Dict[str, Any]]:
-        """Merge persisted ledger & scanned hourly buckets with self-healing 0-step ghost drop and live-load priority."""
+        """Merge persisted ledger & scanned hourly buckets with self-healing 0-step ghost drop, live-load priority, and full multi-dim passthrough."""
         merged_hourly: Dict[int, Dict[str, Any]] = {}
+        dm = max(1, int(deg_min or 400))
         for hk in set(ledger_hourly.keys()) | set(scan_hourly.keys()):
             l_rec = ledger_hourly.get(hk)
             s_rec = scan_hourly.get(hk)
@@ -5422,6 +6805,12 @@ class AntigravityMonitorEngine:
             if steps_v <= 0:
                 continue
             deg_v = bool((l_rec and l_rec.get("degraded")) or (s_rec and s_rec.get("degraded")))
+            l_dk = str((l_rec.get("dk") or l_rec.get("degraded_kind") or "")) if l_rec else ""
+            s_dk = str((s_rec.get("dk") or s_rec.get("degraded_kind") or "")) if s_rec else ""
+            dk_v = _pick_more_severe_deg_kind(l_dk, s_dk)
+            if deg_v and dk_v == "t1_single":
+                # Account-wide degradation (d=True) MUST NOT be downgraded/whitewashed by t1_single
+                dk_v = ""
             l_at_raw = l_rec.get("degraded_24h_at") if l_rec else None
             s_at_raw = s_rec.get("degraded_24h_at") if s_rec else None
             l_at = (
@@ -5434,18 +6823,42 @@ class AntigravityMonitorEngine:
                 if (s_at_raw is not None and not isinstance(s_at_raw, bool) and int(s_at_raw) > 0)
                 else None
             )
-            if (
+            if not deg_v:
+                deg_at: Optional[int] = None
+            elif (
                 l_rec is not None
                 and l_steps > 0
                 and l_at is not None
                 and s_at is not None
-                and l_at >= 400
-                and s_at >= 400
+                and l_at >= dm
+                and s_at >= dm
             ):
-                deg_at: Optional[int] = max(l_at, s_at)
+                deg_at = max(l_at, s_at)
             else:
-                deg_at = _pick_preferred_deg_at(l_at, s_at)
-            merged_hourly[hk] = {"steps": steps_v, "degraded": deg_v, "degraded_24h_at": deg_at}
+                deg_at = _pick_preferred_deg_at(l_at, s_at, deg_min=dm)
+
+            m_v = max(int(l_rec.get("m", 0) or 0) if l_rec else 0, int(s_rec.get("m", 0) or 0) if s_rec else 0)
+            sub_v = max(int(l_rec.get("sub", 0) or 0) if l_rec else 0, int(s_rec.get("sub", 0) or 0) if s_rec else 0)
+            lt_v = min(
+                steps_v,
+                max(int(l_rec.get("lt", 0) or 0) if l_rec else 0, int(s_rec.get("lt", 0) or 0) if s_rec else 0),
+            )
+            p3_v = min(
+                steps_v,
+                max(int(l_rec.get("p3", 0) or 0) if l_rec else 0, int(s_rec.get("p3", 0) or 0) if s_rec else 0),
+            )
+            uc_v = max(int(l_rec.get("uc", 0) or 0) if l_rec else 0, int(s_rec.get("uc", 0) or 0) if s_rec else 0)
+            merged_hourly[hk] = {
+                "steps": steps_v,
+                "degraded": deg_v,
+                "degraded_24h_at": deg_at,
+                "dk": dk_v,
+                "m": m_v,
+                "sub": sub_v,
+                "lt": lt_v,
+                "p3": p3_v,
+                "uc": uc_v,
+            }
         return merged_hourly
 
     @staticmethod
@@ -5525,9 +6938,11 @@ class AntigravityMonitorEngine:
             now, today_start, today_str, timeline, fallback_label=fallback_label
         )
         # 1. Fuse hourly buckets by hour_epoch BEFORE sliding-window evaluation (preserves cross-midnight windows after cleanup)
+        acct_tier_h = self._ledger.get_account_tier(account_label) if hasattr(self._ledger, "get_account_tier") else ""
+        acct_deg_min_h = _tier_deg_min(acct_tier_h)
         ledger_hourly = self._ledger.get_account_hourly_buckets(account_label)
         scan_hourly = self._hist_hourly_buckets_cache.get(acct_low, {})
-        merged_hourly = self._merge_account_hourly_buckets(ledger_hourly, scan_hourly)
+        merged_hourly = self._merge_account_hourly_buckets(ledger_hourly, scan_hourly, deg_min=acct_deg_min_h)
 
         settled_recs = compute_settled_rolling_24h_records(merged_hourly, now_ts=now)
         settled_by_day: Dict[str, Dict[str, Any]] = {r["date"]: r for r in settled_recs}
@@ -5558,6 +6973,7 @@ class AntigravityMonitorEngine:
             deg_at = _pick_preferred_deg_at(
                 r_set.get("degraded_at") if r_set else None,
                 r_leg.get("degraded_at") if r_leg else None,
+                deg_min=acct_deg_min_h,
             )
             safe_vals = [int(r.get("safe_steps", 0) or 0) for r in (r_set, r_leg) if r is not None]
             safe_s = max(safe_vals) if safe_vals else 0
@@ -5685,6 +7101,41 @@ class AntigravityMonitorEngine:
                 title_part = f" {truncate_display_width(title, 22)}" if title else ""
                 tag = f"{best_cid[:6]}{title_part}"
 
+                # Backfill LogEvent.model from culprit conversation's nearest prior non-empty model
+                resolved_model = ""
+                ev_ts_lim = ev.timestamp + 5.0
+                if conv_obj is not None:
+                    for src_steps in (conv_obj._scoped_steps_all, conv_obj.recent_steps):
+                        if not src_steps:
+                            continue
+                        for st_m in reversed(src_steps):
+                            if st_m.timestamp <= ev_ts_lim and st_m.model:
+                                resolved_model = format_model_name(st_m.model, enum_map=self._model_enum_map)
+                                break
+                        if resolved_model:
+                            break
+                    if not resolved_model and conv_obj.model and conv_obj.model != "未知模型":
+                        resolved_model = conv_obj.model
+                if not resolved_model:
+                    tc_ent = self._transcript_cache.get(best_cid)
+                    if tc_ent is not None and tc_ent[1]:
+                        for raw_m_item in reversed(tc_ent[1]):
+                            rts = float(
+                                raw_m_item.timestamp
+                                if isinstance(raw_m_item, _RawStepSlot)
+                                else (raw_m_item.get("timestamp", 0.0) or 0.0)
+                            )
+                            rm = str(
+                                raw_m_item.model
+                                if isinstance(raw_m_item, _RawStepSlot)
+                                else (raw_m_item.get("model", "") or "")
+                            ).strip()
+                            if rts <= ev_ts_lim and rm:
+                                resolved_model = format_model_name(rm, enum_map=self._model_enum_map)
+                                break
+                if resolved_model == "未知模型":
+                    resolved_model = ""
+
                 # Heavy-media upload timeout attribution strictly uses point-in-time snapshot (immune to later /compact!)
                 is_heavy_media_to = False
                 if ev.category == "timeout":
@@ -5711,7 +7162,7 @@ class AntigravityMonitorEngine:
                         category=ev.category,
                         summary=new_summary,
                         event_key=ev.event_key,
-                        model=ev.model,
+                        model=resolved_model or ev.model,
                         duration_sec=ev.duration_sec,
                         is_heavy_media_timeout=is_heavy_media_to,
                         media_count=best_snap_mc,
@@ -5813,12 +7264,18 @@ class AntigravityMonitorEngine:
                         b["main_post_steps"] += 1
                         if t_val is not None:
                             raw_t = float(t_val)
+                            m_th = resolve_model_speed_thresholds(
+                                st.model or mname,
+                                float(slow_tps_th),
+                                float(slow_ttft_th),
+                                enum_map=enum_map,
+                            )
                             # True low-TPS throttling is NEVER exempted by large-context or media allowance!
                             is_low_tps = bool(
                                 st.output_tokens >= 500
                                 and (s_val is None or s_val >= 1.5)
                                 and p_val is not None
-                                and float(p_val) < float(slow_tps_th)
+                                and float(p_val) < m_th.slow_tps
                             )
                             ctx_allow = 0.0 if is_low_tps else compute_large_ctx_ttft_allowance(st.total_tokens, max_ctx_cap)
                             # Module 2: Strict heavy-media sustained full-speed upload exemption
@@ -5830,17 +7287,17 @@ class AntigravityMonitorEngine:
                                 and s_val is not None
                                 and float(s_val) >= 1.5
                                 and p_val is not None
-                                and float(p_val) >= full_speed_tps_floor
+                                and float(p_val) >= m_th.full_speed_tps
                             )
                             media_mb = max(0.0, float(st.active_media_bytes)) / (1024.0 * 1024.0)
                             media_cap = min(
                                 300.0,
-                                float(slow_ttft_th) + float(st.active_media_count) * 5.0 + media_mb * 15.0 + ctx_allow,
+                                m_th.slow_ttft + float(st.active_media_count) * 5.0 + media_mb * 15.0 + ctx_allow,
                             )
                             if (
                                 is_heavy_media
                                 and is_sustained_full_speed
-                                and raw_t >= float(slow_ttft_th)
+                                and raw_t >= m_th.slow_ttft
                                 and raw_t < media_cap
                             ):
                                 b["main_media_exempt"] += 1
@@ -5925,36 +7382,46 @@ class AntigravityMonitorEngine:
         streaming_sec: Optional[float] = None,
         active_media_count: int = 0,
         active_media_bytes: int = 0,
+        model: str = "",
+        max_context_tokens: int = 512000,
     ) -> Tuple[str, bool]:
         """Classify step speed into ('ok'|'slow'|'unknown', media_ttft_exempted).
 
-        Guards against:
-        1) Ultra-short burst tool-calls (output_tokens < 500 or streaming_sec < 1.5s) false-alarming low TPS.
-        2) High-TPS steps (>= 2x slow_tps_threshold, min 80 t/s) with moderate TTFT (< 120s) proving decoding is full-speed.
-        3) Multi-media upload payload latency (~10s/MB + 3s/item, capped +120s) misattributed as backend throttling.
+        Uses per-model thresholds, continuous large-context allowance (no >=220K blind cliff),
+        verified sustained full-speed exemption (>=500 out & >=1.5s streaming), and multimodal upload grace.
         """
         if tps is None and ttft_sec is None:
             return "unknown", False
-        slow_tps_th = float(self.config["slow_tps_threshold"])
-        slow_ttft_th = float(self.config["slow_ttft_threshold_sec"])
+        th = resolve_model_speed_thresholds(
+            model,
+            float(self.config["slow_tps_threshold"]),
+            float(self.config["slow_ttft_threshold_sec"]),
+            enum_map=self._model_enum_map,
+        )
         if (
             output_tokens >= 500
             and (streaming_sec is None or streaming_sec >= 1.5)
             and tps is not None
-            and tps < slow_tps_th
+            and tps < th.slow_tps
         ):
             return "slow", False
-        if ttft_sec is not None and context_tokens < 220000:
+        if ttft_sec is not None:
+            ctx_allow = compute_large_ctx_ttft_allowance(context_tokens, max_context_tokens)
             media_mb = max(0.0, float(active_media_bytes)) / (1024.0 * 1024.0)
             media_grace = min(120.0, max(0, int(active_media_count)) * 3.0 + media_mb * 10.0)
-            ctx_grace = max(0.0, (context_tokens - 100000) / 10000.0) * 3.0
-            eff_ttft_th = slow_ttft_th + media_grace + ctx_grace
-            if ttft_sec >= slow_ttft_th:
-                # Full-speed streaming output (<120s TTFT) disproves backend throttling
-                if tps is not None and tps >= max(80.0, slow_tps_th * 2.0) and ttft_sec < 120.0:
-                    return "ok", bool(media_grace > 0.0 and ttft_sec >= (slow_ttft_th + ctx_grace))
+            eff_ttft_th = th.slow_ttft + ctx_allow + media_grace
+            if ttft_sec >= th.slow_ttft:
+                is_verified_full_speed = bool(
+                    output_tokens >= 500
+                    and streaming_sec is not None
+                    and streaming_sec >= 1.5
+                    and tps is not None
+                    and tps >= th.full_speed_tps
+                )
+                if is_verified_full_speed and ttft_sec < min(120.0 + ctx_allow, 150.0):
+                    return "ok", bool(media_grace > 0.0 and ttft_sec >= (th.slow_ttft + ctx_allow))
                 if ttft_sec < eff_ttft_th:
-                    return "ok", bool(media_grace > 0.0 and ttft_sec >= (slow_ttft_th + ctx_grace))
+                    return "ok", bool(media_grace > 0.0 and ttft_sec >= (th.slow_ttft + ctx_allow))
                 return "slow", False
         return "ok", False
 
@@ -5967,6 +7434,8 @@ class AntigravityMonitorEngine:
         streaming_sec: Optional[float] = None,
         active_media_count: int = 0,
         active_media_bytes: int = 0,
+        model: str = "",
+        max_context_tokens: int = 512000,
     ) -> str:
         status, _ = self._classify_speed_ex(
             output_tokens=output_tokens,
@@ -5976,6 +7445,8 @@ class AntigravityMonitorEngine:
             streaming_sec=streaming_sec,
             active_media_count=active_media_count,
             active_media_bytes=active_media_bytes,
+            model=model,
+            max_context_tokens=max_context_tokens,
         )
         return status
 
@@ -6013,6 +7484,7 @@ class AntigravityMonitorEngine:
         hub_pid_alive: bool = False,
         cache_culprit_summary: str = "",
         downgraded_stale_t1: bool = False,
+        t2_affected_model: str = "",
     ) -> Tuple[str, str, str, str, str]:
         win = self.config["log_sliding_window_min"]
         scope_win_txt = history_range_label if is_historical and history_range_label != "近 30 分钟" else f"近 {win} 分钟"
@@ -6063,7 +7535,11 @@ class AntigravityMonitorEngine:
         t2_recovered_info = ""
         if (server_timeout_count + eff_503) >= 2:
             stats_list = model_stats or []
-            active_is_light = _is_light_immune_model(active_model)
+            cfg_tps = float(self.config["slow_tps_threshold"])
+            cfg_ttft = float(self.config["slow_ttft_threshold_sec"])
+            target_t2_model = (t2_affected_model or "").strip() or active_model
+            target_t2_key = normalize_model_compare_key(target_t2_model, enum_map=self._model_enum_map)
+            affected_is_light = _is_light_immune_model(target_t2_model)
 
             def _eff_rep_ttft(ms: ModelPerfStats) -> Optional[float]:
                 """Always display the true unadjusted raw median TTFT (never fabricate calibrated numbers)."""
@@ -6098,36 +7574,49 @@ class AntigravityMonitorEngine:
                 steps_n = ms.main_steps_after_last_t2
                 if steps_n <= 0:
                     return False
+                m_th = resolve_model_speed_thresholds(ms.model, cfg_tps, cfg_ttft)
                 rep = _eval_rep_ttft(ms)
                 lat = _eval_latest_ttft(ms)
                 rec2 = _eval_rec2_ttft(ms)
-                if rep is not None and rep >= 45.0:
+                if rep is not None and rep >= m_th.t2_deg_median:
                     return True
-                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < 30.0:
-                    if lat is not None and lat >= 150.0:
+                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < m_th.t2_healthy_median:
+                    if lat is not None and lat >= m_th.t2_extreme_spike:
                         return True
                     return False
-                return bool(lat is not None and lat >= 60.0 and (rec2 is None or rec2 >= 60.0))
+                return bool(
+                    lat is not None
+                    and lat >= m_th.t2_latest_spike
+                    and (rec2 is None or rec2 >= m_th.t2_latest_spike)
+                )
 
             def _is_healthy_main_recovery(ms: ModelPerfStats, allow_no_ttft: bool = False) -> bool:
                 steps_n = ms.main_steps_after_last_t2
                 if steps_n < 2:
                     return False
+                m_th = resolve_model_speed_thresholds(ms.model, cfg_tps, cfg_ttft)
                 rep = _eval_rep_ttft(ms)
                 lat = _eval_latest_ttft(ms)
                 if rep is None and not allow_no_ttft:
                     return False
-                if rep is not None and rep >= 45.0:
+                if rep is not None and rep >= m_th.t2_deg_median:
                     return False
-                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < 30.0:
-                    if lat is not None and lat >= 150.0:
+                if _unexempt_ttft_steps(ms) >= 4 and rep is not None and rep < m_th.t2_healthy_median:
+                    if lat is not None and lat >= m_th.t2_extreme_spike:
                         return False
                     return True
-                if lat is not None and lat >= 60.0:
+                if lat is not None and lat >= m_th.t2_latest_spike:
                     return False
                 return True
 
-            primary_ms = next((m for m in stats_list if m.model == active_model), None)
+            def _is_same_target_model(ms: ModelPerfStats) -> bool:
+                if ms.model == target_t2_model:
+                    return True
+                if target_t2_key:
+                    return normalize_model_compare_key(ms.model, enum_map=self._model_enum_map) == target_t2_key
+                return False
+
+            primary_ms = next((m for m in stats_list if _is_same_target_model(m)), None)
             primary_degraded = primary_ms is not None and _is_degraded(primary_ms)
             elapsed_since_err = (now_ts - last_t2_error_ts) if (now_ts > 0 and last_t2_error_ts > 0) else 0.0
             err_parts = []
@@ -6158,8 +7647,8 @@ class AntigravityMonitorEngine:
                 # Only allow a non-lightweight main-conversation peer model to soften T2 -> WARN (never to green T0!)
                 peer_candidates = [
                     m for m in stats_list
-                    if m.model != active_model
-                    and (active_is_light or not _is_light_immune_model(m.model))
+                    if (not _is_same_target_model(m))
+                    and (affected_is_light or not _is_light_immune_model(m.model))
                     and _is_healthy_main_recovery(m, allow_no_ttft=False)
                 ]
                 if peer_candidates:
@@ -7125,6 +8614,11 @@ class AntigravityMonitorEngine:
             gens = self._db_reader.read_full_history(conv_id)
             is_subagent = (not has_user_explicit) and (has_subagent_marker or self._check_subagent_hint_cached(conv_id))
             aligned_gens = _align_steps_with_gen_history(all_steps, gens)
+            all_steps, _ = reconcile_model_switches_from_gens(
+                all_steps,
+                aligned_gens,
+                enum_map=self._model_enum_map,
+            )
 
             raw_view = (view_account or "").strip()
             hr_key = (history_range or "30m").strip().lower()
@@ -7287,17 +8781,21 @@ class AntigravityMonitorEngine:
                 else:
                     break
 
+            eff_latest_model_raw = latest.model or latest_resolved_model_raw
+            detail_fw = resolve_model_freshness_window_sec(
+                eff_latest_model_raw,
+                int(self.config["freshness_window_sec"]),
+            )
             fresh_rem: Optional[int] = None
             fresh_invalid = ""
             if not scope_label and latest.total_tokens >= self.config["large_context_threshold"] and latest.timestamp > 0:
                 age = now - latest.timestamp
-                if age <= self.config["freshness_window_sec"] + 300:
+                if age <= detail_fw + 300:
                     if latest.classification == "abnormal_miss":
                         fresh_invalid = _format_freshness_invalid_reason(consec_miss, latest.reason)
                     else:
-                        fresh_rem = int(self.config["freshness_window_sec"] - age)
+                        fresh_rem = int(detail_fw - age)
 
-            eff_latest_model_raw = latest.model or latest_resolved_model_raw
             return ConversationDetailReport(
                 conversation_id=conv_id,
                 short_id=conv_id[:6],
@@ -7323,7 +8821,7 @@ class AntigravityMonitorEngine:
                 latest_ttft_sec=latest_ttft,
                 freshness_remaining_sec=fresh_rem,
                 freshness_invalid_reason=fresh_invalid,
-                freshness_window_sec=self.config["freshness_window_sec"],
+                freshness_window_sec=detail_fw,
                 points=points,
                 title=self._resolve_conv_title(conv_id),
                 revert_count=revert_count,
@@ -7484,6 +8982,7 @@ class AntigravityMonitorEngine:
     @staticmethod
     def _sync_account_active_pool(info: AccountQuotaInfo, active_family: str) -> None:
         info.quota_family = active_family
+        info.tier_label, info.tier_short = resolve_tier_display(info.tier)
         chosen = info.pools.get(active_family)
         if chosen is None and info.pools:
             chosen = next(iter(info.pools.values()))
@@ -7492,6 +8991,64 @@ class AntigravityMonitorEngine:
             info.weekly_pct = chosen.weekly_pct
             info.five_hour_reset_at = chosen.five_hour_reset_at
             info.weekly_reset_at = chosen.weekly_reset_at
+            info.five_hour_reset_in_sec = chosen.five_hour_reset_in_sec
+            info.weekly_reset_in_sec = chosen.weekly_reset_in_sec
+            info.burn_pct_per_hour = chosen.burn_pct_per_hour
+            info.eta_exhaust_sec = chosen.eta_exhaust_sec
+            info.will_exhaust_before_reset = chosen.will_exhaust_before_reset
+            info.weekly_pace_ratio = chosen.weekly_pace_ratio
+
+    def _record_and_compute_quota_velocity(
+        self,
+        info: AccountQuotaInfo,
+        now_ts: float,
+        *,
+        record_sample: bool = True,
+    ) -> None:
+        acct_low = (info.short_label or "").strip().lower() if info.online else ""
+        for pname, pool in info.pools.items():
+            samples: List[Tuple[float, Optional[float], Optional[float], str, str]] = []
+            if acct_low and acct_low not in ("离线", "离***", "offline", "unknown"):
+                rkey = (acct_low, pname)
+                ring = self._quota_sample_rings.get(rkey)
+                if ring is None:
+                    ring = deque(maxlen=180)
+                    self._quota_sample_rings[rkey] = ring
+                self._quota_sample_rings.move_to_end(rkey)
+                while len(self._quota_sample_rings) > 32:
+                    self._quota_sample_rings.popitem(last=False)
+                if record_sample:
+                    fh_hi = (
+                        round(pool.five_hour_fraction * 100.0, 6)
+                        if pool.five_hour_fraction is not None
+                        else pool.five_hour_pct
+                    )
+                    wk_hi = (
+                        round(pool.weekly_fraction * 100.0, 6)
+                        if pool.weekly_fraction is not None
+                        else pool.weekly_pct
+                    )
+                    fh_rst = str(pool.five_hour_reset_at or "")
+                    wk_rst = str(pool.weekly_reset_at or "")
+                    if fh_hi is not None or wk_hi is not None:
+                        should_add = False
+                        if not ring:
+                            should_add = True
+                        else:
+                            last = ring[-1]
+                            if now_ts >= last[0]:
+                                if (
+                                    (now_ts - last[0]) >= 15.0
+                                    or (fh_hi is not None and (last[1] is None or abs(fh_hi - last[1]) >= 0.005))
+                                    or (wk_hi is not None and (last[2] is None or abs(wk_hi - last[2]) >= 0.005))
+                                    or (fh_rst and fh_rst != last[3])
+                                    or (wk_rst and wk_rst != last[4])
+                                ):
+                                    should_add = True
+                        if should_add:
+                            ring.append((float(now_ts), fh_hi, wk_hi, fh_rst, wk_rst))
+                samples = list(ring)
+            compute_quota_pool_velocity(pool, samples, now_ts)
 
     @staticmethod
     def _sanitize_rpc_error(exc: BaseException) -> str:
@@ -7557,6 +9114,7 @@ class AntigravityMonitorEngine:
                 info.email_masked = mask_email(live_email)
                 info.short_label = short_email_label(live_email)
                 info.tier = str((status.get("userTier") or {}).get("id", "") or "")
+                info.tier_label, info.tier_short = resolve_tier_display(info.tier)
                 plan_info = (status.get("planStatus") or {}).get("planInfo") or {}
                 plan_name = str(plan_info.get("planName", "") or "").strip()
                 teams_tier = str(plan_info.get("teamsTier", "") or "").strip()
@@ -7580,7 +9138,10 @@ class AntigravityMonitorEngine:
                     mid = str((cfg.get("modelOrAlias") or {}).get("model", "") or "")
                     if mid and lbl:
                         mkey = mid.strip().upper()
-                        self._model_enum_map[mkey] = lbl.strip()
+                        new_lbl = lbl.strip()
+                        if self._model_enum_map.get(mkey) != new_lbl:
+                            self._model_enum_map_version += 1
+                        self._model_enum_map[mkey] = new_lbl
                         self._model_enum_map.move_to_end(mkey)
                         while len(self._model_enum_map) > 256:
                             self._model_enum_map.popitem(last=False)
@@ -7592,12 +9153,29 @@ class AntigravityMonitorEngine:
                     pool_name = self._classify_model_pool(lbl, mid)
                     pool = pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
                     pool.model_count += 1
-                    if frac is not None:
-                        pct_val = round(float(frac) * 100.0, 2)
-                        if pool.five_hour_pct is None or pct_val < pool.five_hour_pct:
-                            pool.five_hour_pct = pct_val
                     norm_reset = _normalize_reset_time(reset_raw)
-                    if norm_reset and not pool.five_hour_reset_at:
+                    if frac is not None and not isinstance(frac, bool):
+                        try:
+                            fval = float(frac)
+                        except (TypeError, ValueError):
+                            fval = None
+                        if fval is not None and math.isfinite(fval):
+                            fval = round(max(0.0, min(1.0, fval)), 8)
+                            pct_val = round(fval * 100.0, 2)
+                            if pool.five_hour_fraction is None or fval < pool.five_hour_fraction:
+                                pool.five_hour_fraction = fval
+                                pool.five_hour_pct = pct_val
+                                if norm_reset:
+                                    pool.five_hour_reset_at = norm_reset
+                            elif fval == pool.five_hour_fraction and norm_reset:
+                                if not pool.five_hour_reset_at:
+                                    pool.five_hour_reset_at = norm_reset
+                                else:
+                                    cur_rts = parse_iso_timestamp(pool.five_hour_reset_at)
+                                    new_rts = parse_iso_timestamp(norm_reset)
+                                    if new_rts is not None and (cur_rts is None or new_rts < cur_rts):
+                                        pool.five_hour_reset_at = norm_reset
+                    elif norm_reset and not pool.five_hour_reset_at:
                         pool.five_hour_reset_at = norm_reset
 
                 info.pools = pools
@@ -7730,23 +9308,41 @@ class AntigravityMonitorEngine:
                 self._last_weekly_email = email_low
                 self._last_weekly_poll_ts = now
                 self._last_weekly_pools = {
-                    pn: (pl.weekly_pct, pl.weekly_reset_at, pl.five_hour_pct, pl.five_hour_reset_at)
+                    pn: (
+                        pl.weekly_pct,
+                        pl.weekly_reset_at,
+                        pl.five_hour_pct,
+                        pl.five_hour_reset_at,
+                        pl.weekly_fraction,
+                        pl.five_hour_fraction,
+                    )
                     for pn, pl in info.pools.items()
                 }
             else:
-                for pn, (wk_pct, wk_rst, fh_pct, fh_rst) in self._last_weekly_pools.items():
+                for pn, cached_tup in self._last_weekly_pools.items():
+                    wk_pct, wk_rst, fh_pct, fh_rst = cached_tup[:4]
+                    wk_frac = cached_tup[4] if len(cached_tup) >= 6 else None
+                    fh_frac = cached_tup[5] if len(cached_tup) >= 6 else None
                     pool = info.pools.get(pn)
                     if pool is None and (wk_pct is not None or fh_pct is not None):
                         pool = info.pools.setdefault(pn, QuotaPoolInfo(name=pn))
                     if pool is not None:
                         if wk_pct is not None:
                             pool.weekly_pct = wk_pct
+                        if wk_frac is not None and pool.weekly_fraction is None:
+                            pool.weekly_fraction = wk_frac
                         if wk_rst:
                             pool.weekly_reset_at = wk_rst
                         if pool.five_hour_pct is None and fh_pct is not None:
                             pool.five_hour_pct = fh_pct
+                        if pool.five_hour_fraction is None and fh_frac is not None:
+                            pool.five_hour_fraction = fh_frac
                         if not pool.five_hour_reset_at and fh_rst:
                             pool.five_hour_reset_at = fh_rst
+            self._record_and_compute_quota_velocity(info, now, record_sample=True)
+            self._sync_account_active_pool(info, active_family)
+        elif info.online and info.pools:
+            self._record_and_compute_quota_velocity(info, now, record_sample=True)
             self._sync_account_active_pool(info, active_family)
 
         self._last_probe_any_hub_pid_alive = bool(info.online or any_hub_pid_alive)
@@ -7817,10 +9413,12 @@ class AntigravityMonitorEngine:
                     continue
                 frac = bkt.get("remainingFraction")
                 pct_val: Optional[float] = None
+                frac_val: Optional[float] = None
                 if isinstance(frac, (int, float)) and not isinstance(frac, bool):
                     fval = float(frac)
                     if math.isfinite(fval):
-                        pct_val = round(max(0.0, min(100.0, fval * 100.0)), 2)
+                        frac_val = round(max(0.0, min(1.0, fval)), 8)
+                        pct_val = round(frac_val * 100.0, 2)
                 reset_iso = _normalize_reset_time(bkt.get("resetTime"))
                 if pct_val is None and not reset_iso:
                     continue
@@ -7828,13 +9426,17 @@ class AntigravityMonitorEngine:
                 if is_weekly:
                     if pct_val is not None:
                         pool.weekly_pct = pct_val
+                        pool.weekly_fraction = frac_val
                         got_weekly = True
                     if reset_iso:
                         pool.weekly_reset_at = reset_iso
                 elif is_5h:
                     if pool.five_hour_pct is None and pct_val is not None:
                         pool.five_hour_pct = pct_val
-                    if reset_iso and not pool.five_hour_reset_at:
+                        pool.five_hour_fraction = frac_val
+                        if reset_iso:
+                            pool.five_hour_reset_at = reset_iso
+                    elif reset_iso and not pool.five_hour_reset_at:
                         pool.five_hour_reset_at = reset_iso
         return got_weekly
 
@@ -7948,6 +9550,7 @@ class AntigravityMonitorEngine:
                                 if best_row is not None:
                                     first_rows[m_name] = best_row
                         else:
+                            created_rows = []
                             # Legacy / simplified test schema fallback (WITHOUT ROWID safe: never reference rowid)
                             sel_sql = (
                                 f"SELECT metric, remaining, observed_at, {reset_expr} FROM quota_observations "
@@ -7960,6 +9563,94 @@ class AntigravityMonitorEngine:
                                     first_rows[m_name] = (row[1], _safe_obs_float(row[2]), row[3])
                                     if len(first_rows) >= 4:
                                         break
+
+                        # Optional read-only velocity ring preheat (zero extra SQLite connections, <=32 rows within 2h)
+                        acct_low_ph = (info.short_label or "").strip().lower()
+                        if acct_low_ph and acct_low_ph not in ("离线", "离***", "offline", "unknown"):
+                            def _ring_span_sec(pn: str) -> float:
+                                r_dq = self._quota_sample_rings.get((acct_low_ph, pn))
+                                if not r_dq or len(r_dq) < 2:
+                                    return 0.0
+                                return float(r_dq[-1][0] - r_dq[0][0])
+
+                            need_pools = [pn for pn in ("gemini", "3p") if _ring_span_sec(pn) < 120.0]
+                            if need_pools:
+                                cutoff_2h = now - 7200.0
+                                by_pool_ts: Dict[str, Dict[int, List[Any]]] = {}
+                                raw_preheat: List[Tuple[str, Any, float, Any]] = []
+                                if has_pk_prefix:
+                                    ph_sql = (
+                                        f"SELECT remaining, observed_at, {reset_expr} FROM quota_observations "
+                                        "WHERE platform = 'antigravity' AND account_id = ? AND account_created_at = ? AND metric = ? "
+                                        "ORDER BY observed_at DESC LIMIT 32"
+                                    )
+                                    for pn in need_pools:
+                                        for kind in ("5h", "weekly"):
+                                            m_name = f"{pn}-{kind}"
+                                            for ca in created_rows:
+                                                for pr in cur.execute(ph_sql, (bound_acc_id, ca, m_name)).fetchall():
+                                                    raw_preheat.append((m_name, pr[0], _safe_obs_float(pr[1]), pr[2]))
+                                else:
+                                    ph_sql = (
+                                        f"SELECT metric, remaining, observed_at, {reset_expr} FROM quota_observations "
+                                        "WHERE account_id = ? AND metric IN ('gemini-weekly','gemini-5h','3p-weekly','3p-5h') "
+                                        "ORDER BY observed_at DESC LIMIT 64"
+                                    )
+                                    for pr in cur.execute(ph_sql, (bound_acc_id,)).fetchall():
+                                        raw_preheat.append((str(pr[0] or ""), pr[1], _safe_obs_float(pr[2]), pr[3]))
+
+                                for m_name, rem_raw, obs_raw, rst_raw in raw_preheat:
+                                    if rem_raw is None or "-" not in m_name:
+                                        continue
+                                    pn, kind = m_name.split("-", 1)
+                                    if pn not in need_pools or kind not in ("5h", "weekly"):
+                                        continue
+                                    obs_sec = obs_raw / 1000.0 if obs_raw > 1e11 else obs_raw
+                                    if not (cutoff_2h <= obs_sec <= now + 5.0):
+                                        continue
+                                    try:
+                                        pct_f = float(rem_raw)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if not math.isfinite(pct_f):
+                                        continue
+                                    pct_f = max(0.0, min(100.0, pct_f))
+                                    rst_iso = _normalize_reset_time(rst_raw) or ""
+                                    ts_bucket = int(round(obs_sec))
+                                    slot_p = by_pool_ts.setdefault(pn, {}).setdefault(
+                                        ts_bucket, [obs_sec, None, None, "", ""]
+                                    )
+                                    if kind == "5h":
+                                        # Rows arrive newest-first (ORDER BY observed_at DESC): keep newest per second
+                                        if slot_p[1] is None:
+                                            slot_p[1] = round(pct_f, 6)
+                                            if rst_iso:
+                                                slot_p[3] = rst_iso
+                                    else:
+                                        if slot_p[2] is None:
+                                            slot_p[2] = round(pct_f, 6)
+                                            if rst_iso:
+                                                slot_p[4] = rst_iso
+
+                                for pn, ts_map in by_pool_ts.items():
+                                    rkey = (acct_low_ph, pn)
+                                    ring = self._quota_sample_rings.get(rkey)
+                                    if ring is None:
+                                        ring = deque(maxlen=180)
+                                        self._quota_sample_rings[rkey] = ring
+                                    self._quota_sample_rings.move_to_end(rkey)
+                                    while len(self._quota_sample_rings) > 32:
+                                        self._quota_sample_rings.popitem(last=False)
+                                    existing_first_ts = ring[0][0] if ring else float("inf")
+                                    pre_items = [
+                                        (float(v[0]), v[1], v[2], str(v[3] or ""), str(v[4] or ""))
+                                        for _, v in sorted(ts_map.items(), key=lambda kv: kv[0])
+                                        if float(v[0]) < existing_first_ts
+                                    ][-32:]
+                                    if pre_items:
+                                        merged_samples = (pre_items + list(ring))[-180:]
+                                        ring.clear()
+                                        ring.extend(merged_samples)
                     finally:
                         conn.close()
                 except sqlite3.Error:
@@ -7978,16 +9669,20 @@ class AntigravityMonitorEngine:
                 obs_sec = obs_raw / 1000.0 if obs_raw > 1e11 else obs_raw
                 if obs_sec and obs_sec < stale_cutoff_sec:
                     continue
-                val = round(float(row[0]), 2)
+                raw_pct = max(0.0, min(100.0, float(row[0])))
+                val = round(raw_pct, 2)
+                frac_hi = round(raw_pct / 100.0, 8)
                 reset_iso = _normalize_reset_time(row[2])
                 pool = info.pools.setdefault(pool_name, QuotaPoolInfo(name=pool_name))
                 if kind == "weekly":
                     pool.weekly_pct = val
+                    pool.weekly_fraction = frac_hi
                     if reset_iso:
                         pool.weekly_reset_at = reset_iso
                 else:
                     if pool.five_hour_pct is None:
                         pool.five_hour_pct = val
+                        pool.five_hour_fraction = frac_hi
                     if reset_iso and not pool.five_hour_reset_at:
                         pool.five_hour_reset_at = reset_iso
 
@@ -8065,11 +9760,17 @@ def _serialize_conversation_summary(c: ConversationSummary, include_steps: bool 
         "ttft_max_sec": round(c.ttft_max_sec, 2) if c.ttft_max_sec is not None else None,
         "tps": round(c.tps, 2) if c.tps is not None else None,
         "speed_status": c.speed_status,
+        "sustained_slow": bool(getattr(c, "sustained_slow", False)),
+        "effective_slow_tps_th": round(float(getattr(c, "effective_slow_tps_th", 40.0)), 2),
+        "effective_slow_ttft_th": round(float(getattr(c, "effective_slow_ttft_th", 45.0)), 2),
         "consec_miss": c.consec_miss,
         "abnormal_in_recent10": c.abnormal_in_recent10,
         "cacheable_in_recent10": c.cacheable_in_recent10,
         "recent10_hit_ratio": round(c.recent10_hit_ratio, 4) if c.recent10_hit_ratio is not None else None,
+        "scoped_wasted_cold_tokens": int(getattr(c, "scoped_wasted_cold_tokens", 0) or 0),
         "freshness_remaining_sec": c.freshness_remaining_sec,
+        "freshness_window_sec": int(getattr(c, "freshness_window_sec", 210) or 210),
+        "freshness_zone": str(getattr(c, "freshness_zone", "") or ""),
         "freshness_invalid_reason": c.freshness_invalid_reason,
     }
     if include_steps:
@@ -8113,7 +9814,60 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
                 "five_hour_reset_at": pool.five_hour_reset_at,
                 "weekly_reset_at": pool.weekly_reset_at,
                 "model_count": pool.model_count,
+                "five_hour_reset_in_sec": pool.five_hour_reset_in_sec,
+                "weekly_reset_in_sec": pool.weekly_reset_in_sec,
+                "burn_pct_per_hour": pool.burn_pct_per_hour,
+                "eta_exhaust_sec": pool.eta_exhaust_sec,
+                "will_exhaust_before_reset": bool(pool.will_exhaust_before_reset),
+                "weekly_burn_pct_per_hour": pool.weekly_burn_pct_per_hour,
+                "weekly_eta_exhaust_sec": pool.weekly_eta_exhaust_sec,
+                "weekly_pace_ratio": pool.weekly_pace_ratio,
             }
+
+    recent_ev_flat: List[LogEvent] = []
+    seen_ev_keys: set[Tuple[float, str, str]] = set()
+    by_cat = getattr(snap, "recent_events_by_cat", None) or {}
+    if isinstance(by_cat, dict) and any(by_cat.values()):
+        for cat_evs in by_cat.values():
+            for ev in cat_evs or ():
+                ek = (round(float(ev.timestamp), 3), ev.category, ev.event_key)
+                if ek not in seen_ev_keys:
+                    seen_ev_keys.add(ek)
+                    recent_ev_flat.append(ev)
+        recent_ev_flat.sort(key=lambda e: e.timestamp)
+        recent_ev_flat = recent_ev_flat[-24:]
+    else:
+        recent_ev_flat = list(snap.recent_events or [])
+
+    recent_events_json = [
+        {
+            "timestamp": round(float(ev.timestamp), 3),
+            "category": ev.category,
+            "summary": ev.summary,
+            "model": ev.model,
+            "duration_sec": round(float(ev.duration_sec), 2) if ev.duration_sec is not None else None,
+            "is_heavy_media_timeout": bool(ev.is_heavy_media_timeout),
+            "culprit_cid": ev.culprit_cid,
+        }
+        for ev in recent_ev_flat
+    ]
+
+    large_freshness_json = [
+        {
+            "short_id": fc.short_id,
+            "title": fc.title,
+            "model": fc.model,
+            "context_tokens": fc.context_tokens,
+            "freshness_remaining_sec": fc.freshness_remaining_sec,
+            "freshness_window_sec": int(getattr(fc, "freshness_window_sec", 210) or 210),
+            "freshness_zone": str(getattr(fc, "freshness_zone", "") or ""),
+            "freshness_invalid_reason": fc.freshness_invalid_reason,
+        }
+        for fc in (snap.large_freshness_list or [])[:12]
+    ]
+
+    last_t2_ts = float(getattr(snap, "last_t2_error_ts", 0.0) or 0.0)
+    last_t2_age_sec = max(0, int(round(snap.generated_at - last_t2_ts))) if last_t2_ts > 0.0 else None
 
     alerts_out = [
         {"key": k, "title": t, "message": m}
@@ -8161,12 +9915,20 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "online": snap.account.online,
             "hub_pid_alive": bool(getattr(snap, "hub_pid_alive", False)),
             "tier": snap.account.tier,
+            "tier_label": str(getattr(snap.account, "tier_label", "") or ""),
+            "tier_short": str(getattr(snap.account, "tier_short", "") or ""),
             "plan_status": snap.account.plan_status,
             "quota_family": snap.account.quota_family,
             "five_hour_pct": round(snap.account.five_hour_pct, 2) if snap.account.five_hour_pct is not None else None,
             "weekly_pct": round(snap.account.weekly_pct, 2) if snap.account.weekly_pct is not None else None,
             "five_hour_reset_at": snap.account.five_hour_reset_at,
             "weekly_reset_at": snap.account.weekly_reset_at,
+            "five_hour_reset_in_sec": getattr(snap.account, "five_hour_reset_in_sec", None),
+            "weekly_reset_in_sec": getattr(snap.account, "weekly_reset_in_sec", None),
+            "burn_pct_per_hour": getattr(snap.account, "burn_pct_per_hour", None),
+            "eta_exhaust_sec": getattr(snap.account, "eta_exhaust_sec", None),
+            "will_exhaust_before_reset": bool(getattr(snap.account, "will_exhaust_before_reset", False)),
+            "weekly_pace_ratio": getattr(snap.account, "weekly_pace_ratio", None),
             "pools": pools_out,
         },
         "steps": (
@@ -8202,6 +9964,18 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
                 "last_1h_steps": snap.last_1h_steps,
                 "peak_hour_steps_today": snap.peak_hour_steps_today,
                 "peak_hour_label": snap.peak_hour_label,
+                "account_tier": str(getattr(snap, "account_tier_norm", "") or ""),
+                "pool_family": snap.account.quota_family,
+                "pool_24h_steps": int(getattr(snap, "steps_pool_24h", 0) or 0),
+                "gemini_24h_steps": int(getattr(snap, "steps_gemini_24h", 0) or 0),
+                "third_party_24h_steps": int(getattr(snap, "steps_3p_24h", 0) or 0),
+                "effective_weighted_steps": int(getattr(snap, "steps_effective_weighted_24h", 0) or 0),
+                "peer_prior_peak": int(getattr(snap, "steps_peer_prior_peak", 0) or 0),
+                "peer_weight_pct": int(getattr(snap, "steps_peer_weight_pct", 0) or 0),
+                "quota_headroom_steps": getattr(snap, "steps_quota_headroom", None),
+                "soft_over_limit": bool(getattr(snap, "steps_soft_over_limit", False)),
+                "low_quota_tightened": bool(getattr(snap, "steps_low_quota_tightened", False)),
+                "detail_lines": list(getattr(snap, "steps_detail_lines", ()) or ()),
             }
         )(
             snap.rolling_24h_steps is not None,
@@ -8231,6 +10005,10 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "min_freshness_ctx": snap.min_freshness_ctx,
             "min_freshness_invalid_reason": snap.min_freshness_invalid_reason,
             "freshness_window_sec": snap.freshness_window_sec,
+            "min_freshness_window_sec": int(getattr(snap, "min_freshness_window_sec", snap.freshness_window_sec) or snap.freshness_window_sec),
+            "min_freshness_zone": str(getattr(snap, "min_freshness_zone", "") or ""),
+            "expiring_soon_count": int(getattr(snap, "expiring_soon_count", 0) or 0),
+            "large_freshness_list": large_freshness_json,
             "culprit_summary": getattr(snap, "cache_culprit_summary", ""),
         },
         "perf": {
@@ -8239,6 +10017,11 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "ttft_avg_sec": round(snap.primary_ttft_avg, 2) if snap.primary_ttft_avg is not None else None,
             "ttft_max_sec": round(snap.primary_ttft_max, 2) if snap.primary_ttft_max is not None else None,
             "speed_status": snap.primary_speed_status,
+            "sustained_slow": bool(getattr(snap, "primary_sustained_slow", False)),
+            "effective_slow_tps_th": round(float(getattr(snap, "primary_effective_slow_tps_th", 40.0)), 2),
+            "effective_slow_ttft_th": round(float(getattr(snap, "primary_effective_slow_ttft_th", 45.0)), 2),
+            "media_ttft_exempted": bool(getattr(snap, "primary_media_ttft_exempted", False)),
+            "large_ctx_ttft_allowance_sec": round(float(getattr(snap, "primary_large_ctx_ttft_allowance_sec", 0.0)), 1),
         },
         "errors_30m": {
             "scope_label": snap.log_scope_label,
@@ -8251,6 +10034,9 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "proxy_outage": snap.proxy_outage_recent,
             "proxy_outage_note": snap.proxy_outage_note,
             "t2_recovery_note": snap.t2_recovery_note,
+            "last_t2_error_ts": round(last_t2_ts, 3),
+            "last_t2_error_age_sec": last_t2_age_sec,
+            "recent_events": recent_events_json,
             "log_session_start_ts": round(float(getattr(snap, "log_session_start_ts", 0.0) or 0.0), 3),
             "log_session_start_local": (
                 _epoch_to_iso_local(float(getattr(snap, "log_session_start_ts", 0.0) or 0.0))
@@ -8281,6 +10067,13 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
                 "tps_avg": round(m.tps_avg, 2) if m.tps_avg is not None else None,
                 "steps_after_last_t2": m.steps_after_last_t2,
                 "ttft_after_last_t2_median": round(m.ttft_after_last_t2_median, 2) if m.ttft_after_last_t2_median is not None else None,
+                "main_steps_after_last_t2": m.main_steps_after_last_t2,
+                "main_adj_ttft_after_last_t2_median": (
+                    round(m.main_adj_ttft_after_last_t2_median, 2)
+                    if m.main_adj_ttft_after_last_t2_median is not None
+                    else None
+                ),
+                "main_large_ctx_calibrated": bool(m.main_large_ctx_calibrated),
             }
             for m in snap.model_stats
         ],
@@ -8315,6 +10108,11 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "active_main": len(main_convs),
             "active_subagent": len(sub_convs),
             "active_total": len(snap.active_conversations),
+            "total_matched_conversations": int(
+                getattr(snap, "total_matched_conversations", 0) or len(snap.active_conversations)
+            ),
+            "total_matched_main": int(getattr(snap, "total_matched_main", 0) or len(main_convs)),
+            "total_matched_sub": int(getattr(snap, "total_matched_sub", 0) or len(sub_convs)),
         },
         "active_conversations": [
             _serialize_conversation_summary(c, include_steps=False)

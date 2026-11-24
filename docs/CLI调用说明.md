@@ -83,12 +83,13 @@ python -B main.py --json --readonly --conversation-id <id>
 | 字段 | 说明 |
 |---|---|
 | `short_label` / `email_masked` | 首尾掩码脱敏标签与邮箱（离线时 `short_label = "离线"`） |
-| `online` | 本地 Language Server Hub 进程与 `GetUserStatus` 是否在线 |
-| `tier` / `plan_status` | 账号订阅档位 ID（`userTier.id`）与套餐说明（来自 `planStatus.planInfo`） |
+| `online` / `hub_pid_alive` | 本地 Language Server Hub 进程与 `GetUserStatus` 是否在线 / Hub 进程是否存活 |
+| `tier` / `tier_label` / `tier_short` / `plan_status` | 账号真实订阅档位 ID（`userTier.id`）、可读档位（`Ultra / Pro / Free`）、短徽标（`[U]/[P]/[F]`）与套餐说明 |
 | `quota_family` | 当前主活跃模型归属池：`gemini` 或 `3p` |
 | `five_hour_pct` / `weekly_pct` | 当前主用池 5h 剩余百分比（Hub `GetUserStatus` 实时）与周剩余百分比（优先 Hub `RetrieveUserQuotaSummary` 官方实时，旧版客户端缺失时自动回退本机 Cockpit 同邮箱只读历史库） |
-| `five_hour_reset_at` / `weekly_reset_at` | 当前主用池原生重置时间（ISO-8601 UTC 字符串，无则为 `null`） |
-| `pools.gemini` / `pools.3p` | 分池详情对象，均含 `five_hour_pct`、`weekly_pct`、`five_hour_reset_at`、`weekly_reset_at`、`model_count`（完整遍历全部 `clientModelConfigs`，不截断） |
+| `five_hour_reset_at` / `weekly_reset_at` / `five_hour_reset_in_sec` / `weekly_reset_in_sec` | 当前主用池原生重置时间（ISO-8601 UTC 字符串，无则为 `null`）与距下次重置剩余秒数 |
+| `burn_pct_per_hour` / `eta_exhaust_sec` / `will_exhaust_before_reset` / `weekly_pace_ratio` | 当前主用池近窗 5h 消耗速率（`%/时`）、预计耗尽秒数、是否在重置前耗尽及本周相对消耗节奏倍率 |
+| `pools.gemini` / `pools.3p` | 分池详情对象，均含 `five_hour_pct`、`weekly_pct`、`five_hour_reset_at`、`weekly_reset_at`、`five_hour_reset_in_sec`、`weekly_reset_in_sec`、`burn_pct_per_hour`、`eta_exhaust_sec`、`will_exhaust_before_reset`、`weekly_burn_pct_per_hour`、`weekly_eta_exhaust_sec`、`weekly_pace_ratio`、`model_count` |
 
 ### 2. `steps`（近 24 小时滚动步数、自然日对照与主/子拆解）
 
@@ -107,7 +108,9 @@ python -B main.py --json --readonly --conversation-id <id>
 | `main_today_steps` / `subagent_today_steps` | 当前口径今日自然日的**主对话步数**与**子代理步数**（`today_steps = main + subagent`，向后兼容保留） |
 | `total_main_today_steps` / `total_subagent_today_steps` | 全机口径今日自然日的主对话步数与子代理步数（向后兼容保留） |
 | `daily_steps_warn` / `daily_steps_alert` | 当前生效的黄线 / 红线阈值（初始建议默认 `960` / `1200`，基于紧凑小时桶计算的零重叠已沉淀 24h 历史峰值自动平滑上调或保守收紧） |
-| `daily_steps_base_alert` / `daily_steps_limit_mode` / `daily_steps_limit_note` / `account_hist_safe_peak` | 可选自适应保护线元信息：配置初始基准红线、`default \| adaptive_up \| adaptive_down` 模式、人类可读调整依据与历史零重叠已沉淀 24h 纯健康峰值 |
+| `daily_steps_base_alert` / `daily_steps_limit_mode` / `daily_steps_limit_note` / `account_hist_safe_peak` | 可选自适应保护线元信息：配置初始基准红线、`default \| adaptive_up \| adaptive_down` 模式、通俗调整依据与时间加权安全峰值 |
+| `account_tier` / `pool_family` / `pool_24h_steps` / `gemini_24h_steps` / `third_party_24h_steps` | 账号归一化订阅档位（`ultra/pro/free`）、活跃池、活跃池 24h 步数及 Gemini / 3P 分池 24h 步数 |
+| `effective_weighted_steps` / `peer_prior_peak` / `peer_weight_pct` / `quota_headroom_steps` / `soft_over_limit` / `low_quota_tightened` / `detail_lines` | 等效冷算/轻量折算负载、同档位兄弟号弱先验参考值与占比、按当前斜率估算 5h 余量可跑步数、满血软提醒标志、低额收紧标志与通俗拆解说明列表 |
 | `remaining_to_warn` / `remaining_to_alert` | 基于 `effective_steps` 距黄线 / 红线的剩余步数（最低 `0`） |
 | `usage_pct` | 基于 `effective_steps` 相对当前红线阈值的百分比 |
 | `last_1h_steps` | 当前口径近 60 分钟步数（跨午夜连续滚动，不清零） |
@@ -115,17 +118,17 @@ python -B main.py --json --readonly --conversation-id <id>
 
 ### 3. `cache`、`perf`、`errors_30m`、`errors_today`、`alerts`
 
-- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `cached_diluted` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `rule_change` / `partial_miss` / `abnormal_zero`）、`primary_hit_is_compact`、`primary_hit_is_revert`、`consec_miss`（近窗最大连续异常掉缓存步数，含 `abnormal_zero` 与严重部分失效 `partial_miss`）、`t1_consec_threshold`（固定 `3`，触发红灯 `T1 连续掉缓存` 所需连续异常掉缓存步数；连续 `2` 步归橙色 `WARN` 高留意观察）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`、`culprit_summary`（可选，主要掉缓存罪魁短 ID 与日期，如 `1a5df4 (11-20)`）、`min_freshness_sec`（仅追踪主对话，不被退休子代理抢占；当前在线号切 `6h/today/7d` 时保持实时倒计时）、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`。
-- **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`；已排除极短输出 `<0.15s` 假 TPS 与高 TPS / 多模态原图上传耗时误判）。
-- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长 `5m`/`10m`/`90.5s` 的流超时，自动过滤 `<30s` 的非 LLM 本地毫秒超时，按 `ERROR_MESSAGE ±6s` 与 `USER_INPUT` 瞬时快照两阶段反查出事对话并自动分流重图大包上传超时 `heavy_media_timeout` 免误升 T2）、`403`（已过滤 `poll.go` 后台云同步权限不足误报，完整保留 `TOS_VIOLATION` 与真实推理 403）、`retry` 计数，以及 `errors_30m` 可选字段 `heavy_media_timeout`、`proxy_outage`、`proxy_outage_note`（跨接口 60s 爆发代理断流计数与说明，已排除 `errorreport.go` 双桶裂变误报，离线/历史视图不误升 `WARN`）、`log_session_start_ts` / `log_session_start_local`（当前 `language_server.log` 日志起点的 Unix 秒级时间戳与本机 ISO-8601 时间，无则为 `0.0` / `null`）、`window_min` 与 `t2_recovery_note`（`errors_today` 另附 `machine_*` 全机今日累计）；仅非重图服务端 `503 + timeout >= 2` 才升级红 `T2`，事后按主对话模型结合大上下文（`>=300K`）弹性校准与重图满速豁免评估恢复，严格保留真实 TTFT 展示且需 `>=2` 步常规步才回绿 `T0`。
-- **`slots`**：本机 500 槽位只读盘点对象，含 `cap`（默认 `500`）、`total_db`、`remaining_slots`（兼出 `headroom`）、`usage_pct`、`total_bytes`、`main_count`（主对话数）、`protected_sub_count`（运行中/保护期内子代理）、`cleanable_sub_count`（超保护期可安全让位子代理）、`cleanable_bytes`、`cleanable_30m_count`（30m 硬下限极限可清数）、`unknown_count`、`pinned_floor_count`（不可清基底）、`protect_age_min`、`status`（`ok | warn | danger | main_at_risk`）、`main_at_risk`（是否已撞 30m 保护下限并危及主对话）、`risk_message`（兼出 `risk_headline`）、`summary_db_ok` 与 `last_auto_clean_summary`。
-- **`models_recent`**：数组，按当前账号观测范围内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg`、`steps_after_last_t2`（最近一次 503/超时后的成功步数）与 `ttft_after_last_t2_median`（事后中位 TTFT，防多模态单步长尾误判）。
+- **`cache`**：`primary_hit_rate`、`primary_hit_classification`（`hit \| expected_cold \| abnormal_miss`）、`primary_hit_reason`（最新步缓存原因码，如 `cached` / `cached_diluted` / `small_ctx` / `first_cacheable` / `account_switch` / `model_switch` / `compact_reset` / `revert_reset` / `rule_change` / `partial_miss` / `abnormal_zero`）、`primary_hit_is_compact`、`primary_hit_is_revert`、`consec_miss`、`t1_consec_threshold`（固定 `3`）、`max_abnormal_recent10`、`worst_recent10_hit_ratio`、`wasted_cold_tokens_total`（按真实丢失前缀 `max(0, min(prev_total, total)-cr)` 累计）、`culprit_summary`、`min_freshness_sec`、`min_freshness_conv`、`min_freshness_ctx`、`min_freshness_invalid_reason`、`freshness_window_sec`、`min_freshness_window_sec`（按模型生效安全保鲜窗）、`min_freshness_zone`（`invalid/rescue/warn/safe/expired`）、`expiring_soon_count`（处于失效/临界抢救/快冷的大上下文主对话数）、`large_freshness_list`（最多 12 条活跃大上下文主对话保鲜明细）。
+- **`perf`**：`tps`、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`speed_status`（`ok \| slow \| unknown`）、`sustained_slow`（持续偏慢确认标志）、`effective_slow_tps_th`、`effective_slow_ttft_th`（当前模型生效的差异化速度基线）、`media_ttft_exempted`、`large_ctx_ttft_allowance_sec`。
+- **`errors_30m` / `errors_today`**：按**当前在线账号**隔离统计的 `503`、`timeout`（动态提取真实时长并自动分流重图大包上传超时 `heavy_media_timeout`）、`403`、`retry` 计数，以及 `errors_30m` 可选字段 `heavy_media_timeout`、`proxy_outage`、`proxy_outage_note`、`log_session_start_ts` / `log_session_start_local`、`last_t2_error_ts`、`last_t2_error_age_sec`、`recent_events`（结构化近期日志事件列表，含 `timestamp/category/summary/model/duration_sec/is_heavy_media_timeout/culprit_cid`）、`window_min` 与 `t2_recovery_note`（`errors_today` 另附 `machine_*` 全机今日累计）。
+- **`slots`**：本机 500 槽位只读盘点对象（支持活跃目录短缓存提速 10×），含 `cap`、`total_db`、`remaining_slots`、`usage_pct`、`total_bytes`、`main_count`、`protected_sub_count`、`cleanable_sub_count`、`cleanable_bytes`、`cleanable_30m_count`、`unknown_count`、`pinned_floor_count`、`protect_age_min`、`status`、`main_at_risk`、`risk_message`、`summary_db_ok` 与 `last_auto_clean_summary`。
+- **`models_recent`**：数组，按当前账号观测范围内各活跃模型独立汇总 `model`、`step_count`、`hit_count`、`abnormal_miss_count`、`ttft_avg_sec`、`ttft_max_sec`、`latest_ttft_sec`、`tps_avg`、`steps_after_last_t2`、`ttft_after_last_t2_median`、`main_steps_after_last_t2`、`main_adj_ttft_after_last_t2_median` 与 `main_large_ctx_calibrated`。
 - **`alerts`**：数组，每项含 `{key, title, message}`；当 `pressure` 非正常或 `slots.main_at_risk == true` 时保证包含对应高危告警条目。
-- **`--clean-subagents --json` 输出**：返回 `{ok, dry_run, mode, protect_age_min, candidate_count, removed_count, freed_bytes, skipped_locked_count, skipped_changed_count, remaining_db_count, archive_path, error}`（与 `--readonly` 冲突且未带 `--dry-run` 时返回 `ok: false` 与退出码 `2`）。
+- **`--clean-subagents --json` 输出**：返回 `{ok, dry_run, mode, protect_age_min, candidate_count, removed_count, freed_bytes, skipped_locked_count, skipped_recycle_unavailable_count, skipped_changed_count, remaining_db_count, archive_path, error}`（与 `--readonly` 冲突且未带 `--dry-run` 时返回 `ok: false` 与退出码 `2`）。
 
 ### 4. `counts`、`active_conversations`、`carryover_conversations` 与 `target_conversation`
 
-- **`counts`**：`active_main`、`active_subagent`、`active_total`。
+- **`counts`**：`active_main`、`active_subagent`、`active_total`、`total_matched_conversations`、`total_matched_main`、`total_matched_sub`。
 - **`active_conversations`**：`30m` 模式下严格展示当前 30 分钟窗口（或自动切回锚点 30 分钟）内活跃会话（最多 24 条，内置最多 12 条主对话保护）；`today` / `7d` 模式下放宽至最多 48 条（保护最多 24 条主对话，防止历史掉缓存罪魁被截断），每条包含 `conversation_id`、`short_id`、`title`（对话标题，依次三源解析：`annotations/*.pbtxt` 本地元数据 → 在线本地 Hub `GetAllCascadeTrajectories` → 离线 `state.vscdb`）、`is_subagent`、`model`、`context_tokens`、`latest_context_delta`（相对上一步的请求体净变化）、`total_step_count`、`latest_hit_rate`、`latest_cache_reason`、`active_media_count`、`active_media_bytes`、`media_ttft_exempted`、`is_carryover_preview`、`large_ctx_ttft_allowance_sec`（`>=300K` 逼近压缩窗 TTFT 校准余量秒数，`<300K` 为 `0.0`）、`ttft_sec`、`ttft_avg_sec`、`ttft_max_sec`、`tps`、`consec_miss`、`abnormal_in_recent10`、`freshness_remaining_sec` 等。
 - **`carryover_conversations`**：可选只读过渡列表（默认实时自动跟随视角下，最多 2 条近 10 分钟活跃但当前账号尚无新步的主对话入口，`is_carryover_preview: true`），严格与 `active_conversations` 及健康评级隔离，仅用于提示同窗口换号待首步及快速进入跨号长线详情。
 - **`target_conversation`**：仅当传入 `--conversation-id` 时填充；除上述字段外，还包含 `recent_steps`（近 10 步逐拍 `total_tokens`、`context_delta`、`hit_rate`、`classification`、`reason`、`is_account_switch`、`active_media_count`、`active_media_bytes`）。同时顶层附 `target_conversation_query` 与 `target_conversation_found`。
