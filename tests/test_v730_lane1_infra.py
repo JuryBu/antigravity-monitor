@@ -920,6 +920,206 @@ class TestV730FinalAuditRegressions(unittest.TestCase):
         )
         self.assertGreaterEqual(r_wk.alert_limit, 1240)
 
+    def test_high_load_degradation_smooth_fallback_cap_recovery_aging_and_guards(self) -> None:
+        now = datetime.datetime(2026, 11, 26, 0, 20, 0).timestamp()
+        cur_h = int(now // 3600)
+
+        # 1) Settled high-load degradation (ca***8 real pattern: 11-22 safe=4558, 11-24 deg=2551, post-deg recov=1546 over 11h)
+        h22 = int(datetime.datetime(2026, 11, 22, 10, 0, 0).timestamp() // 3600)
+        h24_deg = int(datetime.datetime(2026, 11, 24, 15, 0, 0).timestamp() // 3600)
+        b_ca: Dict[int, Dict[str, Any]] = {
+            h22: {"steps": 4558},
+            h24_deg: {"steps": 177, "degraded": True, "degraded_24h_at": 2551, "dk": "t1_multi"},
+        }
+        for k in range(1, 12):
+            b_ca[h24_deg + k] = {"steps": 140}  # 1540 steps over 11h (< 2551 -> must stay smoothly capped)
+        res_ca = compute_adaptive_steps_v2(
+            960, 1200, b_ca, now_ts=now, account_tier="ultra",
+            live_24h_raw_steps=2200, live_5h_pct=90.0, live_weekly_pct=90.0,
+        )
+        self.assertEqual(res_ca.mode, "adaptive_up")
+        self.assertEqual(res_ca.alert_limit, 2150)  # floor(2551 * 0.85 / 50) * 50 = 2150
+        self.assertEqual(res_ca.warn_limit, 1720)
+        self.assertFalse(res_ca.soft_over_limit)
+        self.assertIn("2551", res_ca.note)
+        self.assertIn("2150", res_ca.note)
+        self.assertNotIn("初始建议值", res_ca.note)
+
+        # 2) Unsettled high-load degradation with proven history (ly***8 pattern: 11-24 safe=4506, unsettled deg=1635)
+        h24_safe = int(datetime.datetime(2026, 11, 24, 8, 0, 0).timestamp() // 3600)
+        b_ly = {
+            h24_safe: {"steps": 4506},
+            cur_h - 1: {"steps": 139, "degraded": True, "degraded_24h_at": 1635, "dk": "t2"},
+        }
+        res_ly = compute_adaptive_steps_v2(960, 1200, b_ly, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_ly.mode, "adaptive_up")
+        self.assertEqual(res_ly.alert_limit, 1350)  # floor(1635 * 0.85 / 50) * 50 = 1350
+        self.assertIn("1635", res_ly.note)
+        self.assertIn("1350", res_ly.note)
+
+        # 3) Near-baseline high-load degradation (1300 -> 1300*0.85=1105 -> floor baseline 1200) keeps honest note!
+        b_near = {
+            h24_safe: {"steps": 3500},
+            cur_h - 1: {"steps": 100, "degraded": True, "degraded_24h_at": 1300, "dk": "t2"},
+        }
+        res_near = compute_adaptive_steps_v2(960, 1200, b_near, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_near.mode, "default")
+        self.assertEqual(res_near.alert_limit, 1200)
+        self.assertIn("1300", res_near.note)
+        self.assertNotIn("初始建议值", res_near.note)
+
+        # 4) High-load degradation NEVER inflates an account above its own earned capacity (own_est=1500 -> ceil 1800 < 2150)
+        b_small_own = {
+            h22: {"steps": 1500},
+            h24_deg: {"steps": 100, "degraded": True, "degraded_24h_at": 2551, "dk": "t2"},
+        }
+        res_small = compute_adaptive_steps_v2(960, 1200, b_small_own, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_small.mode, "adaptive_up")
+        self.assertEqual(res_small.alert_limit, 1800)
+
+        # 5) Brand-new Day 1 with ONLY unsettled high-load degradation strictly stays at 1200 (zero chasing!)
+        b_day1 = {
+            cur_h - 2: {"steps": 500},
+            cur_h - 1: {"steps": 200, "degraded": True, "degraded_24h_at": 2551, "dk": "t2"},
+        }
+        res_day1 = compute_adaptive_steps_v2(960, 1200, b_day1, now_ts=now, account_tier="ultra")
+        self.assertEqual((res_day1.mode, res_day1.alert_limit), ("default", 1200))
+        self.assertIn("2551", res_day1.note)
+
+        # 6) Sustained post-degradation recovery (>=3h & >=2551 steps) lifts cap under T0, but live T2 locks it!
+        b_recov = dict(b_ca)
+        for k in range(1, 7):
+            b_recov[h24_deg + k] = {"steps": 450}  # 2700 steps over 6h >= 2551
+        res_lifted = compute_adaptive_steps_v2(960, 1200, b_recov, now_ts=now, account_tier="ultra", live_grade="T0")
+        self.assertEqual(res_lifted.mode, "adaptive_up")
+        self.assertGreaterEqual(res_lifted.alert_limit, 4200)
+        res_t2_lock = compute_adaptive_steps_v2(960, 1200, b_recov, now_ts=now, account_tier="ultra", live_grade="T2")
+        self.assertEqual(res_t2_lock.alert_limit, 2150)
+
+        # 7) Settled high-load degradation older than 7 days expires naturally when recent days are clean
+        h_9d_deg = cur_h - 9 * 24
+        h_2d_safe = cur_h - 2 * 24
+        b_aged = {
+            h_9d_deg: {"steps": 1500, "degraded": True, "degraded_24h_at": 1600, "dk": "t2"},
+            h_2d_safe: {"steps": 1400},  # < 1600 so didn't surpass via _evaluate_account_history, relies on >7d aging
+        }
+        res_aged = compute_adaptive_steps_v2(960, 1200, b_aged, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_aged.mode, "adaptive_up")
+        self.assertEqual(res_aged.alert_limit, 1700)  # ceil(1400 * 1.15 / 100) * 100 = 1700
+
+        # 8) Bridge MUST NOT pierce high_deg_cap when post-deg hours >= 6h but steps < active_deg_steps
+        b_bridge_trap: Dict[int, Dict[str, Any]] = {
+            h22: {"steps": 4558},
+            cur_h - 10: {"steps": 100, "degraded": True, "degraded_24h_at": 2551, "dk": "t2"},
+        }
+        for k in range(1, 9):
+            b_bridge_trap[cur_h - 10 + k] = {"steps": 300}  # 2400 steps over 8h (< 2551)
+        res_bt = compute_adaptive_steps_v2(960, 1200, b_bridge_trap, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_bt.alert_limit, 2150)
+
+        # 9) Free tier high-load degradation stays monotonic at 600 cap & omits unreachable relax promise
+        res_free = compute_adaptive_steps_v2(
+            960, 1200, {h24_deg: {"steps": 700, "degraded": True, "degraded_24h_at": 700, "dk": "t2"}},
+            now_ts=now, account_tier="free",
+        )
+        self.assertEqual(res_free.alert_limit, 600)
+        self.assertNotIn("会自动放宽", res_free.note)
+
+        # 10) Dual-review P1-1: Expired >7d high-load degradation MUST NOT resurrect when today has a new degradation
+        h_9d_4k = cur_h - 9 * 24
+        b_p11_low = {
+            h_9d_4k: {"steps": 2000, "degraded": True, "degraded_24h_at": 4000, "dk": "t2"},
+            cur_h - 5: {"steps": 400, "degraded": True, "degraded_24h_at": 800, "dk": "t2"},
+            cur_h - 4: {"steps": 600},
+            cur_h - 3: {"steps": 600},
+            cur_h - 2: {"steps": 600},  # 1800 >= 800*2=1600 -> must lift today's low deg, NOT be held at 8000!
+        }
+        res_p11_low = compute_adaptive_steps_v2(960, 1200, b_p11_low, now_ts=now, account_tier="ultra")
+        self.assertEqual((res_p11_low.mode, res_p11_low.alert_limit), ("default", 1200))
+
+        b_p11_high = {
+            h_9d_4k: {"steps": 1500, "degraded": True, "degraded_24h_at": 1500, "dk": "t2"},
+            h_2d_safe: {"steps": 3000},
+            cur_h - 1: {"steps": 100, "degraded": True, "degraded_24h_at": 2800, "dk": "t2"},
+        }
+        res_p11_high = compute_adaptive_steps_v2(960, 1200, b_p11_high, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_p11_high.alert_limit, 2350)  # floor(2800*0.85/50)*50=2350, NOT 1250 from expired 1500!
+        self.assertIn("2800", res_p11_high.note)
+
+        # 11) Dual-review P1-2: Strict monotonicity across own_est <= 1200 vs 1201 & zero Day-6->Day-8 drop
+        res_own_1200 = compute_adaptive_steps_v2(
+            960, 1200, {h22: {"steps": 1200}, h24_deg: {"steps": 100, "degraded": True, "degraded_24h_at": 2551, "dk": "t2"}},
+            now_ts=now, account_tier="ultra",
+        )
+        res_own_1201 = compute_adaptive_steps_v2(
+            960, 1200, {h22: {"steps": 1201}, h24_deg: {"steps": 100, "degraded": True, "degraded_24h_at": 2551, "dk": "t2"}},
+            now_ts=now, account_tier="ultra",
+        )
+        self.assertLessEqual(res_own_1200.alert_limit, res_own_1201.alert_limit)
+        self.assertEqual(res_own_1200.alert_limit, 1200)
+        self.assertEqual(res_own_1201.alert_limit, 1400)
+
+        # 12) Dual-review P1-4: Unsettled degradation with degraded_24h_at=None falls back to 24h window steps & blocks soft_over_limit
+        b_none_at = {
+            h22: {"steps": 4558},
+            cur_h - 3: {"steps": 900},
+            cur_h - 2: {"steps": 900},
+            cur_h - 1: {"steps": 100, "degraded": True, "degraded_24h_at": None, "dk": "t1_multi"},
+        }
+        res_none_at = compute_adaptive_steps_v2(
+            960, 1200, b_none_at, now_ts=now, account_tier="ultra",
+            live_24h_raw_steps=2000, live_5h_pct=90.0, live_weekly_pct=90.0,
+        )
+        self.assertTrue(res_none_at.high_deg_capped)
+        self.assertEqual(res_none_at.alert_limit, 1600)  # floor(1900*0.85/50)*50=1600
+        self.assertFalse(res_none_at.soft_over_limit)
+
+        # 13) Dual-review P2-1/P2-2: Low-deg + unsettled high-deg prefers low tightening; high_deg_capped + low_quota preserves context
+        b_mix_deg = {
+            h22: {"steps": 600, "degraded": True, "degraded_24h_at": 600, "dk": "t2"},
+            cur_h - 1: {"steps": 100, "degraded": True, "degraded_24h_at": 2000, "dk": "t2"},
+        }
+        res_mix = compute_adaptive_steps_v2(960, 1200, b_mix_deg, now_ts=now, account_tier="ultra")
+        self.assertEqual(res_mix.mode, "adaptive_down")
+        self.assertEqual(res_mix.alert_limit, 600)
+
+        res_hq_lowq = compute_adaptive_steps_v2(
+            960, 1200, b_ca, now_ts=now, account_tier="ultra",
+            live_24h_raw_steps=1400, live_5h_pct=10.0, burn_pct_per_hour=10.0, last_1h_steps=150,
+        )
+        self.assertTrue(res_hq_lowq.low_quota_tightened)
+        self.assertTrue(res_hq_lowq.high_deg_capped)
+        self.assertTrue(any("2551" in line for line in res_hq_lowq.detail_lines))
+
+        # 14) Plain-Chinese jargon check across all new notes
+        for r_chk in (res_ca, res_ly, res_near, res_day1, res_free, res_none_at, res_hq_lowq):
+            _assert_plain_chinese(self, r_chk)
+
+        # 15) Dual-review P1-3: UI tooltip suppresses false "沉淀预告" when high_deg_capped=True
+        from core.log_monitor import AccountQuotaInfo, MonitorSnapshot
+        from ui.capsule_app import AntigravityCapsuleApp
+
+        snap_hd = MonitorSnapshot(
+            generated_at=now, level="green", grade="T0", headline="T0", sub_headline="ok",
+            active_model="Neon XHigh", primary_hit_rate=98.0, primary_hit_classification="hit",
+            primary_tps=120.0, primary_ttft=4.0, primary_speed_status="ok",
+            min_freshness_sec=180, min_freshness_conv="a1b2c3", min_freshness_ctx=120000,
+            min_freshness_invalid_reason="", today_steps=2300, daily_steps_warn=1720, daily_steps_alert=2150,
+            active_conversations=[], large_freshness_list=[], recent_503=0, today_503=0,
+            recent_timeout=0, today_timeout=0, recent_403=0, today_403=0, recent_retry=0, today_retry=0,
+            recent_events=[], wasted_cold_tokens_total=0, max_consec_miss=0,
+            account=AccountQuotaInfo(short_label="ca***8", tier="g1-ultra-tier", online=True, observed_at=now),
+            sliding_window_min=30, freshness_window_sec=210, resolved_account="ca***8",
+            daily_steps_limit_mode="adaptive_up", daily_steps_limit_note=res_ca.note,
+            rolling_24h_steps=2300, current_24h_has_degradation=False,
+            steps_detail_lines=res_ca.detail_lines, steps_high_deg_capped=True, steps_high_deg_ref_steps=2551,
+        )
+        dummy_app = object.__new__(AntigravityCapsuleApp)
+        dummy_app.config = {"daily_steps_warn": 960}
+        tip_txt = AntigravityCapsuleApp._build_steps_tooltip_text(dummy_app, snap_hd)
+        self.assertNotIn("沉淀预告", tip_txt)
+        self.assertIn("2551", tip_txt)
+
 
 if __name__ == "__main__":
     unittest.main()

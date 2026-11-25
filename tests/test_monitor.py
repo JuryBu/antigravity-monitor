@@ -4321,7 +4321,8 @@ class TestShortcutsAndIcons(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            now = time.time()
+            # Fixed midday anchor so -2700s never crosses midnight into yesterday when running tests at 00:00-00:45
+            now = datetime.datetime(2026, 11, 21, 14, 0, 0).timestamp()
             def _glog(dt_s: float) -> str:
                 return datetime.datetime.fromtimestamp(now + dt_s).strftime("%m%d %H:%M:%S.123456")
             def _iso(dt_s: float) -> str:

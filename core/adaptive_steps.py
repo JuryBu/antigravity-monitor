@@ -43,6 +43,8 @@ class AdaptiveStepsResult:
     low_quota_tightened: bool = False         # True only when low 5h/weekly actually lowered alert_limit
     gemini_24h_steps: int = 0                 # Independent 24h Gemini pool steps
     third_party_24h_steps: int = 0            # Independent 24h 3P pool steps
+    high_deg_capped: bool = False             # True when actively held by high-load degradation fallback cap
+    high_deg_ref_steps: int = 0               # Reference step count where the active high-load degradation occurred
 
 
 def _resolve_tier_params(account_tier: str, base_alert: int) -> Tuple[str, int, int, int, int]:
@@ -299,6 +301,14 @@ def compute_account_time_decayed_records(
         }
 
     unsettled_major_degs.sort(key=lambda item: item[0])
+    # Fallback 24h rolling window step load when an unsettled major degradation bucket lacks explicit degraded_24h_at
+    resolved_unsettled_degs: List[Tuple[int, Optional[int]]] = []
+    for uhk, u_at in unsettled_major_degs:
+        if u_at is None:
+            win_sum = sum(all_parsed[h][0] for h in range(uhk - 23, uhk + 1) if h in all_parsed)
+            u_at = win_sum if win_sum > 0 else None
+        resolved_unsettled_degs.append((uhk, u_at))
+    unsettled_major_degs = resolved_unsettled_degs
 
     def _best_24h_clean_window(cmap: Dict[int, int]) -> Tuple[int, int]:
         if not cmap:
@@ -719,7 +729,7 @@ def compute_adaptive_steps_v2(
         bridge_hours = 0
         bridge_has_unsettled = False
 
-    own_est, w_own, hist_safe_peak, latest_high_deg_steps, _latest_deg_date = _evaluate_account_history(
+    own_est, w_own, hist_safe_peak, latest_high_deg_steps, latest_deg_date = _evaluate_account_history(
         daily_peaks,
         b_alert=b_alert,
         deg_min=deg_min,
@@ -727,6 +737,26 @@ def compute_adaptive_steps_v2(
         low_load_min=low_load_min,
         norm_tier=norm_tier,
     )
+    latest_high_deg_age_days: Optional[float] = None
+    if latest_high_deg_steps is not None and latest_deg_date:
+        for _rec in daily_peaks:
+            if str(_rec.get("date", "")) == latest_deg_date:
+                latest_high_deg_age_days = float(_rec.get("age_days", 0.0))
+                break
+
+    # Clamp baseline to tier_cap (e.g. Free tier cap=600) so higher settled peaks stay monotonic and never dive!
+    eff_base_alert = min(b_alert, tier_cap)
+    # Single-day soft cap 4200 applies ONLY when W_own < 1.2 and tier is known (preserves 1300->1500 & 3048->3600)
+    eff_cap = min(tier_cap, 4200) if (w_own < 1.2 and norm_tier != "") else tier_cap
+
+    # Expire settled high-load degradation (>7 days old) BEFORE merging unsettled degradations so ancient blips never resurrect
+    if (
+        latest_high_deg_steps is not None
+        and latest_high_deg_steps >= eff_base_alert
+        and latest_high_deg_age_days is not None
+        and latest_high_deg_age_days > 7.0
+    ):
+        latest_high_deg_steps = None
 
     # Also incorporate unsettled high-load account-wide degradation (>= deg_min) for tightening & refutation guard
     unsettled_high_deg: Optional[int] = None
@@ -745,12 +775,13 @@ def compute_adaptive_steps_v2(
             active_deg_steps = min(active_deg_steps, unsettled_high_deg)
             refute_deg_steps = max(refute_deg_steps or active_deg_steps, unsettled_high_deg)
 
-    # 3. Check active hard tightening & >=3h sustained recovery refutation back to default
-    # Clamp baseline to tier_cap (e.g. Free tier cap=600) so higher settled peaks stay monotonic and never dive!
-    eff_base_alert = min(b_alert, tier_cap)
+    # 3. Check active hard tightening (< eff_base_alert) or smooth high-load fallback cap (>= eff_base_alert)
     eff_alert = eff_base_alert
     mode = "default"
     tightening_lifted = False
+    high_deg_capped = False
+    high_deg_lifted = False
+    high_deg_ref_steps = 0
     used_bridge = False
     used_peer_cold = False
     used_peer_blend = False
@@ -775,14 +806,39 @@ def compute_adaptive_steps_v2(
         else:
             mode = "adaptive_down"
             eff_alert = tight_alert
+    elif active_deg_steps is not None:
+        # High-load degradation (>= baseline) or sub-baseline degradation clamped at tier_floor:
+        # 1) Sustained post-degradation healthy throughput (>=3h & >= refute threshold) lifts the cap.
+        #    Require 1.15x when unsettled degradation is still inside 24h window to prevent 1199 vs 1200 cliff jump.
+        # 2) Otherwise smoothly fall back to 85% of active_deg_steps capped by own earned capacity (strictly monotonic!).
+        refute_high_base = refute_deg_steps if refute_deg_steps is not None else active_deg_steps
+        if has_unsettled_major_deg:
+            refute_high_th = max(eff_base_alert, int(math.ceil(float(refute_high_base or 0) * 1.15)))
+        else:
+            refute_high_th = max(eff_base_alert, int(refute_high_base or 0))
+        if (not live_is_degraded) and recov_hours >= 3 and recov_steps >= refute_high_th:
+            high_deg_lifted = True
+            active_deg_steps = None
+        else:
+            high_deg_capped = True
+            high_deg_ref_steps = int(active_deg_steps)
+            high_deg_raw = int(math.floor((active_deg_steps * 0.85) / 50.0) * 50)
+            high_deg_cap = max(eff_base_alert, min(eff_cap, high_deg_raw))
+            if active_deg_steps >= eff_base_alert and w_own > 0.0 and own_est > eff_base_alert:
+                own_ceil_hd = max(eff_base_alert, int(math.ceil((own_est * 1.15) / 100.0) * 100))
+                target_hd = min(eff_cap, own_ceil_hd, high_deg_cap)
+            else:
+                # Without proven clean history above baseline (or when clamped at tier_floor), stay strictly at baseline
+                target_hd = eff_base_alert
+            eff_alert = max(eff_base_alert, target_hd)
+            mode = "adaptive_up" if eff_alert > eff_base_alert else "default"
 
     # 4. Same-tier peer weak prior & own time-decayed capacity calibration (only when not degraded/tightened)
-    # Single-day soft cap 4200 applies ONLY when W_own < 1.2 and tier is known (preserves 1300->1500 & 3048->3600)
-    eff_cap = min(tier_cap, 4200) if (w_own < 1.2 and norm_tier != "") else tier_cap
     can_use_peer = (
         norm_tier in ("ultra", "pro", "free")
         and (not has_active_tightening)
         and (not tightening_lifted)
+        and (not high_deg_capped)
         and (active_deg_steps is None)
         and (not has_unsettled_major_deg)
         and (not live_is_degraded)
@@ -844,6 +900,8 @@ def compute_adaptive_steps_v2(
     if (
         (not live_is_degraded)
         and (mode != "adaptive_down")
+        and (not has_active_tightening)
+        and (not high_deg_capped)
         and not_brand_new
         and bridge_has_unsettled
         and bridge_hours >= 6
@@ -912,6 +970,9 @@ def compute_adaptive_steps_v2(
         (not live_is_degraded)
         and grade_u == "T0"
         and (not low_quota_tightened)
+        and (not has_active_tightening)
+        and (not high_deg_capped)
+        and (not has_unsettled_major_deg)
         and live_5h_pct is not None
         and float(live_5h_pct) >= 50.0
         and (live_weekly_pct is None or float(live_weekly_pct) >= 50.0)
@@ -921,12 +982,20 @@ def compute_adaptive_steps_v2(
 
     # 7. Plain-Chinese note & detail_lines (zero math/algorithm jargon!)
     tier_text = tier_label or "同档位"
+    relax_tail = "，连续稳跑后会自动放宽" if eff_cap > eff_base_alert else ""
     if low_quota_tightened:
         note = "当前 5 小时或本周余量偏低，已主动收紧提醒线保护额度"
+    elif high_deg_capped:
+        if eff_alert > eff_base_alert:
+            note = f"近期在 {high_deg_ref_steps} 步遇异常，保护线已回落保护至 {eff_alert} 步{relax_tail}"
+        else:
+            note = f"近期在 {high_deg_ref_steps} 步遇异常，保护线暂守默认 {eff_base_alert} 步{relax_tail}"
     elif mode == "adaptive_down":
         note = f"近期曾出现限流/掉缓存，保护线已自动收紧至 {eff_alert} 步，连续稳跑后会自动放宽"
     elif tightening_lifted and mode == "default":
         note = f"近期已连续健康跑过 {recov_steps} 步，已解除历史旧收紧，恢复默认保护线"
+    elif high_deg_lifted and mode == "default":
+        note = f"近期已连续健康跑过 {recov_steps} 步，已解除高位异常保护，恢复默认保护线"
     elif mode == "adaptive_up":
         if used_bridge:
             note = f"近期已连续稳跑 {bridge_hours} 小时（共 {bridge_steps} 步），保护线已平滑放宽至 {eff_alert} 步"
@@ -940,6 +1009,10 @@ def compute_adaptive_steps_v2(
         note = "初始建议值，积累近期稳跑记录后会自动校准"
 
     detail_lines: List[str] = [note]
+    if low_quota_tightened and high_deg_capped and high_deg_ref_steps > 0:
+        detail_lines.append(
+            f"近期在 {high_deg_ref_steps} 步遇异常，当前同步回落保护"
+        )
     if peer_prior_peak > 0 and peer_weight_pct > 0 and not used_peer_cold:
         detail_lines.append(
             f"同为 {tier_text} 账号近期稳跑约 {peer_prior_peak} 步（当前参考占比 {peer_weight_pct}%）"
@@ -977,4 +1050,6 @@ def compute_adaptive_steps_v2(
         low_quota_tightened=low_quota_tightened,
         gemini_24h_steps=gemini_24h,
         third_party_24h_steps=third_party_24h,
+        high_deg_capped=high_deg_capped,
+        high_deg_ref_steps=high_deg_ref_steps,
     )

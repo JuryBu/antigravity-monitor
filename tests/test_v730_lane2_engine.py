@@ -1070,6 +1070,266 @@ class TestV730AdaptiveStepsAndJsonIntegration(unittest.TestCase):
             self.assertEqual(snap.recent_503, 0)
             self.assertEqual(snap.today_503, 0)
 
+    def test_proxy_tls_handshake_timeout_burst_shields_stream_idle_timeout_from_false_t2(self) -> None:
+        from core.log_monitor import format_json_snapshot
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 0, 23, 0).timestamp()
+
+            def _glog(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.123456")
+
+            # Seed staggered cross-endpoint TLS handshake timeout wave (matching real 23:59..00:22 log pattern)
+            # plus local 127.0.0.1 TLS handshake error & errorreport.go echo traps
+            log_lines = [
+                f"ERROR: logging before google.Init: W{_glog(-1400)} 11001 cache.go:169] Cache(peopleInfo): Singleflight refresh failed: Get \"https://www.googleapis.com/oauth2/v2/userinfo\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: E{_glog(-1400)} 11001 errorreport.go:282] Get \"https://www.googleapis.com/oauth2/v2/userinfo\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: W{_glog(-1358)} 11002 cache.go:169] Cache(peopleInfo): Singleflight refresh failed: Get \"https://www.googleapis.com/oauth2/v2/userinfo\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: W{_glog(-1316)} 11003 user_management.go:139] Failed to get profile picture: Get \"https://lh3.googleusercontent.com/a/demo\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: W{_glog(-980)} 11004 cache.go:169] Cache(availableModels): Singleflight refresh failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: W{_glog(-940)} 11005 user_management.go:139] Failed to get profile picture: Get \"https://lh3.googleusercontent.com/a/demo\": net/http: TLS handshake timeout",
+                f"2026/11/26 00:11:59 http: TLS handshake error from 127.0.0.1:60150: client sent an HTTP request to an HTTPS server",
+                f"ERROR: logging before google.Init: I{_glog(-660)} 62407 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                f"ERROR: logging before google.Init: W{_glog(-630)} 11006 user_management.go:139] Failed to get profile picture: Get \"https://lh3.googleusercontent.com/a/demo\": net/http: TLS handshake timeout",
+                f"ERROR: logging before google.Init: I{_glog(-30)} 62407 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+            ]
+            ls_log = root / "language_server.log"
+            ls_log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+            # Seed an active main conversation with recent healthy steps
+            dm = root / "brain" / "tlswave1-aaaa" / ".system_generated" / "logs"
+            dm.mkdir(parents=True)
+            rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(now - 900), "content": "hi"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(now - 700), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso_utc(now - 20), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 200},
+            ]
+            (dm / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            os.utime(dm / "transcript.jsonl", (now - 10, now - 10))
+
+            eng = _make_engine(root, read_only=False)
+            eng._ledger.observe_online("ly***8", now - 3600)
+            eng._account_cache = AccountQuotaInfo(
+                short_label="ly***8",
+                online=True,
+                tier="g1-ultra-tier",
+                observed_at=now,
+                pools={"gemini": QuotaPoolInfo(name="gemini", five_hour_pct=93.0, weekly_pct=56.0)},
+            )
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+
+            # Both 10m0s stream idle timeouts occurred during the cross-endpoint TLS timeout wave -> WARN, NOT red T2!
+            self.assertEqual(snap.grade, "WARN")
+            self.assertEqual(snap.recent_timeout, 2)
+            self.assertEqual(snap.proxy_outage_timeout_recent, 2)
+            self.assertEqual(snap.last_t2_error_ts, 0.0)
+            self.assertTrue(all(ev.is_proxy_outage_timeout for ev in snap.recent_events if ev.category == "timeout"))
+            self.assertIn("代理抖动流超时", snap.sub_headline)
+
+            # Critical invariant: account_ledger MUST NOT persist a false dk="t2" degradation bucket!
+            hb = eng._ledger.get_account_hourly_buckets("ly***8")
+            self.assertFalse(any(rec.get("degraded") for rec in hb.values()))
+
+            # JSON contract exposes proxy_outage_timeout cleanly
+            payload = json.loads(format_json_snapshot(snap))
+            self.assertEqual(payload["errors_30m"]["proxy_outage_timeout"], 2)
+            self.assertTrue(
+                all(e["is_proxy_outage_timeout"] for e in payload["errors_30m"]["recent_events"] if e["category"] == "timeout")
+            )
+
+            # Guard A: Real server 503s during the same proxy TLS wave MUST STILL escalate to red T2!
+            with ls_log.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"ERROR: logging before google.Init: E{_glog(-10)} 77001 http_helpers.go:876] streamGenerateContent status 503 No capacity\n"
+                    f"ERROR: logging before google.Init: E{_glog(-5)} 77002 http_helpers.go:876] streamGenerateContent status 503 No capacity\n"
+                )
+            snap_503 = eng.poll(now_ts=now + 2.0, force_account=False)
+            self.assertEqual(snap_503.grade, "T2")
+            self.assertEqual(snap_503.recent_503, 2)
+
+            # Guard B: Switched account without its own proxy burst hitting 2 standalone stream timeouts MUST escalate to T2!
+            t_sw = now + 30.0
+            t_sw_now = t_sw + 120.0
+            eng._ledger.observe_online("ne***9", t_sw)
+            eng._account_cache = AccountQuotaInfo(
+                short_label="ne***9",
+                online=True,
+                tier="g1-ultra-tier",
+                observed_at=t_sw_now,
+                pools={"gemini": QuotaPoolInfo(name="gemini", five_hour_pct=90.0)},
+            )
+            eng._last_account_poll = t_sw_now
+            with ls_log.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"ERROR: logging before google.Init: I{datetime.datetime.fromtimestamp(t_sw + 40).strftime('%m%d %H:%M:%S.000000')} 88001 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s\n"
+                    f"ERROR: logging before google.Init: I{datetime.datetime.fromtimestamp(t_sw + 90).strftime('%m%d %H:%M:%S.000000')} 88002 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s\n"
+                )
+            snap_sw = eng.poll(now_ts=t_sw_now, force_account=False)
+            self.assertEqual(snap_sw.grade, "T2")
+            self.assertEqual(snap_sw.proxy_outage_timeout_recent, 0)
+
+    def test_standalone_stream_timeouts_with_single_isolated_tls_still_trigger_t2(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 1, 0, 0).timestamp()
+
+            def _glog(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.123456")
+
+            # Only 1 isolated single-bucket TLS timeout (NOT a >=3 cross-endpoint burst) + 2 stream timeouts -> MUST stay T2!
+            (root / "language_server.log").write_text(
+                f"ERROR: logging before google.Init: W{_glog(-300)} 91001 user_management.go:139] Get \"https://lh3.googleusercontent.com/a/demo\": net/http: TLS handshake timeout\n"
+                f"ERROR: logging before google.Init: I{_glog(-120)} 91002 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s\n"
+                f"ERROR: logging before google.Init: I{_glog(-20)} 91003 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s\n",
+                encoding="utf-8",
+            )
+            eng = _make_engine(root, read_only=False)
+            eng._ledger.observe_online("ac***7", now - 3600)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***7", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T2")
+            self.assertEqual(snap.proxy_outage_timeout_recent, 0)
+
+    def test_dual_review_proxy_timeout_anti_whitewash_reentry_settle_and_localhost_profile(self) -> None:
+        from core.log_monitor import LanguageServerLogTailer, format_text_summary
+
+        # 1) Dual-review M1-A: Manual proxy switch 60s AFTER 2 real server timeouts MUST NOT whitewash T2!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 12, 0, 0).timestamp()
+
+            def _g(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.100000")
+
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    f"ERROR: logging before google.Init: I{_g(-80)} 50001 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                    f"ERROR: logging before google.Init: I{_g(-70)} 50002 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                    # 60s AFTER timeouts, user switches proxy node causing 3 cross-endpoint EOFs
+                    f"ERROR: logging before google.Init: E{_g(-10)} 50003 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": unexpected EOF",
+                    f"ERROR: logging before google.Init: W{_g(-9)} 50004 cache.go:189] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo\": unexpected EOF",
+                    f"ERROR: logging before google.Init: E{_g(-8)} 50005 client.go:88] Post \"https://play.googleapis.com/log\": unexpected EOF",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng = _make_engine(root, read_only=True)
+            eng._ledger.observe_online("ac***1", now - 3600)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***1", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T2")
+            self.assertEqual(snap.proxy_outage_timeout_recent, 0)
+
+        # 2) Dual-review M1-B: Stale burst 28m ago + long silence + 1 stray EOF + 2 real timeouts MUST stay T2!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 12, 30, 0).timestamp()
+
+            def _g(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.100000")
+
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    # 28m ago brief proxy blip
+                    f"ERROR: logging before google.Init: E{_g(-1680)} 51001 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": unexpected EOF",
+                    f"ERROR: logging before google.Init: W{_g(-1678)} 51002 cache.go:189] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo\": unexpected EOF",
+                    f"ERROR: logging before google.Init: E{_g(-1676)} 51003 client.go:88] Post \"https://play.googleapis.com/log\": unexpected EOF",
+                    # 26m of complete silence, then 1 stray telemetry EOF & 2 real server timeouts
+                    f"ERROR: logging before google.Init: E{_g(-100)} 51004 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": unexpected EOF",
+                    f"ERROR: logging before google.Init: I{_g(-60)} 51005 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                    f"ERROR: logging before google.Init: I{_g(-20)} 51006 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng = _make_engine(root, read_only=True)
+            eng._ledger.observe_online("ac***2", now - 3600)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***2", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T2")
+            self.assertEqual(snap.proxy_outage_timeout_recent, 0)
+
+        # 3) Dual-review M2: A -> B -> A account re-entry MUST NOT leak prior session's proxy burst across current_acct_since_ts!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 13, 0, 0).timestamp()
+
+            def _g(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.100000")
+
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    # Session 1 on A (t-1200s): proxy burst
+                    f"ERROR: logging before google.Init: E{_g(-1200)} 52001 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": unexpected EOF",
+                    f"ERROR: logging before google.Init: W{_g(-1198)} 52002 cache.go:189] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo\": unexpected EOF",
+                    f"ERROR: logging before google.Init: E{_g(-1196)} 52003 client.go:88] Post \"https://play.googleapis.com/log\": unexpected EOF",
+                    # Session 2 back on A (after t-300s re-entry): 1 stray EOF + 2 timeouts -> MUST be T2!
+                    f"ERROR: logging before google.Init: E{_g(-100)} 52004 telemetry.go:142] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:recordTrajectoryAnalytics\": unexpected EOF",
+                    f"ERROR: logging before google.Init: I{_g(-60)} 52005 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                    f"ERROR: logging before google.Init: I{_g(-20)} 52006 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng = _make_engine(root, read_only=True)
+            eng._ledger.observe_online("ac***a", now - 2000)
+            eng._ledger.observe_online("ac***b", now - 900)
+            eng._ledger.observe_online("ac***a", now - 300)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***a", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.grade, "T2")
+            self.assertEqual(snap.proxy_outage_timeout_recent, 0)
+
+        # 4) Dual-review M3 + M5 + R1 + R4: Localhost proxy -> lh3.googleusercontent.com captured; settle to T0 after >=300s & >=6 flagship steps; historical 'today' stays T0!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 14, 0, 0).timestamp()
+            t_out = now - 400.0
+
+            def _gt(ts_v: float) -> str:
+                return datetime.datetime.fromtimestamp(ts_v).strftime("%m%d %H:%M:%S.100000")
+
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    # Includes localhost 127.0.0.1 proxy error targeting lh3.googleusercontent.com (M5!)
+                    f"ERROR: logging before google.Init: W{_gt(t_out - 20)} 53001 user_management.go:139] Get \"https://lh3.googleusercontent.com/a/demo\" via 127.0.0.1:7890: net/http: TLS handshake timeout",
+                    f"ERROR: logging before google.Init: W{_gt(t_out - 10)} 53002 cache.go:169] Cache(peopleInfo): Get \"https://www.googleapis.com/oauth2/v2/userinfo\": net/http: TLS handshake timeout",
+                    f"ERROR: logging before google.Init: W{_gt(t_out)} 53003 client.go:148] Post \"https://play.googleapis.com/log\": net/http: TLS handshake timeout",
+                    f"ERROR: logging before google.Init: I{_gt(t_out + 5)} 53004 run.go:308] Run: attempt 1 failed (request failed: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            dm = root / "brain" / "settle01-aaaa" / ".system_generated" / "logs"
+            dm.mkdir(parents=True)
+            rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t_out - 60), "content": "hi"}]
+            for k in range(1, 7):  # 6 flagship main steps after t_out+5
+                rows.append({"type": "PLANNER_RESPONSE", "step_index": k, "created_at": _iso_utc(t_out + 30 + k * 30), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000 + k * 100, "output_tokens": 300})
+            (dm / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            os.utime(dm / "transcript.jsonl", (now - 10, now - 10))
+
+            eng = _make_engine(root, read_only=True)
+            eng._ledger.observe_online("ac***3", now - 3600)
+            eng._account_cache = AccountQuotaInfo(short_label="ac***3", online=True, observed_at=now)
+            eng._last_account_poll = now
+            # Check M5 directly on tailer
+            eng._log_tailer.poll(now_ts=now)
+            cnt_d, _, _, _, kind_d = eng._log_tailer.get_proxy_outage_detail(now, 30)
+            self.assertEqual(cnt_d, 3)
+            self.assertEqual(kind_d, "tls_60s")
+            # Live 30m: >300s & 6 flagship main steps after both burst and proxy timeout -> settled cleanly back to T0!
+            snap_live = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap_live.grade, "T0")
+            self.assertEqual(snap_live.proxy_outage_timeout_recent, 1)
+            self.assertIn("已平复", snap_live.sub_headline)
+            txt_sum = format_text_summary(snap_live)
+            self.assertIn("代理超时:", txt_sum)
+            # Historical 'today' view MUST also stay T0 (never escalate WARN for transient proxy timeouts)
+            snap_today = eng.poll(now_ts=now, force_account=False, history_range="today")
+            self.assertEqual(snap_today.grade, "T0")
+
 
 if __name__ == "__main__":
     unittest.main()

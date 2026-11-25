@@ -3259,7 +3259,12 @@ class AntigravityCapsuleApp:
                 text=f"底层日志监控（{snap.log_scope_label} · {win_title} / 今日）"
             )
             self._update_log_cell("503", snap.recent_503, snap.today_503, warn_on_recent=1, red_on_recent=2)
-            server_timeout_recent = max(0, snap.recent_timeout - getattr(snap, "heavy_media_timeout_recent", 0))
+            server_timeout_recent = max(
+                0,
+                snap.recent_timeout
+                - getattr(snap, "heavy_media_timeout_recent", 0)
+                - getattr(snap, "proxy_outage_timeout_recent", 0),
+            )
             self._update_log_cell(
                 "timeout",
                 snap.recent_timeout,
@@ -3326,15 +3331,31 @@ class AntigravityCapsuleApp:
                 fg=t["alert_banner_text"],
                 text=cold_txt,
             )
-        elif logs_live and snap.grade in ("T2", "T3") and snap.recent_events:
+        elif logs_live and snap.grade in ("T2", "T3") and (snap.recent_events or getattr(snap, "recent_events_by_cat", None)):
+            by_cat = getattr(snap, "recent_events_by_cat", None) or {}
             if snap.grade == "T3":
-                key_evs = [e for e in snap.recent_events if e.category == "403"] or snap.recent_events
+                key_evs = list(by_cat.get("403") or []) or [e for e in snap.recent_events if e.category == "403"] or snap.recent_events
             else:
-                key_evs = [
+                cat_t2 = list(by_cat.get("503") or []) + [
                     e
-                    for e in snap.recent_events
-                    if e.category == "503" or (e.category == "timeout" and not getattr(e, "is_heavy_media_timeout", False))
-                ] or snap.recent_events
+                    for e in (by_cat.get("timeout") or [])
+                    if not getattr(e, "is_heavy_media_timeout", False)
+                    and not getattr(e, "is_proxy_outage_timeout", False)
+                ]
+                if cat_t2:
+                    cat_t2.sort(key=lambda e: float(getattr(e, "timestamp", 0.0) or 0.0))
+                    key_evs = cat_t2
+                else:
+                    key_evs = [
+                        e
+                        for e in snap.recent_events
+                        if e.category == "503"
+                        or (
+                            e.category == "timeout"
+                            and not getattr(e, "is_heavy_media_timeout", False)
+                            and not getattr(e, "is_proxy_outage_timeout", False)
+                        )
+                    ] or snap.recent_events
             ev_txt = "\n".join(e.summary for e in key_evs[-2:])
             self._banner_frame.configure(bg=t["red_bg"], highlightbackground=t["red"])
             self._lbl_banner.configure(bg=t["red_bg"], fg=t["red"], text=ev_txt)
@@ -3347,6 +3368,7 @@ class AntigravityCapsuleApp:
             or snap.recent_503 > 0
             or getattr(snap, "proxy_outage_recent", 0) > 0
             or getattr(snap, "heavy_media_timeout_recent", 0) > 0
+            or getattr(snap, "proxy_outage_timeout_recent", 0) > 0
         ):
             self._banner_frame.configure(bg=t["orange_bg"], highlightbackground=t["orange"])
             self._lbl_banner.configure(bg=t["orange_bg"], fg=t["orange"], text=snap.sub_headline)
@@ -3825,6 +3847,8 @@ class AntigravityCapsuleApp:
         if eff_total > eff_steps:
             lines.append(f"  全机近24h: {eff_total} 步（主 {eff_tot_main} / 子 {eff_tot_sub}）")
         has_cur_deg = bool(getattr(snap, "current_24h_has_degradation", False))
+        high_deg_capped = bool(getattr(snap, "steps_high_deg_capped", False))
+        high_deg_ref = int(getattr(snap, "steps_high_deg_ref_steps", 0) or 0)
         if (
             snap.history_range == "30m"
             and not snap.is_historical_rating
@@ -3832,6 +3856,8 @@ class AntigravityCapsuleApp:
             and snap.grade == "T0"
             and mode != "adaptive_down"
             and not has_cur_deg
+            and not low_q_tight
+            and not high_deg_capped
             and snap.resolved_account
             and eff_steps > max(base_alert, snap.daily_steps_alert)
         ):
@@ -3856,6 +3882,13 @@ class AntigravityCapsuleApp:
                 )
             if next_alert > snap.daily_steps_alert:
                 lines.append(f"  沉淀预告: 当前 24h 已健康跑至 {eff_steps} 步，待本批步数完整退出 24h 窗后自动上调保护线至 {next_alert} 步")
+        elif (
+            high_deg_capped
+            and high_deg_ref > 0
+            and not low_q_tight
+            and eff_steps > snap.daily_steps_alert
+        ):
+            lines.append(f"  解除条件: 连续健康跑过 {high_deg_ref} 步后将自动解除高位异常保护")
         elif mode == "default" and not detail_lines:
             lines.append("  说明: 仅依据已沉淀的稳跑记录自动调整，当前窗口超线仍友好提醒而不盲目追高")
         return "\n".join(lines)
@@ -4024,6 +4057,8 @@ class AntigravityCapsuleApp:
                 row_txt = f"  [{hms}] {' · '.join(parts)}" if parts else f"  [{hms}] {cat_title}"
                 if cat == "timeout" and bool(getattr(ev, "is_heavy_media_timeout", False)):
                     row_txt += "（已识别为多图上传耗时，不计入限流）"
+                elif cat == "timeout" and bool(getattr(ev, "is_proxy_outage_timeout", False)):
+                    row_txt += "（已识别为代理线路抖动超时，不计入服务端限流）"
                 lines.append(row_txt)
         else:
             lines.append("  当前窗口无此类异常，运行平稳")

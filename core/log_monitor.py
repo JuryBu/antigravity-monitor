@@ -64,7 +64,7 @@ from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, par
 EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 RETRY_RE = re.compile(r"(?:^|[\s\[/\\])(?:run|retry)\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
 _PROXY_EOF_RE = re.compile(
-    r"(?:\bunexpected\s+eof\b|:\s*eof\b|\bforcibly closed\b|\bconnection reset\b|\bbroken pipe\b)",
+    r"(?:\bunexpected\s+eof\b|:\s*eof\b|\bforcibly closed\b|\bconnection reset\b|\bbroken pipe\b|\btls handshake timeout\b)",
     re.IGNORECASE,
 )
 _PROXY_IGNORED_SOURCES = frozenset({"runner.go", "llm_monitor.go", "extract_searchable_content.go"})
@@ -1411,6 +1411,7 @@ class LogEvent:
     model: str = ""
     duration_sec: Optional[float] = None
     is_heavy_media_timeout: bool = False
+    is_proxy_outage_timeout: bool = False
     media_count: int = 0
     media_bytes: int = 0
     culprit_cid: str = ""
@@ -1565,6 +1566,7 @@ class MonitorSnapshot:
     primary_hit_reason: str = ""
     carryover_conversations: List[ConversationSummary] = field(default_factory=list)
     heavy_media_timeout_recent: int = 0
+    proxy_outage_timeout_recent: int = 0
     proxy_outage_recent: int = 0
     proxy_outage_note: str = ""
     daily_steps_limit_mode: str = "default"
@@ -1608,6 +1610,8 @@ class MonitorSnapshot:
     steps_quota_headroom: Optional[int] = None
     steps_soft_over_limit: bool = False
     steps_low_quota_tightened: bool = False
+    steps_high_deg_capped: bool = False
+    steps_high_deg_ref_steps: int = 0
     account_tier_norm: str = ""
 
 
@@ -2206,9 +2210,11 @@ class LanguageServerLogTailer:
         self._block_emitted_cats: set[str] = set()
         self._skip_continuation_lines: int = 0
         self._skip_brace_depth: int = 0
-        # Bounded cross-endpoint proxy outage burst tracking (separated from notable events so single retry stays clean)
-        self._proxy_eof_events: Deque[Tuple[float, str, str]] = deque(maxlen=256)
+        # Bounded cross-endpoint proxy outage burst tracking (aligned with self._events maxlen=1500)
+        self._proxy_eof_events: Deque[Tuple[float, str, str]] = deque(maxlen=1500)
+        self._proxy_tls_events: Deque[Tuple[float, str, str]] = deque(maxlen=1500)
         self._proxy_eof_dedup: "OrderedDict[Tuple[str, str, int], float]" = OrderedDict()
+        self._proxy_bucket_last_ts: "OrderedDict[str, float]" = OrderedDict()
         self._proxy_eof_gid_ts: "OrderedDict[str, float]" = OrderedDict()
         self._session_start_ts: float = 0.0
 
@@ -2226,22 +2232,28 @@ class LanguageServerLogTailer:
         ):
             return "stream"
         if (
-            "fetchuserinfo" in body_low
-            or "retrieveuserquotasummary" in body_low
-            or src_base == "cache.go"
-        ):
-            return "userinfo"
-        if "play.googleapis.com" in body_low:
-            return "playlog"
-        if "recordtrajectoryanalytics" in body_low or src_base == "telemetry.go" or "clearcut" in body_low:
-            return "telemetry"
-        if (
             "listexperiments" in body_low
             or "fetchconfig" in body_low
             or "loadcodeassist" in body_low
             or "fetchavailablemodels" in body_low
         ):
             return "experiments"
+        if "googleusercontent.com" in body_low:
+            return "profile"
+        if (
+            "fetchuserinfo" in body_low
+            or "retrieveuserquotasummary" in body_low
+            or "oauth2/v2/userinfo" in body_low
+            or "peopleinfo" in body_low
+            or src_base == "cache.go"
+        ):
+            return "userinfo"
+        if src_base == "user_management.go":
+            return "profile"
+        if "play.googleapis.com" in body_low:
+            return "playlog"
+        if "recordtrajectoryanalytics" in body_low or src_base == "telemetry.go" or "clearcut" in body_low:
+            return "telemetry"
         return "other_google"
 
     def _record_proxy_eof_if_matched(
@@ -2256,6 +2268,7 @@ class LanguageServerLogTailer:
             return
         if not (
             "googleapis.com" in body_low
+            or "googleusercontent.com" in body_low
             or "stream reading error" in body_low
             or "streamgeneratecontent" in body_low
             or "fetchuserinfo" in body_low
@@ -2265,27 +2278,38 @@ class LanguageServerLogTailer:
             return
         bucket = self._classify_proxy_bucket(src_base, body_low)
         gid_tag = goroutine_id or src_base
-        # Collapse singleflight fanout storms (e.g. cache.go:189 emitting 17 fetchUserInfo EOFs in the same millisecond)
+        # Collapse singleflight fanout storms (sliding 2s per non-stream bucket prevents even-second boundary split)
         if bucket == "stream":
             dedup_key = ("stream", gid_tag, int(ts))
+            if dedup_key in self._proxy_eof_dedup:
+                return
         else:
+            prev_b_ts = self._proxy_bucket_last_ts.get(bucket)
+            if prev_b_ts is not None and abs(ts - prev_b_ts) <= 2.0:
+                return
             dedup_key = (bucket, "", int(ts // 2))
-        if dedup_key in self._proxy_eof_dedup:
-            return
         if goroutine_id:
             prev_gid_ts = self._proxy_eof_gid_ts.get(goroutine_id)
             if prev_gid_ts is not None and abs(ts - prev_gid_ts) <= 2.0:
                 return
-        self._proxy_eof_dedup[dedup_key] = ts
-        self._proxy_eof_dedup.move_to_end(dedup_key)
-        while len(self._proxy_eof_dedup) > 128:
-            self._proxy_eof_dedup.popitem(last=False)
+        if bucket == "stream":
+            self._proxy_eof_dedup[dedup_key] = ts
+            self._proxy_eof_dedup.move_to_end(dedup_key)
+            while len(self._proxy_eof_dedup) > 128:
+                self._proxy_eof_dedup.popitem(last=False)
+        else:
+            self._proxy_bucket_last_ts[bucket] = ts
+            self._proxy_bucket_last_ts.move_to_end(bucket)
+            while len(self._proxy_bucket_last_ts) > 64:
+                self._proxy_bucket_last_ts.popitem(last=False)
         if goroutine_id:
             self._proxy_eof_gid_ts[goroutine_id] = ts
             self._proxy_eof_gid_ts.move_to_end(goroutine_id)
             while len(self._proxy_eof_gid_ts) > 128:
                 self._proxy_eof_gid_ts.popitem(last=False)
         self._proxy_eof_events.append((ts, bucket, gid_tag))
+        if "tls handshake timeout" in body_low:
+            self._proxy_tls_events.append((ts, bucket, gid_tag))
 
     @staticmethod
     def _source_base_name(source: str) -> str:
@@ -2391,7 +2415,9 @@ class LanguageServerLogTailer:
             self._skip_continuation_lines = 0
             self._skip_brace_depth = 0
             self._proxy_eof_events.clear()
+            self._proxy_tls_events.clear()
             self._proxy_eof_dedup.clear()
+            self._proxy_bucket_last_ts.clear()
             self._proxy_eof_gid_ts.clear()
 
         if size == self._offset and self._initialized:
@@ -2520,7 +2546,9 @@ class LanguageServerLogTailer:
             return None
         low_full = line.lower()
         if "tls handshake error" in low_full or (
-            ("127.0.0.1" in low_full or "localhost" in low_full) and "googleapis.com" not in low_full
+            ("127.0.0.1" in low_full or "localhost" in low_full)
+            and "googleapis.com" not in low_full
+            and "googleusercontent.com" not in low_full
         ):
             if self._session_start_ts <= 0.0:
                 h_ok, h_tok, h_eager, _sv, _gid, _src, _bd = self._split_header_meta_lazy(line, fallback_ts)
@@ -2597,6 +2625,7 @@ class LanguageServerLogTailer:
                 or "forcibly closed" in body_low
                 or "connection reset" in body_low
                 or "broken pipe" in body_low
+                or "tls handshake timeout" in body_low
             )
         ):
             self._record_proxy_eof_if_matched(effective_ts, goroutine_id, src_base, body, body_low)
@@ -2851,33 +2880,15 @@ class LanguageServerLogTailer:
                 matched.append(ev)
         return matched[-limit:] if limit > 0 else matched
 
-    def get_proxy_outage_info(
-        self,
-        now_ts: float,
-        window_min: int,
-        account_since_ts: float = 0.0,
-        account_filter_fn: Optional[Callable[[float], bool]] = None,
-        range_start_ts: Optional[float] = None,
-        range_end_ts: Optional[float] = None,
+    @staticmethod
+    def _scan_proxy_burst_window(
+        evs: List[Tuple[float, str, str]],
+        window_sec: float,
+        *,
+        allow_single_stream_burst: bool = True,
     ) -> Tuple[int, float, float, int]:
-        """Detect a 60s cross-endpoint / multi-stream proxy disconnect burst within the active account & window.
-
-        Returns ``(burst_event_count, outage_start_ts, outage_end_ts, distinct_buckets)`` for the latest burst,
-        or ``(0, 0.0, 0.0, 0)`` if no genuine proxy outage occurred.
-        """
-        win_end = range_end_ts if range_end_ts is not None else now_ts
-        default_start = win_end - max(1, window_min) * 60
-        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
-        evs: List[Tuple[float, str, str]] = []
-        for ts, bucket, gid in self._proxy_eof_events:
-            if account_filter_fn is not None and not account_filter_fn(ts):
-                continue
-            if cutoff <= ts <= win_end + 2.0:
-                evs.append((ts, bucket, gid))
         if len(evs) < 3:
             return 0, 0.0, 0.0, 0
-        evs.sort(key=lambda x: x[0])
-
         best_end_ts = 0.0
         best_start_ts = 0.0
         best_count = 0
@@ -2885,18 +2896,18 @@ class LanguageServerLogTailer:
         left = 0
         for right in range(len(evs)):
             r_ts = evs[right][0]
-            while left < right and (r_ts - evs[left][0]) > 60.0:
+            while left < right and (r_ts - evs[left][0]) > window_sec:
                 left += 1
             cnt = right - left + 1
             if cnt < 3:
                 continue
             win_slice = evs[left : right + 1]
             buckets = {b for _, b, _ in win_slice}
-            stream_gids = {g for _, b, g in win_slice if b == "stream"}
+            stream_gids = {g for _, b, g in win_slice if b == "stream"} if allow_single_stream_burst else set()
             if len(buckets) >= 2 or len(stream_gids) >= 3:
-                # Track the latest burst window; if extending the same 60s burst, accumulate max coverage
+                # Track the latest burst window; if extending the same burst, accumulate max coverage
                 if r_ts >= best_end_ts:
-                    if best_end_ts > 0.0 and (r_ts - best_end_ts) <= 60.0:
+                    if best_end_ts > 0.0 and (r_ts - best_end_ts) <= window_sec:
                         best_end_ts = r_ts
                         best_count = max(best_count, cnt)
                         best_buckets = max(best_buckets, len(buckets))
@@ -2908,6 +2919,168 @@ class LanguageServerLogTailer:
         if best_count < 3:
             return 0, 0.0, 0.0, 0
         return best_count, best_start_ts, best_end_ts, best_buckets
+
+    def get_proxy_outage_detail(
+        self,
+        now_ts: float,
+        window_min: int,
+        account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
+    ) -> Tuple[int, float, float, int, str]:
+        """Detect proxy outage bursts within the active account & window.
+
+        Supports two complementary burst modes:
+        1. ``"eof_60s"``: >=3 cross-endpoint (or >=3 stream-goroutine) disconnects/TLS timeouts within 60s.
+        2. ``"tls_5m"``: >=3 cross-endpoint ``TLS handshake timeout`` errors within 300s (captures staggered proxy TLS stalls).
+
+        Returns ``(burst_event_count, outage_start_ts, outage_end_ts, distinct_buckets, kind)``.
+        """
+        win_end = range_end_ts if range_end_ts is not None else now_ts
+        default_start = win_end - max(1, window_min) * 60
+        cutoff = max(range_start_ts if range_start_ts is not None else default_start, account_since_ts)
+
+        all_evs: List[Tuple[float, str, str]] = []
+        for ts, bucket, gid in self._proxy_eof_events:
+            if account_filter_fn is not None and not account_filter_fn(ts):
+                continue
+            if cutoff <= ts <= win_end + 2.0:
+                all_evs.append((ts, bucket, gid))
+        all_evs.sort(key=lambda x: x[0])
+
+        tls_evs: List[Tuple[float, str, str]] = []
+        for ts, bucket, gid in self._proxy_tls_events:
+            if account_filter_fn is not None and not account_filter_fn(ts):
+                continue
+            if cutoff <= ts <= win_end + 2.0:
+                tls_evs.append((ts, bucket, gid))
+        tls_evs.sort(key=lambda x: x[0])
+
+        eof_res = self._scan_proxy_burst_window(all_evs, 60.0, allow_single_stream_burst=True)
+        tls_res_60 = self._scan_proxy_burst_window(tls_evs, 60.0, allow_single_stream_burst=True)
+        tls_res = self._scan_proxy_burst_window(tls_evs, 300.0, allow_single_stream_burst=False)
+        eof_kind = (
+            "tls_60s"
+            if (eof_res[0] >= 3 and tls_res_60[0] >= eof_res[0] and abs(tls_res_60[2] - eof_res[2]) <= 1.0)
+            else "eof_60s"
+        )
+
+        if eof_res[0] >= 3 and tls_res[0] >= 3:
+            if tls_res[2] > eof_res[2] + 60.0:
+                return tls_res[0], tls_res[1], tls_res[2], tls_res[3], "tls_5m"
+            return eof_res[0], eof_res[1], eof_res[2], eof_res[3], eof_kind
+        if eof_res[0] >= 3:
+            return eof_res[0], eof_res[1], eof_res[2], eof_res[3], eof_kind
+        if tls_res[0] >= 3:
+            return tls_res[0], tls_res[1], tls_res[2], tls_res[3], "tls_5m"
+        return 0, 0.0, 0.0, 0, ""
+
+    def get_proxy_outage_info(
+        self,
+        now_ts: float,
+        window_min: int,
+        account_since_ts: float = 0.0,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        range_start_ts: Optional[float] = None,
+        range_end_ts: Optional[float] = None,
+    ) -> Tuple[int, float, float, int]:
+        """Detect a cross-endpoint / multi-stream proxy disconnect or TLS jitter burst within the active account & window.
+
+        Returns ``(burst_event_count, outage_start_ts, outage_end_ts, distinct_buckets)`` for the latest burst,
+        or ``(0, 0.0, 0.0, 0)`` if no genuine proxy outage occurred.
+        """
+        cnt, s_ts, e_ts, b_cnt, _kind = self.get_proxy_outage_detail(
+            now_ts,
+            window_min,
+            account_since_ts=account_since_ts,
+            account_filter_fn=account_filter_fn,
+            range_start_ts=range_start_ts,
+            range_end_ts=range_end_ts,
+        )
+        return cnt, s_ts, e_ts, b_cnt
+
+    def has_proxy_outage_near_timeout(
+        self,
+        timeout_ts: float,
+        dur_sec: Optional[float] = None,
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        account_since_ts: float = 0.0,
+    ) -> bool:
+        """Return True iff a stream timeout causally coincides with a genuine cross-endpoint proxy disconnect / TLS wave.
+
+        Guards against real-T2 whitewashing:
+        - Right-side lookahead capped strictly to +15s (blocks manual proxy-node switch after a real T2 timeout).
+        - Enforces ``account_since_ts`` lower bound (prevents A -> B -> A account re-entry cross-session leakage).
+        - Condition 2 requires either a continuous <=420s proxy-error chain from the burst tail into this stream
+          (or burst tail <=600s before stream start) OR >=2 distinct proxy buckets failing during this stream itself.
+        """
+        if timeout_ts <= 0.0 or (not self._proxy_eof_events and not self._proxy_tls_events):
+            return False
+        eff_dur = min(1800.0, max(60.0, float(dur_sec))) if (dur_sec is not None and float(dur_sec) > 0.0) else 600.0
+        req_start = timeout_ts - eff_dur
+        hi_cap = timeout_ts + 15.0
+        acct_floor = float(account_since_ts or 0.0)
+
+        # Condition 1: Full cross-endpoint proxy burst occurred inside this stalled stream's lifetime window
+        direct_lo = max(req_start - 180.0, acct_floor)
+        cnt_direct, _, _, _ = self.get_proxy_outage_info(
+            hi_cap,
+            30,
+            account_since_ts=acct_floor,
+            account_filter_fn=account_filter_fn,
+            range_start_ts=direct_lo,
+            range_end_ts=hi_cap,
+        )
+        if cnt_direct >= 3:
+            return True
+
+        # Merge both queues (immune to one queue evicting older entries earlier) inside [max(timeout-1800, acct_floor), hi_cap]
+        wave_lo = max(timeout_ts - 1800.0, acct_floor)
+        seen_keys: set[Tuple[int, str, str]] = set()
+        merged_evs: List[Tuple[float, str, str]] = []
+        for q in (self._proxy_eof_events, self._proxy_tls_events):
+            for ts, b, g in q:
+                if ts < wave_lo or ts > hi_cap:
+                    continue
+                if account_filter_fn is not None and not account_filter_fn(ts):
+                    continue
+                dk = (int(round(ts * 1000.0)), b, g)
+                if dk not in seen_keys:
+                    seen_keys.add(dk)
+                    merged_evs.append((ts, b, g))
+        if not merged_evs:
+            return False
+        merged_evs.sort(key=lambda x: x[0])
+
+        span_lo = max(req_start - 120.0, acct_floor)
+        stream_hits = [e for e in merged_evs if span_lo <= e[0] <= hi_cap]
+        if not stream_hits:
+            return False
+
+        cnt_wave, _w_s, outage_e, _w_b = self.get_proxy_outage_info(
+            hi_cap,
+            30,
+            account_since_ts=acct_floor,
+            account_filter_fn=account_filter_fn,
+            range_start_ts=wave_lo,
+            range_end_ts=hi_cap,
+        )
+        if cnt_wave < 3 or outage_e <= 0.0:
+            return False
+
+        # Condition 2b: This stream's own lifetime experienced >=2 distinct proxy buckets failing during an active 30m wave
+        if len({b for _, b, _ in stream_hits}) >= 2:
+            return True
+
+        # Condition 2a: Burst ended close to stream start (<=600s) OR continuous <=420s error chain bridges burst to stream
+        if outage_e >= req_start - 600.0:
+            return True
+        first_hit_ts = stream_hits[0][0]
+        chain_ts = [e[0] for e in merged_evs if outage_e <= e[0] <= first_hit_ts]
+        if len(chain_ts) >= 2 and all((chain_ts[i] - chain_ts[i - 1]) <= 420.0 for i in range(1, len(chain_ts))):
+            return True
+        return False
 
     def get_machine_today_counts(self, now_ts: float) -> Dict[str, int]:
         today_start = datetime.datetime.fromtimestamp(now_ts).replace(
@@ -5323,10 +5496,16 @@ class AntigravityMonitorEngine:
                             max_notable=None,
                         )
                         p_notable_ann = self._annotate_log_events_with_conversations(p_notable_raw, top_convs)
+                        p_notable_ann = self._annotate_proxy_outage_timeouts(p_notable_ann, account_filter_fn=acct_filter_fn)
                         p_heavy_to = sum(
                             1 for ev in p_notable_ann if ev.category == "timeout" and ev.is_heavy_media_timeout
                         )
-                        p_server_to = max(0, p_log["timeout"] - p_heavy_to)
+                        p_proxy_to = sum(
+                            1
+                            for ev in p_notable_ann
+                            if ev.category == "timeout" and ev.is_proxy_outage_timeout and not ev.is_heavy_media_timeout
+                        )
+                        p_server_to = max(0, p_log["timeout"] - p_heavy_to - p_proxy_to)
                         p_consec = 0
                         p_freq_t1 = False
                         for c in top_convs:
@@ -5545,7 +5724,13 @@ class AntigravityMonitorEngine:
         ratios = [c.recent10_hit_ratio for c in recent_active if c.cacheable_in_recent10 >= 2 and c.recent10_hit_ratio is not None]
         worst_hit_ratio = min(ratios) if ratios else None
 
+        proxy_acct_since = current_acct_since_ts if (hr_key == "30m" and not is_historical_rating and not is_custom_account_view) else 0.0
         annotated_notable = self._annotate_log_events_with_conversations(notable_events, top_convs)
+        annotated_notable = self._annotate_proxy_outage_timeouts(
+            annotated_notable,
+            account_filter_fn=acct_filter_fn,
+            account_since_ts=proxy_acct_since,
+        )
         recent_retry_evs = self._log_tailer.get_category_events(
             now,
             self.config["log_sliding_window_min"],
@@ -5564,12 +5749,18 @@ class AntigravityMonitorEngine:
         heavy_media_timeout_count = sum(
             1 for ev in annotated_notable if ev.category == "timeout" and ev.is_heavy_media_timeout
         )
-        # Recompute last_t2_error_ts strictly excluding heavy-media upload timeouts so they never reset T2 recovery!
+        proxy_outage_timeout_count = sum(
+            1
+            for ev in annotated_notable
+            if ev.category == "timeout" and ev.is_proxy_outage_timeout and not ev.is_heavy_media_timeout
+        )
+        # Recompute last_t2_error_ts strictly excluding heavy-media & proxy-outage timeouts so they never trigger/reset server T2!
         last_t2_error_ts = max(
             (
                 ev.timestamp
                 for ev in annotated_notable
-                if ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout)
+                if ev.category == "503"
+                or (ev.category == "timeout" and not ev.is_heavy_media_timeout and not ev.is_proxy_outage_timeout)
             ),
             default=0.0,
         )
@@ -5577,22 +5768,38 @@ class AntigravityMonitorEngine:
             (
                 ev.model
                 for ev in reversed(annotated_notable)
-                if (ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout))
+                if (
+                    ev.category == "503"
+                    or (ev.category == "timeout" and not ev.is_heavy_media_timeout and not ev.is_proxy_outage_timeout)
+                )
                 and ev.model
             ),
             "",
         )
         notable_events = annotated_notable[-3:]
         latest_server_timeout_ev = next(
-            (ev for ev in reversed(annotated_notable) if ev.category == "timeout" and not ev.is_heavy_media_timeout),
+            (
+                ev
+                for ev in reversed(annotated_notable)
+                if ev.category == "timeout" and not ev.is_heavy_media_timeout and not ev.is_proxy_outage_timeout
+            ),
             None,
         )
         latest_heavy_timeout_ev = next(
             (ev for ev in reversed(annotated_notable) if ev.category == "timeout" and ev.is_heavy_media_timeout),
             None,
         )
+        latest_proxy_timeout_ev = next(
+            (
+                ev
+                for ev in reversed(annotated_notable)
+                if ev.category == "timeout" and ev.is_proxy_outage_timeout and not ev.is_heavy_media_timeout
+            ),
+            None,
+        )
         latest_timeout_summary = latest_server_timeout_ev.summary if latest_server_timeout_ev is not None else ""
         latest_heavy_timeout_summary = latest_heavy_timeout_ev.summary if latest_heavy_timeout_ev is not None else ""
+        latest_proxy_timeout_summary = latest_proxy_timeout_ev.summary if latest_proxy_timeout_ev is not None else ""
 
         slot_inv = self.read_slot_inventory(now_ts=now, include_items=False, force=False)
 
@@ -5663,25 +5870,30 @@ class AntigravityMonitorEngine:
         proxy_outage_active = False
         proxy_outage_note = ""
         if eff_online:
-            outage_cnt, _outage_s, outage_e, _outage_b = self._log_tailer.get_proxy_outage_info(
+            outage_cnt, _outage_s, outage_e, _outage_b, outage_kind = self._log_tailer.get_proxy_outage_detail(
                 now,
                 self.config["log_sliding_window_min"],
                 account_filter_fn=acct_filter_fn,
                 range_start_ts=eval_cutoff_ts,
                 range_end_ts=eval_end_ts,
             )
+            non_light_mains_outage = [
+                c for c in recent_active
+                if (not c.is_subagent) and (not _is_light_immune_model(c.model_raw or c.model))
+            ]
+            outage_recov_convs = (
+                non_light_mains_outage if non_light_mains_outage else [c for c in recent_active if not c.is_subagent]
+            )
             if outage_cnt > 0 and outage_e > 0.0:
                 hm_outage = datetime.datetime.fromtimestamp(outage_e).strftime("%H:%M")
+                is_tls_kind = outage_kind in ("tls_5m", "tls_60s")
+                outage_brief = (
+                    f"{outage_cnt}次跨接口TLS超时" if is_tls_kind else f"{outage_cnt}次跨接口断连"
+                )
+                outage_span = "5m内" if outage_kind == "tls_5m" else "60s内"
                 if is_live_30m:
                     age_since_outage = now - outage_e
                     if age_since_outage <= 15.0 * 60.0:
-                        non_light_mains = [
-                            c for c in recent_active
-                            if (not c.is_subagent) and (not _is_light_immune_model(c.model_raw or c.model))
-                        ]
-                        outage_recov_convs = (
-                            non_light_mains if non_light_mains else [c for c in recent_active if not c.is_subagent]
-                        )
                         post_outage_steps = sum(
                             1
                             for c in outage_recov_convs
@@ -5691,15 +5903,34 @@ class AntigravityMonitorEngine:
                         if age_since_outage >= 300.0 and post_outage_steps >= 6:
                             proxy_outage_active = False
                             proxy_outage_recent = 0
-                            proxy_outage_note = f"前序代理断流 ({hm_outage} {outage_cnt}次跨接口断连) 已平复"
+                            proxy_outage_note = f"前序代理断流 ({hm_outage} {outage_brief}) 已平复"
                         else:
                             proxy_outage_active = True
                             proxy_outage_recent = outage_cnt
-                            proxy_outage_note = f"代理线路疑似断流 ({hm_outage} 60s内 {outage_cnt}次跨接口断连，非服务端限流)"
+                            proxy_outage_note = f"代理线路疑似断流 ({hm_outage} {outage_span} {outage_brief}，非服务端限流)"
                 else:
                     # Historical views NEVER escalate WARN for transient proxy blips; keep note read-only
                     proxy_outage_recent = outage_cnt
-                    proxy_outage_note = f"{hm_outage} 曾发生 {outage_cnt} 次跨接口代理断连"
+                    proxy_outage_note = f"{hm_outage} 曾发生 {outage_brief}"
+
+        proxy_outage_timeout_active_count = 0
+        if eff_online and proxy_outage_timeout_count > 0 and is_live_30m:
+            pto_settled = False
+            if (not proxy_outage_active) and latest_proxy_timeout_ev is not None:
+                age_since_pto = now - latest_proxy_timeout_ev.timestamp
+                if age_since_pto >= 300.0:
+                    post_pto_steps = sum(
+                        1
+                        for c in outage_recov_convs
+                        for s in c._scoped_steps_all
+                        if s.timestamp > latest_proxy_timeout_ev.timestamp + 1.0
+                    )
+                    if post_pto_steps >= 6:
+                        pto_settled = True
+                        if not proxy_outage_note:
+                            proxy_outage_note = f"前序代理抖动流超时 ({proxy_outage_timeout_count}次) 已平复"
+            if not pto_settled:
+                proxy_outage_timeout_active_count = proxy_outage_timeout_count
 
         # Module 5: Next-generation adaptive sliding-window daily step protection limits (v7.3.0)
         today_str = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
@@ -5720,6 +5951,8 @@ class AntigravityMonitorEngine:
         steps_quota_headroom: Optional[int] = None
         steps_soft_over_limit = False
         steps_low_quota_tightened = False
+        steps_high_deg_capped = False
+        steps_high_deg_ref_steps = 0
         account_tier_norm = ""
 
         def _is_isolated_t1_in_convs(culprit_cid: str, t1_ts_val: float) -> bool:
@@ -5912,6 +6145,7 @@ class AntigravityMonitorEngine:
                     nonlocal steps_peer_weight_pct, steps_effective_weighted_24h
                     nonlocal steps_pool_24h, steps_gemini_24h, steps_3p_24h
                     nonlocal steps_quota_headroom, steps_soft_over_limit, steps_low_quota_tightened
+                    nonlocal steps_high_deg_capped, steps_high_deg_ref_steps
                     res_v2 = adaptive_v2_fn(
                         base_steps_warn,
                         base_steps_alert,
@@ -5953,6 +6187,8 @@ class AntigravityMonitorEngine:
                     steps_quota_headroom = res_v2.quota_headroom_steps
                     steps_soft_over_limit = bool(res_v2.soft_over_limit)
                     steps_low_quota_tightened = bool(res_v2.low_quota_tightened)
+                    steps_high_deg_capped = bool(getattr(res_v2, "high_deg_capped", False))
+                    steps_high_deg_ref_steps = int(getattr(res_v2, "high_deg_ref_steps", 0) or 0)
 
                 _apply_adaptive_v2("T0")
                 # Fallback to legacy daily_step_profiles ONLY when zero hourly buckets exist yet
@@ -6010,6 +6246,9 @@ class AntigravityMonitorEngine:
             latest_timeout_summary=latest_timeout_summary,
             heavy_media_timeout_count=heavy_media_timeout_count,
             latest_heavy_timeout_summary=latest_heavy_timeout_summary,
+            proxy_outage_timeout_count=proxy_outage_timeout_count,
+            proxy_outage_timeout_active_count=proxy_outage_timeout_active_count,
+            latest_proxy_timeout_summary=latest_proxy_timeout_summary,
             proxy_outage_active=proxy_outage_active,
             proxy_outage_note=proxy_outage_note,
             daily_steps_warn_override=eff_steps_warn,
@@ -6051,6 +6290,7 @@ class AntigravityMonitorEngine:
             annotated_notable = []
             recent_events_by_cat = {"503": [], "timeout": [], "403": [], "retry": []}
             heavy_media_timeout_count = 0
+            proxy_outage_timeout_count = 0
             last_t2_error_ts = 0.0
             t2_recovery_note = ""
             proxy_outage_recent = 0
@@ -6350,6 +6590,7 @@ class AntigravityMonitorEngine:
             primary_hit_reason=primary_hit_reason,
             carryover_conversations=carryover_convs,
             heavy_media_timeout_recent=heavy_media_timeout_count,
+            proxy_outage_timeout_recent=proxy_outage_timeout_count,
             proxy_outage_recent=proxy_outage_recent,
             proxy_outage_note=proxy_outage_note,
             daily_steps_limit_mode=steps_limit_mode,
@@ -6393,6 +6634,8 @@ class AntigravityMonitorEngine:
             steps_quota_headroom=steps_quota_headroom,
             steps_soft_over_limit=steps_soft_over_limit,
             steps_low_quota_tightened=steps_low_quota_tightened,
+            steps_high_deg_capped=steps_high_deg_capped,
+            steps_high_deg_ref_steps=steps_high_deg_ref_steps,
             account_tier_norm=account_tier_norm,
         )
 
@@ -7174,6 +7417,42 @@ class AntigravityMonitorEngine:
                 out.append(ev)
         return out
 
+    def _annotate_proxy_outage_timeouts(
+        self,
+        events: List[LogEvent],
+        account_filter_fn: Optional[Callable[[float], bool]] = None,
+        account_since_ts: float = 0.0,
+    ) -> List[LogEvent]:
+        """Mark stream timeouts that coincided with a verified cross-endpoint proxy disconnect / TLS timeout wave."""
+        if not events:
+            return events
+        out: List[LogEvent] = []
+        for ev in events:
+            if (
+                ev.category == "timeout"
+                and (not ev.is_heavy_media_timeout)
+                and (not ev.is_proxy_outage_timeout)
+                and self._log_tailer.has_proxy_outage_near_timeout(
+                    ev.timestamp,
+                    ev.duration_sec,
+                    account_filter_fn=account_filter_fn,
+                    account_since_ts=account_since_ts,
+                )
+            ):
+                summ = ev.summary or ""
+                if "流超时" in summ:
+                    new_summary = summ.replace("流超时", "代理抖动流超时", 1)
+                else:
+                    hm_match = re.match(r"^(\[\d{2}:\d{2}:\d{2}\])\s*", summ)
+                    hm_prefix = f"{hm_match.group(1)} " if hm_match else ""
+                    dur_short = self._format_timeout_dur_short(ev.duration_sec)
+                    dur_part = f" ({dur_short})" if dur_short else ""
+                    new_summary = f"{hm_prefix}代理抖动流超时{dur_part}"
+                out.append(replace(ev, summary=new_summary, is_proxy_outage_timeout=True))
+            else:
+                out.append(ev)
+        return out
+
     @staticmethod
     def _compute_recent_model_stats(
         recent_active: List[ConversationSummary],
@@ -7476,6 +7755,9 @@ class AntigravityMonitorEngine:
         latest_timeout_summary: str = "",
         heavy_media_timeout_count: int = 0,
         latest_heavy_timeout_summary: str = "",
+        proxy_outage_timeout_count: int = 0,
+        proxy_outage_timeout_active_count: Optional[int] = None,
+        latest_proxy_timeout_summary: str = "",
         proxy_outage_active: bool = False,
         proxy_outage_note: str = "",
         daily_steps_warn_override: Optional[int] = None,
@@ -7510,7 +7792,18 @@ class AntigravityMonitorEngine:
         eff_403 = recent_log["403"] if is_online else 0
         eff_timeout = recent_log["timeout"] if is_online else 0
         eff_heavy_timeout = min(eff_timeout, max(0, int(heavy_media_timeout_count))) if is_online else 0
-        server_timeout_count = max(0, eff_timeout - eff_heavy_timeout)
+        eff_proxy_timeout = (
+            min(max(0, eff_timeout - eff_heavy_timeout), max(0, int(proxy_outage_timeout_count)))
+            if is_online
+            else 0
+        )
+        if proxy_outage_timeout_active_count is None:
+            eff_proxy_timeout_active = 0 if is_historical else eff_proxy_timeout
+        else:
+            eff_proxy_timeout_active = (
+                0 if is_historical else min(eff_proxy_timeout, max(0, int(proxy_outage_timeout_active_count)))
+            )
+        server_timeout_count = max(0, eff_timeout - eff_heavy_timeout - eff_proxy_timeout)
         eff_503 = recent_log["503"] if is_online else 0
 
         if eff_403 > 0:
@@ -7729,6 +8022,7 @@ class AntigravityMonitorEngine:
             or eff_503 == 1
             or server_timeout_count == 1
             or eff_heavy_timeout >= 1
+            or eff_proxy_timeout_active >= 1
             or (proxy_outage_active and bool(proxy_outage_note))
             or any_slow
         ):
@@ -7737,8 +8031,17 @@ class AntigravityMonitorEngine:
                 reasons.append(prior_hist_warning)
             if t2_recovering_warn:
                 reasons.append(t2_recovering_warn)
-            if proxy_outage_active and proxy_outage_note:
+            if proxy_outage_active and proxy_outage_note and eff_proxy_timeout_active >= 1:
+                reasons.append(f"{proxy_outage_note}，伴发 {eff_proxy_timeout_active} 次流超时，建议检查代理节点")
+            elif proxy_outage_active and proxy_outage_note:
                 reasons.append(proxy_outage_note)
+            elif eff_proxy_timeout_active >= 1:
+                if latest_proxy_timeout_summary:
+                    short_p = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", latest_proxy_timeout_summary)
+                    cnt_p = f" ({eff_proxy_timeout_active}次)" if eff_proxy_timeout_active > 1 else ""
+                    reasons.append(f"{short_p}{cnt_p}，非服务端限流，建议检查代理节点")
+                else:
+                    reasons.append(f"代理抖动流超时 ({eff_proxy_timeout_active}次)，非服务端限流，建议检查代理节点")
             if eff_heavy_timeout >= 1:
                 if latest_heavy_timeout_summary:
                     short_h = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", latest_heavy_timeout_summary)
@@ -7857,7 +8160,11 @@ class AntigravityMonitorEngine:
                         candidates.append((ev.event_key, "Antigravity 封禁告警 (T3)", ev.summary))
             elif grade == "T2":
                 for ev in notable_events:
-                    if ev.category == "503" or (ev.category == "timeout" and not ev.is_heavy_media_timeout):
+                    if ev.category == "503" or (
+                        ev.category == "timeout"
+                        and not ev.is_heavy_media_timeout
+                        and not ev.is_proxy_outage_timeout
+                    ):
                         candidates.append((ev.event_key, "Antigravity 限流/超时告警 (T2)", ev.summary))
             elif grade == "T1":
                 # Deduplicate per contiguous cr=0 streak start or severe 10-step window start
@@ -9847,6 +10154,7 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "model": ev.model,
             "duration_sec": round(float(ev.duration_sec), 2) if ev.duration_sec is not None else None,
             "is_heavy_media_timeout": bool(ev.is_heavy_media_timeout),
+            "is_proxy_outage_timeout": bool(ev.is_proxy_outage_timeout),
             "culprit_cid": ev.culprit_cid,
         }
         for ev in recent_ev_flat
@@ -9975,6 +10283,8 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
                 "quota_headroom_steps": getattr(snap, "steps_quota_headroom", None),
                 "soft_over_limit": bool(getattr(snap, "steps_soft_over_limit", False)),
                 "low_quota_tightened": bool(getattr(snap, "steps_low_quota_tightened", False)),
+                "high_deg_capped": bool(getattr(snap, "steps_high_deg_capped", False)),
+                "high_deg_ref_steps": int(getattr(snap, "steps_high_deg_ref_steps", 0) or 0),
                 "detail_lines": list(getattr(snap, "steps_detail_lines", ()) or ()),
             }
         )(
@@ -10029,6 +10339,7 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             "503": snap.recent_503,
             "timeout": snap.recent_timeout,
             "heavy_media_timeout": snap.heavy_media_timeout_recent,
+            "proxy_outage_timeout": snap.proxy_outage_timeout_recent,
             "403": snap.recent_403,
             "retry": snap.recent_retry,
             "proxy_outage": snap.proxy_outage_recent,
@@ -10242,7 +10553,15 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
     acc_5h = f"{snap.account.five_hour_pct:.1f}%" if snap.account.five_hour_pct is not None else "—"
     acc_wk = f"{snap.account.weekly_pct:.0f}%" if snap.account.weekly_pct is not None else "—"
     limit_note = getattr(snap, "daily_steps_limit_note", "")
-    limit_badge = f" [自适应·{limit_note}]" if (getattr(snap, "daily_steps_limit_mode", "default") != "default" and limit_note) else (" [自适应]" if getattr(snap, "daily_steps_limit_mode", "default") != "default" else "")
+    limit_mode = getattr(snap, "daily_steps_limit_mode", "default")
+    if limit_mode != "default" and limit_note:
+        limit_badge = f" [自适应·{limit_note}]"
+    elif limit_mode != "default":
+        limit_badge = " [自适应]"
+    elif limit_note and (not limit_note.startswith("初始建议值")):
+        limit_badge = f" [{limit_note}]"
+    else:
+        limit_badge = ""
     has_24h = getattr(snap, "rolling_24h_steps", None) is not None
     if has_24h:
         eff_steps = int(snap.rolling_24h_steps or 0)
@@ -10300,6 +10619,8 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
     )
     if getattr(snap, "heavy_media_timeout_recent", 0) > 0:
         lines.append(f"多图超时: 近窗 {snap.heavy_media_timeout_recent} 次流超时归因为多图大包上传超时（已免误判红灯 T2）")
+    if getattr(snap, "proxy_outage_timeout_recent", 0) > 0:
+        lines.append(f"代理超时: 近窗 {snap.proxy_outage_timeout_recent} 次流超时归因为代理线路抖动超时（已免误判红灯 T2）")
     if getattr(snap, "proxy_outage_note", ""):
         lines.append(f"代理状态: {snap.proxy_outage_note}")
     if snap.slot_inventory is not None:
