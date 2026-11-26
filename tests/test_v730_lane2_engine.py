@@ -1330,6 +1330,350 @@ class TestV730AdaptiveStepsAndJsonIntegration(unittest.TestCase):
             snap_today = eng.poll(now_ts=now, force_account=False, history_range="today")
             self.assertEqual(snap_today.grade, "T0")
 
+    def test_v732_mesh_routing_non_inference_503_idle_backdate_guard_and_zero_step_prior_wording(self) -> None:
+        from core.log_monitor import LanguageServerLogTailer
+
+        # 1) Non-inference background RPCs (mesh_routing, remote_control[_v2], mcp_manager, GetCascadeNuxes,
+        #    fetchUserInfo, oauth2, play.googleapis.com/log, profile, remote:listProjects, GetConversationMetadata)
+        #    and their 1s same-gid errorreport.go echoes + non-brace continuation JSON MUST NOT false-alarm 503;
+        #    content-echo INFO sources MUST NOT false-alarm T3; single-endpoint oauth2 failures MUST NOT fabricate
+        #    a fake cross-bucket proxy outage; while real cross-endpoint TLS bursts, real streamGenerateContent
+        #    503/403/retry, and real network-source hard-ban 403 (including multi-line JSON) STILL trigger!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now = datetime.datetime(2026, 11, 26, 21, 15, 0).timestamp()
+
+            def _g(dt_sec: float) -> str:
+                return datetime.datetime.fromtimestamp(now + dt_sec).strftime("%m%d %H:%M:%S.123456")
+
+            ls_path = root / "language_server.log"
+            ls_path.write_text(
+                "\n".join([
+                    # Non-inference 503s + 1s same-gid generic errorreport.go echo (no marker on echo line!)
+                    f"ERROR: logging before google.Init: E{_g(-300)} 676 mesh_routing.go:974] [remote-control-demo-v2] Signaling poll failed: pollSignalingMessages returned status 503",
+                    f"ERROR: logging before google.Init: E{_g(-299)} 676 errorreport.go:282] UNAVAILABLE (code 503): Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-250)} 677 remote_control.go:90] background sync status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-240)} 678 remote_control_v2.go:2418] WebChannel: XMLHTTP Bad status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-230)} 679 mcp_manager.go:112] external MCP server returned 503 Service Unavailable and account_disabled",
+                    f"ERROR: logging before google.Init: E{_g(-220)} 701 interceptor.go:70] /exa.language_server_pb.LanguageServerService/GetCascadeNuxes (unknown): status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-210)} 702 cache.go:201] Failed to refresh cache in background: Get \"https://www.googleapis.com/oauth2/v2/userinfo\": status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-200)} 703 http_helpers.go:100] Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo\": status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-190)} 704 client.go:148] Post \"https://play.googleapis.com/log\": status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-180)} 705 user_management.go:139] failed to get profile picture from lh3.googleusercontent.com: status 503",
+                    f"ERROR: logging before google.Init: E{_g(-170)} 706 poll.go:251] Post \"https://aicode.googleapis.com/v1alpha/remote:listProjects\": status 503 Service Unavailable",
+                    f"ERROR: logging before google.Init: E{_g(-160)} 707 server.go:900] GetConversationMetadata failed: status 503 Service Unavailable",
+                    # Non-brace continuation JSON after non-inference header MUST NOT leak 503!
+                    f"ERROR: logging before google.Init: E{_g(-150)} 708 server.go:1615] Failed to get OAuth token: unexpected response:",
+                    '  "status": "RESOURCE_EXHAUSTED"',
+                    '  "code": 503',
+                    # Content-echo INFO sources & boolean config fields MUST NEVER false-alarm T3 403!
+                    f'ERROR: logging before google.Init: I{_g(-140)} 709 runner.go:957] Monitor sir_flash_lite FINISHED: triggered=false, reason="Adding unit test for TOS_VIOLATION and account suspended handling"',
+                    f'ERROR: logging before google.Init: I{_g(-135)} 710 extract_searchable_content.go:54] conversationsearch: snippet "...account_disabled..."',
+                    f"ERROR: logging before google.Init: I{_g(-130)} 711 remote_control.go:20] sync state account_disabled=false ok",
+                    # Real cross-endpoint TLS timeouts (oauth + other_google + playlog = 3 real buckets)
+                    f"ERROR: logging before google.Init: E{_g(-50)} 712 remote_control.go:73] [remote-control-demo-v2] Failed to get token: Post \"https://oauth2.googleapis.com/token\": net/http: TLS handshake timeout",
+                    f"ERROR: logging before google.Init: E{_g(-40)} 713 interceptor.go:70] /exa.language_server_pb.LanguageServerService/GetCascadeNuxes: Get \"https://daily-cloudcode-pa.googleapis.com/v1internal/cascadeNuxes\": net/http: TLS handshake timeout",
+                    f"ERROR: logging before google.Init: E{_g(-30)} 99 client.go:148] Post \"https://play.googleapis.com/log\": net/http: TLS handshake timeout",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng = _make_engine(root, read_only=False)
+            eng._ledger.observe_online("ly***8", now - 7200)
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = eng.poll(now_ts=now, force_account=False)
+            self.assertEqual(snap.recent_503, 0)
+            self.assertEqual(snap.today_503, 0)
+            self.assertEqual(snap.recent_403, 0)
+            self.assertEqual(snap.grade, "WARN")
+            self.assertGreaterEqual(snap.proxy_outage_recent, 3)
+            self.assertIn("oauth", {b for _, b, _ in eng._log_tailer._proxy_tls_events})
+
+            # Single-endpoint oauth2.googleapis.com/token wrapped across server.go / cache.go / aicode_fallback.go
+            # MUST collapse into single "oauth" bucket -> 0 fake cross-bucket outage!
+            oauth_only_log = root / "oauth_only.log"
+            oauth_only_log.write_text(
+                "\n".join([
+                    f'ERROR: logging before google.Init: E{_g(-20)} 99 server.go:1615] Failed to get OAuth token: Post "https://oauth2.googleapis.com/token": EOF',
+                    f'ERROR: logging before google.Init: W{_g(-19)} 5001 cache.go:169] Cache(retrieveUserQuotaSummary): Post "https://oauth2.googleapis.com/token": EOF',
+                    f'ERROR: logging before google.Init: W{_g(-18)} 5002 aicode_fallback.go:117] AICode fetchConfig: Post "https://oauth2.googleapis.com/token": EOF',
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            t_oauth = LanguageServerLogTailer(oauth_only_log)
+            t_oauth.poll(now_ts=now)
+            self.assertEqual({b for _, b, _ in t_oauth._proxy_eof_events}, {"oauth"})
+            self.assertEqual(t_oauth.get_proxy_outage_info(now, window_min=30)[0], 0)
+
+            # Inference streamGenerateContent wrapping oauth2.googleapis.com/token MUST NOT mute retry/403
+            # or poison same-gid follow-up real 503; multi-line JSON TOS_VIOLATION from network RPC MUST still fire 403!
+            inf_log = root / "inf_check.log"
+            inf_log.write_text(
+                "\n".join([
+                    f'ERROR: logging before google.Init: I{_g(-25)} 2002 run.go:308] Run: attempt 1 failed (request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": Post "https://oauth2.googleapis.com/token": EOF), retrying in 4s',
+                    f"ERROR: logging before google.Init: E{_g(-23)} 2002 errorreport.go:307] UNAVAILABLE (code 503): No capacity available",
+                    f'ERROR: logging before google.Init: E{_g(-20)} 2003 http_helpers.go:876] Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": Post "https://oauth2.googleapis.com/token": HTTP status 403 Forbidden',
+                    f"ERROR: logging before google.Init: E{_g(-15)} 2004 remote_control.go:100] request failed: {{",
+                    '  "error": {',
+                    '    "reason": "TOS_VIOLATION"',
+                    "  }",
+                    "}",
+                    f"ERROR: logging before google.Init: E{_g(-10)} 2005 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            t_inf = LanguageServerLogTailer(inf_log)
+            t_inf.poll(now_ts=now)
+            rec_inf, _, _ = t_inf.get_counts(now, window_min=30)
+            self.assertEqual(rec_inf["retry"], 1)
+            self.assertEqual(rec_inf["503"], 2)
+            self.assertEqual(rec_inf["403"], 2)
+
+        # 2) Idle-period T2 (14h earlier OR 118m earlier on deg_h-1) MUST NOT contaminate prior clean buckets or
+        #    daily_step_profiles (>=50 healthy steps already recorded); AND zero-active-conv / A->B->A 0-new-step /
+        #    subagent-only / main-cold prior_hist_warning wording MUST be exact!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            now_t2 = datetime.datetime(2026, 11, 26, 20, 58, 0).timestamp()
+            t_06 = datetime.datetime(2026, 11, 26, 6, 10, 0).timestamp()
+            h_06 = int(t_06 // 3600)
+
+            dm = root / "brain" / "morn0001-aaaa" / ".system_generated" / "logs"
+            dm.mkdir(parents=True)
+            m_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t_06 - 30), "content": "hi"},
+            ]
+            for i in range(1, 61):
+                m_rows.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": i,
+                    "created_at": _iso_utc(t_06 + i * 5),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 50000 if i == 1 else 2000,
+                    "cache_read_tokens": 0 if i == 1 else 50000,
+                    "output_tokens": 200,
+                })
+            (dm / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in m_rows) + "\n", encoding="utf-8")
+            os.utime(dm / "transcript.jsonl", (t_06 + 300, t_06 + 300))
+
+            ls_log = root / "language_server.log"
+            ls_log.write_text("", encoding="utf-8")
+            eng = _make_engine(root, read_only=False)
+            eng._ledger.observe_online("ly***8", t_06 - 3600)
+            # First record a healthy morning poll at 06:20 so daily_step_profiles["2026-11-26"] is genuinely created (safe_steps=60)
+            t_morn = t_06 + 600.0
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=t_morn)
+            eng._last_account_poll = t_morn
+            snap_morn = eng.poll(now_ts=t_morn, force_account=False)
+            self.assertEqual(snap_morn.grade, "T0")
+            self.assertEqual(eng._ledger.get_account_daily_profiles("ly***8")["2026-11-26"]["safe_steps"], 60)
+
+            # 14h later idle T2: 0 steps since 06:15 -> MUST NOT contaminate h_06 or daily_step_profiles!
+            t_503_1 = now_t2 - 40.0
+            t_503_2 = now_t2 - 15.0
+            ls_log.write_text(
+                "\n".join([
+                    f"ERROR: logging before google.Init: E{datetime.datetime.fromtimestamp(t_503_1).strftime('%m%d %H:%M:%S.000000')} 8001 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                    f"ERROR: logging before google.Init: E{datetime.datetime.fromtimestamp(t_503_2).strftime('%m%d %H:%M:%S.000000')} 8002 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_t2)
+            eng._last_account_poll = now_t2
+            snap_t2 = eng.poll(now_ts=now_t2, force_account=False)
+            self.assertEqual(snap_t2.grade, "T2")
+            hb = eng._ledger.get_account_hourly_buckets("ly***8")
+            self.assertIn(h_06, hb)
+            self.assertEqual(hb[h_06]["steps"], 60)
+            self.assertFalse(hb[h_06].get("degraded", False))
+            self.assertFalse(any(rec.get("degraded", False) for rec in hb.values()))
+            daily_prof = eng._ledger.get_account_daily_profiles("ly***8")["2026-11-26"]
+            self.assertIsNone(daily_prof.get("degraded_at"))
+            self.assertEqual(daily_prof.get("safe_steps"), 60)
+
+            # 50m later: 0 live steps + immediate proxy TLS burst -> prior_hist_warning must NOT falsely say "首步冷启"
+            now_later = now_t2 + 50 * 60.0
+            with ls_log.open("a", encoding="utf-8") as fh:
+                for off, line_tpl in [
+                    (-40, 'E{t} 9001 client.go:148] Post "https://play.googleapis.com/log": net/http: TLS handshake timeout'),
+                    (-20, 'W{t} 9002 cache.go:169] Cache(peopleInfo): Get "https://www.googleapis.com/oauth2/v2/userinfo": net/http: TLS handshake timeout'),
+                    (-5, 'E{t} 9003 client.go:148] Post "https://play.googleapis.com/log": net/http: TLS handshake timeout'),
+                ]:
+                    fh.write("ERROR: logging before google.Init: " + line_tpl.format(t=datetime.datetime.fromtimestamp(now_later + off).strftime("%m%d %H:%M:%S.000000")) + "\n")
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_later)
+            eng._last_account_poll = now_later
+            snap_later = eng.poll(now_ts=now_later, force_account=False)
+            self.assertEqual(snap_later.grade, "WARN")
+            self.assertFalse(snap_later.current_24h_has_degradation)
+            self.assertIn("前序历史曾触发 T2 限流", snap_later.sub_headline)
+            self.assertNotIn("首步冷启", snap_later.sub_headline)
+            self.assertIn("尚无新对话采样", snap_later.sub_headline)
+
+            # Subagent-only 1-step cold start after idle -> explicit subagent-only wording
+            dsub = root / "brain" / "subc0001-bbbb" / ".system_generated" / "logs"
+            dsub.mkdir(parents=True)
+            sub_rows = [
+                {"source": "SUBAGENT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(now_later + 5), "content": "sub"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(now_later + 10), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 100},
+            ]
+            (dsub / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in sub_rows) + "\n", encoding="utf-8")
+            os.utime(dsub / "transcript.jsonl", (now_later + 10, now_later + 10))
+            snap_sub = eng.poll(now_ts=now_later + 20, force_account=False)
+            self.assertIn("仅子代理冷启采样", snap_sub.sub_headline)
+            self.assertNotIn("首步冷启", snap_sub.sub_headline)
+
+            # Main conversation 1-step cold start -> genuine "首步冷启待次拍验真"
+            dm2 = root / "brain" / "main0002-cccc" / ".system_generated" / "logs"
+            dm2.mkdir(parents=True)
+            m2_rows = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(now_later + 25), "content": "new"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(now_later + 30), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 100},
+            ]
+            (dm2 / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in m2_rows) + "\n", encoding="utf-8")
+            os.utime(dm2 / "transcript.jsonl", (now_later + 30, now_later + 30))
+            snap_main_cold = eng.poll(now_ts=now_later + 40, force_account=False)
+            self.assertIn("首步冷启待次拍验真", snap_main_cold.sub_headline)
+
+        # 3) Review-B regressions:
+        #    (a) 118m idle on deg_h-1 MUST NOT backdate;
+        #    (b) Cross-midnight 23:59 -> 00:00:10 T2 (today_steps==0) MUST anchor to h_23;
+        #    (c) Delayed restart >120s T2 MUST still persist hourly_step_buckets + daily_step_profiles;
+        #    (d) A -> B -> A switch-back within 30m with 0 new steps MUST NOT falsely say "首步冷启"!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # (a) 08:01 steps -> 09:59 0-step T2 (118m idle on deg_h-1) MUST NOT backdate to h_08
+            t_0801 = datetime.datetime(2026, 11, 26, 8, 1, 0).timestamp()
+            h_08 = int(t_0801 // 3600)
+            now_0959 = datetime.datetime(2026, 11, 26, 9, 59, 0).timestamp()
+            d_a = root / "brain" / "idle118m-aaaa" / ".system_generated" / "logs"
+            d_a.mkdir(parents=True)
+            rows_a = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t_0801 - 10), "content": "hi"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(t_0801), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 100},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso_utc(t_0801 + 20), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 100},
+            ]
+            (d_a / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows_a) + "\n", encoding="utf-8")
+            os.utime(d_a / "transcript.jsonl", (t_0801 + 20, t_0801 + 20))
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    f"E{datetime.datetime.fromtimestamp(now_0959 - 20).strftime('%m%d %H:%M:%S.000000')} 101 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                    f"E{datetime.datetime.fromtimestamp(now_0959 - 5).strftime('%m%d %H:%M:%S.000000')} 102 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng_a = _make_engine(root, read_only=False)
+            eng_a._ledger.observe_online("ly***8", t_0801 - 3600)
+            eng_a._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_0959)
+            eng_a._last_account_poll = now_0959
+            snap_a = eng_a.poll(now_ts=now_0959, force_account=False)
+            self.assertEqual(snap_a.grade, "T2")
+            hb_a = eng_a._ledger.get_account_hourly_buckets("ly***8")
+            self.assertIn(h_08, hb_a)
+            self.assertFalse(hb_a[h_08].get("degraded", False))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # (b) Cross-midnight 23:59:20 active steps -> 00:00:10 T2 (today_steps==0) MUST anchor to h_23!
+            t_2359 = datetime.datetime(2026, 11, 26, 23, 59, 20).timestamp()
+            h_23 = int(t_2359 // 3600)
+            now_0000 = datetime.datetime(2026, 11, 27, 0, 0, 20).timestamp()
+            d_b = root / "brain" / "midn0001-bbbb" / ".system_generated" / "logs"
+            d_b.mkdir(parents=True)
+            rows_b = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t_2359 - 20), "content": "hi"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(t_2359 - 10), "model": "gemini-4-neon-xhigh", "input_tokens": 50000, "cache_read_tokens": 0, "output_tokens": 100},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso_utc(t_2359), "model": "gemini-4-neon-xhigh", "input_tokens": 2000, "cache_read_tokens": 50000, "output_tokens": 100},
+            ]
+            (d_b / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows_b) + "\n", encoding="utf-8")
+            os.utime(d_b / "transcript.jsonl", (t_2359, t_2359))
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    f"E{datetime.datetime.fromtimestamp(now_0000 - 15).strftime('%m%d %H:%M:%S.000000')} 201 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                    f"E{datetime.datetime.fromtimestamp(now_0000 - 10).strftime('%m%d %H:%M:%S.000000')} 202 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng_b = _make_engine(root, read_only=False)
+            eng_b._ledger.observe_online("ly***8", t_2359 - 3600)
+            eng_b._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_0000)
+            eng_b._last_account_poll = now_0000
+            snap_b = eng_b.poll(now_ts=now_0000, force_account=False)
+            self.assertEqual(snap_b.grade, "T2")
+            self.assertEqual(snap_b.today_steps, 0)
+            hb_b = eng_b._ledger.get_account_hourly_buckets("ly***8")
+            self.assertIn(h_23, hb_b)
+            self.assertTrue(hb_b[h_23].get("degraded", False))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # (c) Delayed restart >120s after T2 MUST still persist hourly_step_buckets (frozen_at=None) & daily_step_profiles!
+            t_1405 = datetime.datetime(2026, 11, 26, 14, 5, 0).timestamp()
+            h_14 = int(t_1405 // 3600)
+            t_deg = datetime.datetime(2026, 11, 26, 14, 10, 0).timestamp()
+            now_delayed = t_deg + 150.0  # 150s > 120s freshness threshold
+            d_c = root / "brain" / "dlyt0001-cccc" / ".system_generated" / "logs"
+            d_c.mkdir(parents=True)
+            rows_c = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t_1405 - 10), "content": "hi"}]
+            for i in range(1, 61):
+                rows_c.append({
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": i,
+                    "created_at": _iso_utc(t_1405 + i * 3),
+                    "model": "gemini-4-neon-xhigh",
+                    "input_tokens": 50000 if i == 1 else 2000,
+                    "cache_read_tokens": 0 if i == 1 else 50000,
+                    "output_tokens": 100,
+                })
+            (d_c / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows_c) + "\n", encoding="utf-8")
+            os.utime(d_c / "transcript.jsonl", (t_1405 + 180, t_1405 + 180))
+            (root / "language_server.log").write_text(
+                "\n".join([
+                    f"E{datetime.datetime.fromtimestamp(t_deg - 20).strftime('%m%d %H:%M:%S.000000')} 301 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                    f"E{datetime.datetime.fromtimestamp(t_deg).strftime('%m%d %H:%M:%S.000000')} 302 http_helpers.go:876] streamGenerateContent status 503 No capacity",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            eng_c = _make_engine(root, read_only=False)
+            eng_c._ledger.observe_online("ly***8", t_1405 - 3600)
+            eng_c._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now_delayed)
+            eng_c._last_account_poll = now_delayed
+            snap_c = eng_c.poll(now_ts=now_delayed, force_account=False)
+            self.assertEqual(snap_c.grade, "T2")
+            self.assertTrue(snap_c.current_24h_has_degradation)
+            hb_c = eng_c._ledger.get_account_hourly_buckets("ly***8")
+            self.assertTrue(hb_c[h_14].get("degraded", False))
+            self.assertIsNone(hb_c[h_14].get("degraded_24h_at"))
+            dp_c = eng_c._ledger.get_account_daily_profiles("ly***8")["2026-11-26"]
+            self.assertEqual(dp_c.get("degraded_at"), 60)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # (d) A -> B -> A switch-back within 30m with 0 new steps MUST NOT falsely say "首步冷启"!
+            t0 = datetime.datetime(2026, 11, 26, 10, 0, 0).timestamp()
+            now_sw = t0 + 25 * 60.0  # 10:25
+            d_d = root / "brain" / "swba0001-dddd" / ".system_generated" / "logs"
+            d_d.mkdir(parents=True)
+            rows_d = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "step_index": 0, "created_at": _iso_utc(t0 + 60), "content": "hi"},
+                {"type": "PLANNER_RESPONSE", "step_index": 1, "created_at": _iso_utc(t0 + 120), "model": "gemini-4-neon-xhigh", "input_tokens": 110000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 2, "created_at": _iso_utc(t0 + 180), "model": "gemini-4-neon-xhigh", "input_tokens": 115000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 3, "created_at": _iso_utc(t0 + 240), "model": "gemini-4-neon-xhigh", "input_tokens": 120000, "cache_read_tokens": 0, "output_tokens": 200},
+                {"type": "PLANNER_RESPONSE", "step_index": 4, "created_at": _iso_utc(t0 + 300), "model": "gemini-4-neon-xhigh", "input_tokens": 125000, "cache_read_tokens": 0, "output_tokens": 200},
+            ]
+            (d_d / "transcript.jsonl").write_text("\n".join(json.dumps(r) for r in rows_d) + "\n", encoding="utf-8")
+            os.utime(d_d / "transcript.jsonl", (t0 + 300, t0 + 300))
+            (root / "language_server.log").write_text("", encoding="utf-8")
+            eng_d = _make_engine(root, read_only=False)
+            eng_d._ledger.observe_online("ac***a", t0 - 3600)
+            eng_d._ledger.observe_online("ac***b", t0 + 10 * 60.0)
+            eng_d._ledger.observe_online("ac***a", t0 + 20 * 60.0)
+            eng_d._account_cache = AccountQuotaInfo(short_label="ac***a", online=True, observed_at=now_sw)
+            eng_d._last_account_poll = now_sw
+            snap_d = eng_d.poll(now_ts=now_sw, force_account=False)
+            self.assertIn("前序历史曾连续", snap_d.sub_headline)
+            self.assertNotIn("首步冷启", snap_d.sub_headline)
+            self.assertIn("尚无新对话采样", snap_d.sub_headline)
+
 
 if __name__ == "__main__":
     unittest.main()

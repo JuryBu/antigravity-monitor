@@ -471,16 +471,29 @@ TOS_403_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-IGNORED_LOG_SOURCES = (
+# Content-echo / safety-commentary & external-tool sources must NEVER trigger model 503 OR account-ban 403
+CONTENT_ECHO_IGNORED_SOURCES = (
     "extract_searchable_content.go",
     "llm_monitor.go",
     "runner.go",
-    "code_assist_client.go",
     "conversationsearch",
+)
+EXTERNAL_TOOL_IGNORED_SOURCES = (
+    "mcp_manager.go",
+)
+# Non-inference internal RPC sources: ignore non-inference 503/retry, only allow strict error-context hard-ban 403
+NON_INFERENCE_IGNORED_SOURCES = (
+    "code_assist_client.go",
     "telemetry.go",
+    "mesh_routing.go",
+    "remote_control.go",
+    "remote_control_v2.go",
+)
+IGNORED_LOG_SOURCES = (
+    CONTENT_ECHO_IGNORED_SOURCES + EXTERNAL_TOOL_IGNORED_SOURCES + NON_INFERENCE_IGNORED_SOURCES
 )
 
-# Non-inference background RPCs (analytics, telemetry, experiments, profile, metadata) must never trigger model 503/T2 alerts
+# Non-inference background RPCs (analytics, telemetry, experiments, profile, metadata, remote-control signaling, oauth) must never trigger model 503/T2 alerts
 NON_INFERENCE_RPC_MARKERS = (
     "recordtrajectoryanalytics",
     "recording trajectory segment analytics",
@@ -497,6 +510,23 @@ NON_INFERENCE_RPC_MARKERS = (
     "counttokens",
     "clearcut",
     "peopleinfo",
+    "pollsignalingmessages",
+    "signaling poll",
+    "[remote-control-",
+    "jetski-webchannel.googleapis.com",
+    "v1internal:notifyuser",
+    "getcascadenuxes",
+    "cascadenuxes",
+    "fetchuserinfo",
+    "oauth2/v2/userinfo",
+    "play.googleapis.com/log",
+    "failed to get profile picture",
+    "googleusercontent.com",
+    "remote:listprojects",
+    "remote:listconversations",
+    "getconversationmetadata",
+    "oauth2.googleapis.com/token",
+    "failed to get oauth token",
 )
 
 # Narrow cloud-sync poll 403 markers on poll.go (missing optional aicode OAuth scope on older tokens, NOT account TOS ban)
@@ -508,6 +538,16 @@ NON_INFERENCE_403_POLL_MARKERS = (
 # Hard ban / real inference 403 markers that MUST NEVER be muted by poll.go / errorreport.go 403 filters
 _HARD_403_RE = re.compile(
     r"(?:tos_violation|account[\s_]+(?:suspended|disabled|banned)|streamgeneratecontent|generatecontent)",
+    re.I,
+)
+# Strict account-ban 403 pattern (excludes boolean config fields like account_disabled=false)
+_ACCOUNT_BAN_403_RE = re.compile(
+    r"(?:tos_violation|account[\s_]+(?:suspended|disabled|banned)(?!\s*[:=]\s*false\b))",
+    re.I,
+)
+# Narrow pattern for an OAuth token endpoint 503 wrapped inside an inference URL error (never mutes 403/retry/goroutine)
+_OAUTH_TOKEN_503_RE = re.compile(
+    r"oauth2\.googleapis\.com/token[\"']?\s*:\s*[^\r\n]{0,120}(?:503|service\s+unavailable)",
     re.I,
 )
 
@@ -2207,9 +2247,13 @@ class LanguageServerLogTailer:
         self._last_event_by_cat: Dict[str, Tuple[float, str, str]] = {}
         self._last_header_gid: str = ""
         self._last_header_src: str = ""
+        self._last_header_content_echo: bool = False
+        self._last_header_ignored_non_inf: bool = False
+        self._last_header_is_err_context: bool = False
         self._block_emitted_cats: set[str] = set()
         self._skip_continuation_lines: int = 0
         self._skip_brace_depth: int = 0
+        self._skip_allow_ban_403: bool = False
         # Bounded cross-endpoint proxy outage burst tracking (aligned with self._events maxlen=1500)
         self._proxy_eof_events: Deque[Tuple[float, str, str]] = deque(maxlen=1500)
         self._proxy_tls_events: Deque[Tuple[float, str, str]] = deque(maxlen=1500)
@@ -2224,6 +2268,10 @@ class LanguageServerLogTailer:
 
     @staticmethod
     def _classify_proxy_bucket(src_base: str, body_low: str) -> str:
+        # Root-cause OAuth token refresh errors FIRST so outer wrapped callers (cache/aicode_fallback/stream)
+        # collapse into a single "oauth" bucket instead of fabricating a fake cross-endpoint outage!
+        if "oauth2.googleapis.com" in body_low:
+            return "oauth"
         if (
             "streamgeneratecontent" in body_low
             or "generatecontent" in body_low
@@ -2411,9 +2459,13 @@ class LanguageServerLogTailer:
             self._last_event_by_cat.clear()
             self._last_header_gid = ""
             self._last_header_src = ""
+            self._last_header_content_echo = False
+            self._last_header_ignored_non_inf = False
+            self._last_header_is_err_context = False
             self._block_emitted_cats.clear()
             self._skip_continuation_lines = 0
             self._skip_brace_depth = 0
+            self._skip_allow_ban_403 = False
             self._proxy_eof_events.clear()
             self._proxy_tls_events.clear()
             self._proxy_eof_dedup.clear()
@@ -2571,9 +2623,13 @@ class LanguageServerLogTailer:
             self._last_seen_ts_token = ts_token
             self._last_header_gid = goroutine_id
             self._last_header_src = self._source_base_name(source)
+            self._last_header_content_echo = False
+            self._last_header_ignored_non_inf = False
+            self._last_header_is_err_context = False
             self._block_emitted_cats.clear()
             self._skip_continuation_lines = 0
             self._skip_brace_depth = 0
+            self._skip_allow_ban_403 = False
             if self._session_start_ts <= 0.0:
                 first_ts = (
                     eager_ts
@@ -2583,13 +2639,38 @@ class LanguageServerLogTailer:
                 if first_ts is not None and first_ts > 0.0:
                     self._session_start_ts = first_ts
         else:
+            if self._last_header_content_echo:
+                return None
             if self._skip_continuation_lines > 0:
                 self._skip_continuation_lines -= 1
                 self._skip_brace_depth += body.count("{") - body.count("}")
+                allow_ban_scan = self._skip_allow_ban_403
                 if self._skip_brace_depth <= 0 and "}" in body:
                     self._skip_continuation_lines = 0
                     self._skip_brace_depth = 0
-                return None
+                    self._skip_allow_ban_403 = False
+                if not (
+                    allow_ban_scan
+                    and (
+                        "tos_violation" in low_full
+                        or "suspended" in low_full
+                        or "disabled" in low_full
+                        or "banned" in low_full
+                    )
+                    and _ACCOUNT_BAN_403_RE.search(body)
+                ):
+                    return None
+            elif self._last_header_ignored_non_inf:
+                if not (
+                    (
+                        "tos_violation" in low_full
+                        or "suspended" in low_full
+                        or "disabled" in low_full
+                        or "banned" in low_full
+                    )
+                    and _ACCOUNT_BAN_403_RE.search(body)
+                ):
+                    return None
             # Inherit originating goroutine & source base for multi-line JSON error payloads (e.g. http_helpers.go)
             goroutine_id = self._last_header_gid
             if not source and self._last_header_src:
@@ -2598,11 +2679,14 @@ class LanguageServerLogTailer:
         # Cheap lowercase keyword pre-filter: skip heavy regexes and lazy datetime parsing on 95%+ benign INFO lines
         has_event_kw = any(kw in low_full for kw in _LOG_FAST_KEYWORDS)
         if not has_event_kw:
-            # Still honor state-machine side effects (multi-line JSON block skip / ignored goroutine tagging)
+            # Still honor state-machine side effects (multi-line JSON block skip / content-echo / ignored goroutine tagging)
             if (
                 severity_ch not in ("E", "W", "F")
                 and (is_continuation or not body.rstrip().endswith("{"))
                 and not any(marker in low_full for marker in NON_INFERENCE_RPC_MARKERS)
+                and (is_continuation or not any(ign in source.lower() for ign in IGNORED_LOG_SOURCES))
+                and "monitor sir_" not in low_full
+                and "llm monitor" not in low_full
             ):
                 return None
 
@@ -2629,8 +2713,57 @@ class LanguageServerLogTailer:
             )
         ):
             self._record_proxy_eof_if_matched(effective_ts, goroutine_id, src_base, body, body_low)
-        is_ignored_source = any(ign in src_low or ign in body_low[:80] for ign in IGNORED_LOG_SOURCES)
-        is_non_inference_rpc = any(marker in body_low for marker in NON_INFERENCE_RPC_MARKERS)
+
+        line_err_context = (
+            severity_ch in ("E", "W", "F")
+            or ("403" in body_low)
+            or ("permission_denied" in body_low)
+            or ("error" in body_low)
+            or ("failed" in body_low)
+            or ("forbidden" in body_low)
+        )
+        if not is_continuation:
+            self._last_header_is_err_context = line_err_context
+        is_err_context = line_err_context or (is_continuation and self._last_header_is_err_context)
+
+        is_content_echo_source = (
+            any(ign in src_low or ign in body_low[:80] for ign in CONTENT_ECHO_IGNORED_SOURCES)
+            or ("monitor sir_" in body_low)
+            or ("llm monitor" in body_low)
+        )
+        is_external_tool_source = any(
+            ign in src_low or ign in body_low[:80] for ign in EXTERNAL_TOOL_IGNORED_SOURCES
+        )
+        if is_content_echo_source or is_external_tool_source:
+            # Content-echo / safety-commentary & external MCP tool logs MUST NEVER bypass into account-ban 403 or model 503
+            is_err_like = (
+                severity_ch in ("E", "W", "F")
+                or ("error" in body_low)
+                or ("failed" in body_low)
+                or ("unavailable" in body_low)
+                or ("503" in body_low)
+            )
+            if goroutine_id and effective_ts > 0.0 and is_err_like:
+                self._mark_ignored_goroutine(goroutine_id, effective_ts)
+            if not is_continuation:
+                self._last_header_content_echo = True
+                if body.rstrip().endswith("{"):
+                    self._skip_continuation_lines = 64
+                    self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
+                    self._skip_allow_ban_403 = False
+            return None
+
+        is_inference_endpoint = (
+            "streamgeneratecontent" in body_low
+            or "generatecontent" in body_low
+            or src_base in ("run.go", "retry.go")
+        )
+        is_non_inference_source = any(
+            ign in src_low or ign in body_low[:80] for ign in NON_INFERENCE_IGNORED_SOURCES
+        )
+        is_non_inference_rpc = (not is_inference_endpoint) and any(
+            marker in body_low for marker in NON_INFERENCE_RPC_MARKERS
+        )
         is_non_inference_403_poll = (
             src_base == "poll.go"
             and any(marker in body_low for marker in NON_INFERENCE_403_POLL_MARKERS)
@@ -2646,11 +2779,24 @@ class LanguageServerLogTailer:
         if is_non_inference_403_poll:
             if goroutine_id and effective_ts > 0.0:
                 self._mark_ignored_403_goroutine(goroutine_id, effective_ts)
-            if not is_continuation and body.rstrip().endswith("{"):
-                self._skip_continuation_lines = 64
-                self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
+            if not is_continuation:
+                self._last_header_ignored_non_inf = True
+                if body.rstrip().endswith("{"):
+                    self._skip_continuation_lines = 64
+                    self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
+                    self._skip_allow_ban_403 = True
             return None
-        if is_ignored_source or is_non_inference_rpc or "monitor sir_" in body_low or "llm monitor" in body_low:
+        is_account_ban_403 = bool(
+            is_err_context
+            and (
+                "tos_violation" in body_low
+                or "suspended" in body_low
+                or "disabled" in body_low
+                or "banned" in body_low
+            )
+            and _ACCOUNT_BAN_403_RE.search(body)
+        )
+        if (is_non_inference_source or is_non_inference_rpc) and not is_account_ban_403:
             # Only tag goroutine as ignored non-inference when this line is actually an error/warning or failed RPC,
             # preventing normal INFO telemetry lines from ever muting a later real error on the same goroutine.
             is_err_like = (
@@ -2663,9 +2809,12 @@ class LanguageServerLogTailer:
             )
             if goroutine_id and effective_ts > 0.0 and is_err_like:
                 self._mark_ignored_goroutine(goroutine_id, effective_ts)
-            if not is_continuation and body.rstrip().endswith("{"):
-                self._skip_continuation_lines = 64
-                self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
+            if not is_continuation:
+                self._last_header_ignored_non_inf = True
+                if body.rstrip().endswith("{"):
+                    self._skip_continuation_lines = 64
+                    self._skip_brace_depth = max(1, body.count("{") - body.count("}"))
+                    self._skip_allow_ban_403 = True
             return None
 
         if not has_event_kw:
@@ -2705,6 +2854,7 @@ class LanguageServerLogTailer:
         elif (
             ("503" in body_low or "no capacity" in body_low or "resource_exhausted" in body_low)
             and HTTP_503_RE.search(body)
+            and (_OAUTH_TOKEN_503_RE.search(body) is None)
         ):
             category = "503"
             if "capacity" in body_low:
@@ -5523,14 +5673,25 @@ class AntigravityMonitorEngine:
                             p_cach = p_abn + p_hit
                             if p_abn >= 4 and p_cach >= 4 and (p_hit / float(p_cach)) < 0.5:
                                 p_freq_t1 = True
+                        live_floor_convs = [c for c in live_active if c.latest_timestamp >= live_eval_floor - 2.0]
+                        has_live_main_step = any(not c.is_subagent for c in live_floor_convs)
+                        if has_live_main_step:
+                            p_suffix_403 = "首步冷启尚未验真"
+                            p_suffix_std = "首步冷启待次拍验真"
+                        elif live_floor_convs:
+                            p_suffix_403 = "仅子代理冷启采样，待主对话新步验真"
+                            p_suffix_std = "仅子代理冷启采样，待主对话新步验真"
+                        else:
+                            p_suffix_403 = "尚无新对话采样，待发新步验真"
+                            p_suffix_std = "尚无新对话采样，待发新步验真"
                         if p_log["403"] > 0:
-                            prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），首步冷启尚未验真"
+                            prior_hist_warning = f"前序历史曾触发 403（{format_relative_age(now - p_anchor)}），{p_suffix_403}"
                         elif (p_server_to + p_log["503"]) >= 2:
-                            prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                            prior_hist_warning = f"前序历史曾触发 T2 限流（{format_relative_age(now - p_anchor)}），{p_suffix_std}"
                         elif p_consec >= T1_CONSEC_MISS_THRESHOLD:
-                            prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                            prior_hist_warning = f"前序历史曾连续 {p_consec} 步掉缓存 T1（{format_relative_age(now - p_anchor)}），{p_suffix_std}"
                         elif p_freq_t1:
-                            prior_hist_warning = f"前序历史曾频繁掉缓存 T1（{format_relative_age(now - p_anchor)}），首步冷启待次拍验真"
+                            prior_hist_warning = f"前序历史曾频繁掉缓存 T1（{format_relative_age(now - p_anchor)}），{p_suffix_std}"
                 if is_custom_account_view:
                     is_historical_rating = True
                     historical_tag = f"历史视角 · {resolved_account or '全机'}"
@@ -6346,13 +6507,49 @@ class AntigravityMonitorEngine:
                 if len(same_hour_t1_cids) == 1:
                     is_live_t1_isolated_single = _is_isolated_t1_in_convs(next(iter(same_hour_t1_cids)), deg_ts)
 
+            # Skip the partially elapsed left-edge hour bucket so we never truncate a prior full hour
+            left_edge_h = int(rolling_24h_cutoff // 3600)
+            persist_buckets = {hk: cnt for hk, cnt in account_24h_utc_buckets.items() if hk > left_edge_h and cnt > 0}
+            degraded_hours: Optional[Dict[int, Optional[int]]] = None
+            degraded_kinds: Optional[Dict[int, str]] = None
+            target_deg_h: Optional[int] = None
+            if is_deg_grade and deg_ts > 0.0:
+                deg_h = int(deg_ts // 3600)
+                if grade == "T1":
+                    if account_24h_utc_buckets.get(deg_h, 0) > 0:
+                        target_deg_h = deg_h
+                elif rolling_24h_steps > 0:
+                    # Decouple target hour anchoring from the 120s frozen_at freshness threshold so delayed restarts (>120s)
+                    # still persist degraded=True (with frozen_at=None) and daily_step_profiles.degraded_at!
+                    if account_24h_utc_buckets.get(deg_h, 0) > 0:
+                        target_deg_h = deg_h
+                    elif account_24h_utc_buckets.get(deg_h - 1, 0) > 0:
+                        # Anchor top-of-hour / cross-midnight 0-step T2/T3 bursts ONLY to the immediately
+                        # preceding hour (deg_h - 1) when an active step occurred within the live window (+5m grace);
+                        # NEVER retroactively blame a clean bucket from an idle period (e.g. 2h or 14h earlier)!
+                        last_step_before_deg = 0.0
+                        for c_st in convs:
+                            for st_item in reversed(c_st._scoped_steps_all or c_st.recent_steps):
+                                if st_item.timestamp <= deg_ts + 5.0:
+                                    if st_item.timestamp > last_step_before_deg:
+                                        last_step_before_deg = st_item.timestamp
+                                    break
+                        prev_hour_grace_sec = max(win_sec + 300.0, 2100.0)
+                        if (
+                            last_step_before_deg > 0.0
+                            and int(last_step_before_deg // 3600) == (deg_h - 1)
+                            and (deg_ts - last_step_before_deg) <= prev_hour_grace_sec
+                        ):
+                            target_deg_h = deg_h - 1
+
             if today_steps > 0:
-                # Never attribute a prior-day lingering degradation or isolated t1_single drift to today's daily profile!
+                # Never attribute a prior-day lingering degradation, isolated t1_single, or idle-period unanchored T2 to today's daily profile!
                 is_today_degraded = (
                     is_deg_grade
                     and (not is_live_t1_isolated_single)
                     and (deg_ts > 0.0)
                     and (deg_ts >= today_start)
+                    and (grade == "T3" or target_deg_h is not None)
                 )
                 self._ledger.record_daily_step_profile(
                     short_label=resolved_account,
@@ -6361,55 +6558,33 @@ class AntigravityMonitorEngine:
                     is_healthy=(grade == "T0"),
                     is_degraded=is_today_degraded,
                 )
-            # Skip the partially elapsed left-edge hour bucket so we never truncate a prior full hour
-            left_edge_h = int(rolling_24h_cutoff // 3600)
-            persist_buckets = {hk: cnt for hk, cnt in account_24h_utc_buckets.items() if hk > left_edge_h and cnt > 0}
-            degraded_hours: Optional[Dict[int, Optional[int]]] = None
-            degraded_kinds: Optional[Dict[int, str]] = None
-            if is_deg_grade and deg_ts > 0.0:
-                deg_h = int(deg_ts // 3600)
-                target_deg_h: Optional[int] = None
-                if grade == "T1":
-                    if account_24h_utc_buckets.get(deg_h, 0) > 0:
-                        target_deg_h = deg_h
+
+            if is_deg_grade and deg_ts > 0.0 and target_deg_h is not None:
+                if target_deg_h not in persist_buckets and account_24h_utc_buckets.get(target_deg_h, 0) > 0:
+                    persist_buckets[target_deg_h] = account_24h_utc_buckets[target_deg_h]
+                if grade == "T1" and is_live_t1_isolated_single:
+                    # Isolated single-conversation T1 persists cleanly as d=False, dk="t1_single"
+                    degraded_hours = None
+                    degraded_kinds = {target_deg_h: "t1_single"}
                 else:
-                    if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
-                        if account_24h_utc_buckets.get(deg_h, 0) > 0:
-                            target_deg_h = deg_h
-                        elif today_steps > 0 and deg_ts >= today_start:
-                            # Anchor top-of-hour 0-step T2/T3 bursts to the most recent active (>0 steps) bucket
-                            # in the same rolling 24h window so we neither write 0-step ghost buckets nor drop real T2/T3!
-                            cand_hs = [hk for hk, cnt in persist_buckets.items() if hk <= deg_h and cnt > 0]
-                            if not cand_hs:
-                                cand_hs = [hk for hk, cnt in account_24h_utc_buckets.items() if hk <= deg_h and cnt > 0]
-                            if cand_hs:
-                                target_deg_h = max(cand_hs)
-                if target_deg_h is not None:
-                    if target_deg_h not in persist_buckets and account_24h_utc_buckets.get(target_deg_h, 0) > 0:
-                        persist_buckets[target_deg_h] = account_24h_utc_buckets[target_deg_h]
-                    if grade == "T1" and is_live_t1_isolated_single:
-                        # Isolated single-conversation T1 persists cleanly as d=False, dk="t1_single"
-                        degraded_hours = None
-                        degraded_kinds = {target_deg_h: "t1_single"}
+                    anchor_key = (resolved_account.lower(), int(round(deg_ts)))
+                    if anchor_key in self._recorded_deg_anchors:
+                        # Reuse frozen initial load for this exact degradation event (prevents write storms & load drift as old steps slide out!)
+                        frozen_at = self._recorded_deg_anchors[anchor_key]
+                        self._recorded_deg_anchors.move_to_end(anchor_key)
                     else:
-                        anchor_key = (resolved_account.lower(), int(round(deg_ts)))
-                        if anchor_key in self._recorded_deg_anchors:
-                            # Reuse frozen initial load for this exact degradation event (prevents write storms & load drift as old steps slide out!)
-                            frozen_at = self._recorded_deg_anchors[anchor_key]
-                            self._recorded_deg_anchors.move_to_end(anchor_key)
+                        # Only record live rolling_24h_steps when observed within 120s of the degradation event;
+                        # for stale pre-restart degradations pass None so historical two-pointer scan restores exact load.
+                        if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
+                            frozen_at = int(rolling_24h_steps)
                         else:
-                            # Only record live rolling_24h_steps when observed within 120s of the degradation event;
-                            # for stale pre-restart degradations pass None so historical two-pointer scan restores exact load.
-                            if abs(now - deg_ts) <= 120.0 and rolling_24h_steps > 0:
-                                frozen_at = int(rolling_24h_steps)
-                            else:
-                                frozen_at = None
-                            self._recorded_deg_anchors[anchor_key] = frozen_at
-                            while len(self._recorded_deg_anchors) > 64:
-                                self._recorded_deg_anchors.popitem(last=False)
-                        degraded_hours = {target_deg_h: frozen_at}
-                        dk_code = "t3" if grade == "T3" else ("t2" if grade == "T2" else "t1_multi")
-                        degraded_kinds = {target_deg_h: dk_code}
+                            frozen_at = None
+                        self._recorded_deg_anchors[anchor_key] = frozen_at
+                        while len(self._recorded_deg_anchors) > 64:
+                            self._recorded_deg_anchors.popitem(last=False)
+                    degraded_hours = {target_deg_h: frozen_at}
+                    dk_code = "t3" if grade == "T3" else ("t2" if grade == "T2" else "t1_multi")
+                    degraded_kinds = {target_deg_h: dk_code}
 
             persist_meta: Dict[int, Dict[str, Any]] = {}
             for hk_p in persist_buckets:
