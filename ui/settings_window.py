@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
 from tkinter import filedialog
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -32,8 +33,14 @@ _UPDATE_MODE_OPTIONS: Tuple[Tuple[str, str], ...] = (
 def _clamp_int(raw: str, low: int, high: int, label: str) -> int:
     text = str(raw).strip()
     try:
-        val = int(round(float(text)))
-    except (TypeError, ValueError) as exc:
+        fval = float(text)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"「{label}」请输入有效数字") from exc
+    if not math.isfinite(fval):
+        raise ValueError(f"「{label}」请输入有效数字")
+    try:
+        val = int(round(fval))
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"「{label}」请输入有效数字") from exc
     return max(low, min(high, val))
 
@@ -42,9 +49,9 @@ def _clamp_float(raw: str, low: float, high: float, label: str) -> float:
     text = str(raw).strip()
     try:
         val = float(text)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"「{label}」请输入有效数字") from exc
-    if val != val:  # NaN guard
+    if not math.isfinite(val):
         raise ValueError(f"「{label}」请输入有效数字")
     return max(low, min(high, val))
 
@@ -135,8 +142,9 @@ class MonitorSettingsWindow:
         self._var_slow_tps = tk.StringVar(master=self.win, value="40")
         self._var_slow_ttft = tk.StringVar(master=self.win, value="45")
 
-        self._var_slot_auto = tk.BooleanVar(master=self.win, value=True)
+        self._var_slot_auto = tk.BooleanVar(master=self.win, value=False)
         self._var_slot_protect_min = tk.StringVar(master=self.win, value="120")
+        self._var_slot_cap = tk.StringVar(master=self.win, value="0")
         self._var_slot_clean_mode = tk.StringVar(master=self.win, value="recycle")
         self._var_slot_archive_dir = tk.StringVar(master=self.win, value="")
 
@@ -378,27 +386,30 @@ class MonitorSettingsWindow:
         lbl_ttftu.grid(row=5, column=2, sticky="w", padx=(4, 0))
         self._field_labels.append(lbl_ttftu)
 
-        # --- Group 3: 500 槽位保护 (flat 3-column grid) ---
-        c3 = self._make_card(self._grid_wrap, 1, 0, "🧹 500 槽位保护", cols=3)
+        # --- Group 3: 本地会话清理 (flat 3-column grid; keep total widget count < 70) ---
+        c3 = self._make_card(self._grid_wrap, 1, 0, "🧹 本地会话清理", cols=3)
 
         self._make_checkbox(c3, "自动清理超期老旧子代理（主对话永久保护）", self._var_slot_auto).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 5)
         )
 
-        lbl_sp = tk.Label(c3, text="子代理保护时长 (硬下限 30)", font=(UI_FONT, 8), anchor="w")
+        lbl_sp = tk.Label(c3, text="子代理保护时长 (分，硬下限 30)", font=(UI_FONT, 8), anchor="w")
         lbl_sp.grid(row=2, column=0, sticky="w", pady=(0, 5))
         self._field_labels.append(lbl_sp)
         self._ent_slot_protect = self._make_entry(c3, self._var_slot_protect_min, width=7)
-        self._ent_slot_protect.grid(row=2, column=1, sticky="e", pady=(0, 5))
-        lbl_spu = tk.Label(c3, text="分钟", font=(UI_FONT, 8), anchor="w")
-        lbl_spu.grid(row=2, column=2, sticky="w", padx=(4, 0), pady=(0, 5))
-        self._field_labels.append(lbl_spu)
+        self._ent_slot_protect.grid(row=2, column=1, columnspan=2, sticky="e", pady=(0, 5))
+
+        lbl_cap = tk.Label(c3, text="旧版槽位上限兼容 (0=不限或100-5000)", font=(UI_FONT, 8), anchor="w")
+        lbl_cap.grid(row=3, column=0, sticky="w", pady=(0, 5))
+        self._field_labels.append(lbl_cap)
+        self._ent_slot_cap = self._make_entry(c3, self._var_slot_cap, width=7)
+        self._ent_slot_cap.grid(row=3, column=1, columnspan=2, sticky="e", pady=(0, 5))
 
         lbl_cm = tk.Label(c3, text="清理方式", font=(UI_FONT, 8), anchor="w")
-        lbl_cm.grid(row=3, column=0, sticky="w", pady=(0, 5))
+        lbl_cm.grid(row=4, column=0, sticky="w", pady=(0, 5))
         self._field_labels.append(lbl_cm)
         cm_wrap = tk.Frame(c3)
-        cm_wrap.grid(row=3, column=1, columnspan=2, sticky="e", pady=(0, 5))
+        cm_wrap.grid(row=4, column=1, columnspan=2, sticky="e", pady=(0, 5))
         self._sub_frames.append(cm_wrap)
         for idx_c, (key, txt) in enumerate(_CLEAN_MODE_OPTIONS):
             btn = tk.Label(cm_wrap, text=txt, font=(UI_FONT, 8), padx=6, pady=2, cursor="hand2")
@@ -407,7 +418,7 @@ class MonitorSettingsWindow:
             self._clean_mode_btns[key] = btn
 
         lbl_ad = tk.Label(c3, text="归档目录", font=(UI_FONT, 8), anchor="w")
-        lbl_ad.grid(row=4, column=0, sticky="w", pady=(0, 3))
+        lbl_ad.grid(row=5, column=0, sticky="w", pady=(0, 3))
         self._field_labels.append(lbl_ad)
         self._ent_archive_dir = tk.Entry(
             c3,
@@ -417,21 +428,21 @@ class MonitorSettingsWindow:
             highlightthickness=1,
             justify="left",
         )
-        self._ent_archive_dir.grid(row=4, column=1, sticky="ew", padx=(4, 4), pady=(0, 3))
+        self._ent_archive_dir.grid(row=5, column=1, sticky="ew", padx=(4, 4), pady=(0, 3))
         self._entries.append(self._ent_archive_dir)
         c3.grid_columnconfigure(1, weight=1)
         self._btn_browse_archive = tk.Label(c3, text="选择目录…", font=(UI_FONT, 8), padx=6, pady=2, cursor="hand2", highlightthickness=1)
-        self._btn_browse_archive.grid(row=4, column=2, sticky="e", pady=(0, 3))
+        self._btn_browse_archive.grid(row=5, column=2, sticky="e", pady=(0, 3))
         self._btn_browse_archive.bind("<Button-1>", lambda _e: self._browse_archive_dir())
         self._small_btns.append(self._btn_browse_archive)
 
         lbl_ad_hint = tk.Label(
             c3,
-            text="留空则使用默认归档位置；回收站不可用时推荐切换「先归档校验再删」",
+            text="v2.35+ 默认无限历史（上限填 0）；旧版可填 500 启用告警；归档留空用默认位置",
             font=(UI_FONT, 7),
             anchor="w",
         )
-        lbl_ad_hint.grid(row=5, column=0, columnspan=3, sticky="ew")
+        lbl_ad_hint.grid(row=6, column=0, columnspan=3, sticky="ew")
         self._hint_labels.append(lbl_ad_hint)
 
         # --- Group 4: 版本更新 (flat grid) ---
@@ -547,9 +558,19 @@ class MonitorSettingsWindow:
             slow_ttft = float(cfg.get("slow_ttft_threshold_sec", 45.0) or 45.0)
             self._var_slow_ttft.set(f"{slow_ttft:g}")
 
-            self._var_slot_auto.set(bool(cfg.get("slot_auto_clean_enabled", True)))
+            self._var_slot_auto.set(bool(cfg.get("slot_auto_clean_enabled", False)))
             prot_min = int(cfg.get("slot_protect_age_min", 120) or 120)
             self._var_slot_protect_min.set(str(max(30, min(10080, prot_min))))
+            raw_cap = cfg.get("slot_cap", 0)
+            if raw_cap is None or isinstance(raw_cap, bool):
+                cap_val = 0
+            else:
+                try:
+                    f_cap = float(raw_cap)
+                    cap_val = int(f_cap) if math.isfinite(f_cap) else 0
+                except (TypeError, ValueError, OverflowError):
+                    cap_val = 0
+            self._var_slot_cap.set(str(0 if cap_val <= 0 else max(100, min(5000, cap_val))))
 
             cmode = str(cfg.get("slot_clean_mode", "recycle") or "recycle")
             if cmode not in ("recycle", "archive", "delete"):
@@ -711,8 +732,9 @@ class MonitorSettingsWindow:
         self._var_large_ctx_k.set("100")
         self._var_slow_tps.set("40")
         self._var_slow_ttft.set("45")
-        self._var_slot_auto.set(True)
+        self._var_slot_auto.set(False)
         self._var_slot_protect_min.set("120")
+        self._var_slot_cap.set("0")
         self._var_slot_clean_mode.set("recycle")
         self._var_slot_archive_dir.set("")
         self._var_update_check.set(True)
@@ -733,6 +755,12 @@ class MonitorSettingsWindow:
         slow_tps = round(_clamp_float(self._var_slow_tps.get(), 5.0, 200.0, "生成速度偏慢判定"), 1)
         slow_ttft = round(_clamp_float(self._var_slow_ttft.get(), 10.0, 300.0, "首字等待偏慢基线"), 1)
         slot_protect_min = _clamp_int(self._var_slot_protect_min.get(), 30, 10080, "子代理保护时长")
+        raw_cap_txt = self._var_slot_cap.get().strip()
+        if not raw_cap_txt:
+            slot_cap = 0
+        else:
+            raw_cap_val = _clamp_int(raw_cap_txt, 0, 5000, "旧版槽位上限兼容")
+            slot_cap = 0 if raw_cap_val <= 0 else max(100, raw_cap_val)
 
         theme_val = self._var_theme.get()
         if theme_val not in ("midnight_blue", "obsidian_dark"):
@@ -756,6 +784,7 @@ class MonitorSettingsWindow:
             "large_context_threshold": large_ctx_k * 1000,
             "slow_tps_threshold": slow_tps,
             "slow_ttft_threshold_sec": slow_ttft,
+            "slot_cap": slot_cap,
             "slot_auto_clean_enabled": bool(self._var_slot_auto.get()),
             "slot_protect_age_min": slot_protect_min,
             "slot_clean_mode": clean_mode,

@@ -972,6 +972,7 @@ class TestV730AdaptiveStepsAndJsonIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             eng = _make_engine(root, read_only=False)
+            eng.update_config({"slot_auto_clean_enabled": True, "slot_cap": 500})
             now = 1795450000.0
             eng._account_cache = AccountQuotaInfo(
                 short_label="de***3",
@@ -1673,6 +1674,427 @@ class TestV730AdaptiveStepsAndJsonIntegration(unittest.TestCase):
             self.assertIn("前序历史曾连续", snap_d.sub_headline)
             self.assertNotIn("首步冷启", snap_d.sub_headline)
             self.assertIn("尚无新对话采样", snap_d.sub_headline)
+
+    def test_v733_tps_distortion_guard_wavg5_and_unlimited_slots_default_off(self) -> None:
+        from core.config_store import DEFAULT_CONFIG, sanitize_config
+        from core.log_monitor import (
+            ConversationDetailPoint,
+            ConversationSummary,
+            compute_weighted_avg_tps,
+            format_json_snapshot,
+            format_text_summary,
+            resolve_gen_clean_tps,
+        )
+        from core.slot_manager import SlotInventoryScanner
+        from core.sqlite_reader import _compute_clean_step_tps, _max_plausible_tps_for_model, parse_gen_metadata_row
+        from ui.detail_window import summarize_detail_points
+
+        # 1) Row-level TPS distortion guard: retry_error / tiny out / sub-0.5s / NaN / inf / word-boundary ceilings
+        self.assertIsNone(_compute_clean_step_tps(158, 25.08, "stream reading error: unexpected EOF", "Gemini 4 Neon (XHigh)"))
+        self.assertIsNone(_compute_clean_step_tps(530, 604.48, "stream idle timeout (10m0s)", "Gemini 4 Neon (XHigh)"))
+        self.assertAlmostEqual(_compute_clean_step_tps(200, 1.0, "   ", "Gemini 4 Neon (XHigh)") or 0.0, 200.0, places=2)
+        self.assertIsNone(_compute_clean_step_tps(100, float("nan"), "", "Gemini 4 Neon (XHigh)"))
+        self.assertIsNone(_compute_clean_step_tps(100, float("inf"), "", "Gemini 4 Neon (XHigh)"))
+        self.assertIsNone(_compute_clean_step_tps(25, 1.92, "", "Gemini 4 Neon (XHigh)"))
+        self.assertIsNone(_compute_clean_step_tps(400, 0.45, "", "Gemini 4 Neon (XHigh)"))
+        # Word-boundary check: M4270 must NOT match m427 (Carbon), M5280 must NOT match m528 (Hydrogen)
+        self.assertEqual(_max_plausible_tps_for_model("MODEL_PLACEHOLDER_M427"), 320.0)
+        self.assertEqual(_max_plausible_tps_for_model("MODEL_PLACEHOLDER_M4270"), 420.0)
+        self.assertEqual(_max_plausible_tps_for_model("MODEL_PLACEHOLDER_M528"), 650.0)
+        self.assertEqual(_max_plausible_tps_for_model("MODEL_PLACEHOLDER_M5280"), 420.0)
+        # Tool-call burst spikes exceeding per-family ceilings MUST become None
+        self.assertIsNone(_compute_clean_step_tps(710, 0.787, "", "Gemini 4 Neon (XHigh)"))   # 902 > 420
+        self.assertIsNone(_compute_clean_step_tps(330, 1.0, "", "Gemini 4 Carbon (High)"))    # 330 > 320
+        self.assertIsNone(_compute_clean_step_tps(700, 1.0, "", "Gemini 4 Hydrogen (XHigh)")) # 700 > 650
+        # Genuine slow & genuine fast long streams MUST be preserved intact
+        self.assertAlmostEqual(_compute_clean_step_tps(3636, 465.57, "", "Gemini 4 Carbon (High)") or 0.0, 3636 / 465.57, places=2)
+        self.assertAlmostEqual(_compute_clean_step_tps(310, 1.0, "", "Gemini 4 Carbon (High)") or 0.0, 310.0, places=2)
+        self.assertAlmostEqual(_compute_clean_step_tps(777, 2.0, "", "Gemini 4 Neon (XHigh)") or 0.0, 388.5, places=2)
+        self.assertAlmostEqual(_compute_clean_step_tps(560, 1.0, "", "Gemini 4 Hydrogen (XHigh)") or 0.0, 560.0, places=2)
+
+        # End-to-end protobuf parse_gen_metadata_row: multi-entry m1[17] retry_error & sub-0.5s guard
+        blob_clean = _build_gen_blob(1000, 99000, 600, ttft_s=5.0, strm_s=4.0, model_label="Gemini 4 Neon (XHigh)")
+        g_pb_ok = parse_gen_metadata_row(1, blob_clean)
+        self.assertIsNotNone(g_pb_ok)
+        self.assertAlmostEqual(g_pb_ok.tps or 0.0, 150.0, places=2)  # type: ignore[union-attr]
+        blob_sub = _build_gen_blob(1000, 99000, 400, ttft_s=5.0, strm_s=0.45, model_label="Gemini 4 Neon (XHigh)")
+        g_pb_sub = parse_gen_metadata_row(2, blob_sub)
+        self.assertIsNotNone(g_pb_sub)
+        self.assertIsNone(g_pb_sub.tps)  # type: ignore[union-attr]
+        # Multi-entry m1[17] where last retry entry has empty field 3 but previous entry has error -> still drops TPS
+        usage_b = _pb_varint(2, 1000) + _pb_varint(3, 600) + _pb_varint(5, 99000)
+        ttft_b = _pb_varint(1, 5)
+        strm_b = _pb_varint(1, 30)
+        r_prev = _pb_bytes(3, b"unexpected EOF")
+        r_last_empty = _pb_varint(1, 2)
+        m1_retry = _pb_bytes(4, usage_b) + _pb_bytes(11, ttft_b) + _pb_bytes(12, strm_b) + _pb_bytes(17, r_prev) + _pb_bytes(17, r_last_empty)
+        g_pb_retry = parse_gen_metadata_row(3, _pb_bytes(1, m1_retry))
+        self.assertIsNotNone(g_pb_retry)
+        self.assertEqual(g_pb_retry.retry_error, "unexpected EOF")  # type: ignore[union-attr]
+        self.assertIsNone(g_pb_retry.tps)  # type: ignore[union-attr]
+
+        # Empty-label resolution: block Carbon 380 burst & recover Hydrogen 500 genuine stream
+        g_unlab_carb = _make_gen(10, 100000, 99000, 380, streaming_sec=1.0, tps=380.0, model_label="")
+        self.assertIsNone(resolve_gen_clean_tps(g_unlab_carb, "Gemini 4 Carbon (High)"))
+        g_unlab_hydro = replace(_make_gen(11, 100000, 99000, 500, streaming_sec=1.0, model_label=""), tps=None)
+        self.assertAlmostEqual(resolve_gen_clean_tps(g_unlab_hydro, "Gemini 4 Hydrogen (XHigh)") or 0.0, 500.0, places=2)
+
+        # 2) Same-family wavg5 smoothing resists burst outliers & all 5 cross-family edge cases
+        g_neon_1 = _make_gen(1, 100000, 99000, 600, streaming_sec=4.0, tps=150.0, model_label="Gemini 4 Neon (XHigh)")
+        g_neon_2 = _make_gen(2, 101000, 100000, 210, streaming_sec=0.6, tps=350.0, model_label="Gemini 4 Neon (XHigh)")
+        g_neon_burst = replace(
+            _make_gen(3, 102000, 101000, 710, streaming_sec=0.787, model_label="Gemini 4 Neon (XHigh)"),
+            tps=None,
+        )
+        smoothed = AntigravityMonitorEngine._compute_smoothed_conv_tps([g_neon_1, g_neon_2, g_neon_burst])
+        self.assertAlmostEqual(smoothed or 0.0, 810.0 / 4.6, places=2)
+
+        g_hydro = _make_gen(1, 100000, 99000, 1000, streaming_sec=4.0, tps=250.0, model_label="Gemini 4 Hydrogen (XHigh)")
+        g_carb_ok = _make_gen(2, 101000, 100000, 950, streaming_sec=10.0, tps=95.0, model_label="Gemini 4 Carbon (High)")
+        g_carb_none = replace(
+            _make_gen(3, 102000, 101000, 710, streaming_sec=0.78, model_label="Gemini 4 Carbon (High)"),
+            tps=None,
+        )
+        self.assertAlmostEqual(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_hydro, g_carb_ok]) or 0.0, 95.0, places=2
+        )
+        # Switching from Hydrogen to Carbon with only a filtered burst step on Carbon MUST return None
+        self.assertIsNone(AntigravityMonitorEngine._compute_smoothed_conv_tps([g_hydro, g_carb_none]))
+        # Edge 1: unlabeled historical Hydrogen + latest Carbon(tps=None) with fallback Carbon MUST NOT leak 500
+        g_unlab_500 = _make_gen(1, 100000, 99000, 500, streaming_sec=1.0, tps=500.0, model_label="")
+        self.assertIsNone(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps(
+                [g_unlab_500, g_carb_none],
+                fallback_model="gemini-4-carbon-high",
+                step_models=["gemini-4-hydrogen-xhigh", "gemini-4-carbon-high"],
+            )
+        )
+        self.assertIsNone(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_unlab_500, g_carb_none], fallback_model="gemini-4-carbon-high")
+        )
+        # Edge 2: trailing unlabeled step with empty fallback anchors on Carbon, MUST NOT mix older Hydrogen
+        g_unlab_none = replace(_make_gen(3, 102000, 101000, 20, streaming_sec=0.2, model_label=""), tps=None)
+        self.assertAlmostEqual(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_hydro, g_carb_ok, g_unlab_none], fallback_model="") or 0.0,
+            95.0,
+            places=2,
+        )
+        # Edge 3: whitespace label & "未知模型" fallback must NOT misclassify as default and break known family
+        g_ws_none = replace(_make_gen(2, 101000, 100000, 20, streaming_sec=0.2, model_label="   "), tps=None)
+        self.assertAlmostEqual(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_neon_1, g_ws_none], fallback_model="未知模型") or 0.0,
+            150.0,
+            places=2,
+        )
+        # Edge 4: trailing None (newest step not yet in SQLite after switching to Carbon) MUST NOT leak Hydrogen
+        self.assertIsNone(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_hydro, None], fallback_model="gemini-4-carbon-high")
+        )
+        # Edge 5: max_window=5 truncation ignores 6th-oldest step
+        g_old_slow = _make_gen(0, 100000, 99000, 100, streaming_sec=10.0, tps=10.0, model_label="Gemini 4 Neon (XHigh)")
+        g_five = [_make_gen(i, 100000, 99000, 200, streaming_sec=1.0, tps=200.0, model_label="Gemini 4 Neon (XHigh)") for i in range(1, 6)]
+        self.assertAlmostEqual(
+            AntigravityMonitorEngine._compute_smoothed_conv_tps([g_old_slow] + g_five, max_window=5) or 0.0,
+            200.0,
+            places=2,
+        )
+
+        # 3) Detail weighted avg_tps & latest_tps honor single source of truth, finite guard & same-family isolation
+        now = 1795750000.0
+        p_ok = ConversationDetailPoint(
+            step_index=1, timestamp=now - 30, model="Neon XHigh", total_tokens=100000, context_delta=1000,
+            input_tokens=1000, cache_read_tokens=99000, output_tokens=600, hit_rate=99.0,
+            classification="hit", reason="cached", ttft_sec=5.0, tps=150.0, streaming_sec=4.0,
+        )
+        p_aborted = ConversationDetailPoint(
+            step_index=2, timestamp=now - 10, model="Neon XHigh", total_tokens=101000, context_delta=1000,
+            input_tokens=1000, cache_read_tokens=100000, output_tokens=158, hit_rate=99.0,
+            classification="hit", reason="cached", ttft_sec=6.0, tps=None, streaming_sec=60.0,
+        )
+        p_burst = ConversationDetailPoint(
+            step_index=3, timestamp=now - 5, model="Neon XHigh", total_tokens=102000, context_delta=1000,
+            input_tokens=1000, cache_read_tokens=101000, output_tokens=2000, hit_rate=99.0,
+            classification="hit", reason="cached", ttft_sec=12.0, tps=None, streaming_sec=0.8,
+        )
+        p_nan = ConversationDetailPoint(
+            step_index=4, timestamp=now - 2, model="Neon XHigh", total_tokens=103000, context_delta=1000,
+            input_tokens=1000, cache_read_tokens=102000, output_tokens=500, hit_rate=99.0,
+            classification="hit", reason="cached", ttft_sec=5.0, tps=float("nan"), streaming_sec=float("inf"),
+        )
+        kpi = summarize_detail_points([p_ok, p_aborted, p_burst, p_nan])
+        self.assertAlmostEqual(kpi["avg_tps"] or 0.0, 150.0, places=2)
+        self.assertAlmostEqual(kpi["latest_tps"] or 0.0, 150.0, places=2)
+        # Model switch on trailing burst step -> latest_tps MUST NOT leak older Hydrogen into Carbon
+        p_carb_burst = replace(p_burst, step_index=5, model="Carbon High", tps=None)
+        kpi_sw = summarize_detail_points([p_ok, p_carb_burst])
+        self.assertIsNone(kpi_sw["latest_tps"])
+        self.assertIsNone(compute_weighted_avg_tps([(float("nan"), float("inf"), 100)]))
+
+        # 3b) _compute_recent_model_stats ignores aborted/burst steps (tps=None) & uses gen.output_tokens when st.output_tokens==0
+        st_clean = StepRecord(
+            step_index=1, timestamp=now - 30, model="gemini-4-neon-xhigh",
+            input_tokens=1000, cache_read_tokens=99000, output_tokens=0,
+            total_tokens=100000, context_delta=1000, hit_rate=99.0,
+            classification="hit", reason="cached",
+        )
+        st_abort = StepRecord(
+            step_index=2, timestamp=now - 10, model="gemini-4-neon-xhigh",
+            input_tokens=1000, cache_read_tokens=100000, output_tokens=158,
+            total_tokens=101000, context_delta=1000, hit_rate=99.0,
+            classification="hit", reason="cached",
+        )
+        g_clean_m = _make_gen(1, 100000, 99000, 600, streaming_sec=4.0, tps=150.0, model_label="Gemini 4 Neon (XHigh)")
+        g_abort_m = replace(
+            _make_gen(2, 101000, 100000, 158, streaming_sec=60.0, model_label="Gemini 4 Neon (XHigh)"),
+            tps=None,
+            retry_error="unexpected EOF",
+        )
+        c_mstat = ConversationSummary(
+            conversation_id="conv-mstat",
+            short_id="convm1",
+            title="Model Stats Guard",
+            model="Neon XHigh",
+            model_raw="gemini-4-neon-xhigh",
+            context_tokens=101000,
+            max_context_tokens=512000,
+            latest_hit_rate=99.0,
+            latest_cached_in=100000,
+            latest_uncached_in=1000,
+            latest_timestamp=now - 10,
+            recent_steps=[st_clean, st_abort],
+            consec_miss=0,
+            consec_miss_start_step=0,
+            single_miss=False,
+            wasted_cold_tokens=0,
+            freshness_remaining_sec=180,
+            recent_ttfts=[5.0, 6.0],
+            recent_tps_list=[150.0, None],
+            _scoped_steps_all=[st_clean, st_abort],
+            _scoped_gens_all=[g_clean_m, g_abort_m],
+        )
+        mstats = AntigravityMonitorEngine._compute_recent_model_stats(
+            [c_mstat], cutoff_ts=now - 600.0, use_full_scoped=True
+        )
+        self.assertEqual(len(mstats), 1)
+        self.assertAlmostEqual(mstats[0].tps_avg or 0.0, 150.0, places=2)
+
+        # 4) Plan A: Default unlimited local history (slot_cap=0) & default auto-clean OFF, bool/inf/legacy safe
+        self.assertEqual(DEFAULT_CONFIG["slot_cap"], 0)
+        self.assertFalse(DEFAULT_CONFIG["slot_auto_clean_enabled"])
+        c_def = sanitize_config({})
+        self.assertEqual(c_def["slot_cap"], 0)
+        self.assertFalse(c_def["slot_auto_clean_enabled"])
+        self.assertGreaterEqual(c_def["slot_warn_threshold"], 50)
+        self.assertEqual(sanitize_config({"slot_cap": True})["slot_cap"], 0)
+        self.assertEqual(sanitize_config({"slot_cap": False})["slot_cap"], 0)
+        self.assertEqual(sanitize_config({"slot_cap": float("inf")})["slot_cap"], 0)
+        self.assertEqual(sanitize_config({"slot_cap": float("nan")})["slot_cap"], 0)
+        c_leg = sanitize_config({"slot_cap": 500, "slot_auto_clean_enabled": True})
+        self.assertEqual(c_leg["slot_cap"], 500)
+        self.assertTrue(c_leg["slot_auto_clean_enabled"])
+        c_small = sanitize_config({"slot_cap": 30})  # positive <100 clamps to 100
+        self.assertEqual(c_small["slot_cap"], 100)
+        c_neg = sanitize_config({"slot_cap": -5})
+        self.assertEqual(c_neg["slot_cap"], 0)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eng = _make_engine(root, read_only=False)
+            self.assertEqual(eng.config["slot_cap"], 0)
+            self.assertFalse(eng.config["slot_auto_clean_enabled"])
+
+            # 4a) Sustained slow TPS MUST NOT be washed out by a trailing filtered burst step (tps=None, ttft=5s)
+            c_slow = ConversationSummary(
+                conversation_id="conv-slow-guard",
+                short_id="convs1",
+                title="Slow Guard Test",
+                model="Neon XHigh",
+                model_raw="gemini-4-neon-xhigh",
+                context_tokens=100000,
+                max_context_tokens=512000,
+                latest_hit_rate=99.0,
+                latest_cached_in=99000,
+                latest_uncached_in=1000,
+                latest_timestamp=now,
+                recent_steps=[],
+                consec_miss=0,
+                consec_miss_start_step=0,
+                single_miss=False,
+                wasted_cold_tokens=0,
+                freshness_remaining_sec=180,
+            )
+            slow_gens = [
+                _make_gen(i, 100000, 99000, 600, ttft_sec=5.0, streaming_sec=40.0, tps=15.0, model_label="Gemini 4 Neon (XHigh)")
+                for i in range(1, 5)
+            ]
+            burst_g = replace(
+                _make_gen(5, 100000, 99000, 710, ttft_sec=5.0, streaming_sec=0.787, model_label="Gemini 4 Neon (XHigh)"),
+                tps=None,
+            )
+            eng._evaluate_conv_speed_window(c_slow, [(None, g) for g in slow_gens + [burst_g]])
+            self.assertEqual(c_slow.speed_status, "slow")
+            self.assertTrue(c_slow.sustained_slow)
+            # Once a genuinely fast clean stream arrives, speed MUST recover to ok
+            rec_g = _make_gen(6, 100000, 99000, 600, ttft_sec=5.0, streaming_sec=4.0, tps=150.0, model_label="Gemini 4 Neon (XHigh)")
+            eng._evaluate_conv_speed_window(c_slow, [(None, g) for g in slow_gens[1:] + [burst_g, rec_g]])
+            self.assertEqual(c_slow.speed_status, "ok")
+            self.assertFalse(c_slow.sustained_slow)
+
+            # 4b) Real SlotInventoryScanner.scan(..., slot_cap=0) end-to-end test
+            scanner = SlotInventoryScanner(root / "conversations", root / "brain", root / "summaries.db")
+            (root / "conversations" / "11111111-1111-1111-1111-111111111111.db").write_bytes(b"sqlite-stub")
+            inv_real = scanner.scan(slot_cap=0, now_ts=now, force=True)
+            self.assertTrue(inv_real.is_unlimited)
+            self.assertEqual(inv_real.cap, 0)
+            self.assertEqual(inv_real.status, "ok")
+            self.assertFalse(inv_real.main_at_risk)
+            self.assertEqual(inv_real.usage_pct, 0.0)
+
+            # 4c) Unlimited inventory with 520 DBs: OFF by default; when manually enabled, uses gentle auto_periodic (never auto_high_water/30m)
+            inv_unlim = SlotInventorySnapshot(
+                observed_at=now, cap=0, total_db=520, remaining_slots=0, main_count=400,
+                cleanable_sub_count=40, cleanable_30m_count=50, protected_sub_count=80,
+                unknown_count=0, pinned_floor_count=470, total_bytes=50 * 1024 * 1024,
+                cleanable_bytes=8 * 1024 * 1024, protect_age_min=120, status="ok",
+                main_at_risk=False, risk_message="", summary_db_ok=True,
+            )
+            self.assertTrue(inv_unlim.is_unlimited)
+            self.assertEqual(inv_unlim.usage_pct, 0.0)
+
+            eng._account_cache = AccountQuotaInfo(short_label="ly***8", online=True, observed_at=now)
+            eng._last_account_poll = now
+            snap = replace(eng.poll(now_ts=now, force_account=False), slot_inventory=inv_unlim)
+
+            # Auto-clean OFF by default -> returns None
+            self.assertIsNone(eng.maybe_auto_clean_slots(snap, now_ts=now))
+            # When user manually enables auto-clean in unlimited mode, online triggers gentle auto_periodic at base_protect=120m (never auto_high_water or 30m floor!)
+            eng.update_config({"slot_auto_clean_enabled": True, "slot_cap": 0, "slot_protect_age_min": 120})
+            calls: List[Tuple[str, int]] = []
+            orig_clean = eng.clean_old_subagents
+
+            def _spy_clean(**kwargs: Any) -> SlotCleanupResult:
+                calls.append((str(kwargs.get("trigger", "")), int(kwargs.get("protect_age_min", 0))))
+                return SlotCleanupResult(
+                    started_at=now, finished_at=now, trigger=str(kwargs.get("trigger", "")),
+                    mode="recycle", protect_age_min=int(kwargs.get("protect_age_min", 120)),
+                    dry_run=False, candidate_count=0, removed_count=0, freed_bytes=0,
+                    skipped_locked_count=0, skipped_changed_count=0, remaining_db_count=520,
+                )
+
+            eng.clean_old_subagents = _spy_clean  # type: ignore[method-assign]
+            try:
+                res_p = eng.maybe_auto_clean_slots(snap, now_ts=now)
+                self.assertIsNotNone(res_p)
+                self.assertEqual(calls, [("auto_periodic", 120)])
+                # Within 30m periodic cooldown -> must NOT re-trigger even after 10m base cooldown
+                self.assertIsNone(eng.maybe_auto_clean_slots(snap, now_ts=now + 900.0))
+                # After >= 30m cooldown -> triggers gentle auto_periodic again
+                res_p2 = eng.maybe_auto_clean_slots(snap, now_ts=now + 1850.0)
+                self.assertIsNotNone(res_p2)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1], ("auto_periodic", 120))
+            finally:
+                eng.clean_old_subagents = orig_clean  # type: ignore[method-assign]
+
+            # JSON & text summary contract in unlimited mode (no "/0" bug!)
+            js = json.loads(format_json_snapshot(snap))
+            self.assertTrue(js["slots"]["unlimited"])
+            self.assertEqual(js["slots"]["cap"], 0)
+            txt_sum = format_text_summary(snap)
+            slot_lines = [ln for ln in txt_sum.splitlines() if ln.startswith("本地会话")]
+            self.assertEqual(len(slot_lines), 1)
+            self.assertIn("无限历史", slot_lines[0])
+            self.assertNotIn("/0", slot_lines[0])
+            self.assertNotIn("/ 0", slot_lines[0])
+
+    def test_v733_ui_unlimited_slots_settings_roundtrip_and_sync(self) -> None:
+        import tkinter as tk
+        from ui.capsule_app import THEMES
+        from ui.settings_window import MonitorSettingsWindow
+        from ui.slots_window import ConversationSlotsWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            saved_patches: List[Dict[str, Any]] = []
+            cfg_state: Dict[str, Any] = {
+                "theme": "midnight_blue", "window_alpha": 0.95, "poll_interval_ms": 2500,
+                "topmost": True, "start_minimized": False, "notifications_enabled": True,
+                "freshness_window_sec": 210, "large_context_threshold": 100000,
+                "slow_tps_threshold": 40.0, "slow_ttft_threshold_sec": 45.0,
+                "slot_cap": 0, "slot_auto_clean_enabled": False, "slot_protect_age_min": 120,
+                "slot_clean_mode": "recycle", "slot_archive_dir": "",
+                "update_check_enabled": True, "update_mode": "download",
+            }
+            sw = MonitorSettingsWindow(
+                parent=root,
+                theme=THEMES["midnight_blue"],
+                get_config=lambda: dict(cfg_state),
+                on_save_patch=lambda p: (saved_patches.append(dict(p)) or dict(p)),
+            )
+            try:
+                # Widget budget < 70 guard
+                def _cnt(w: tk.Misc) -> int:
+                    return 1 + sum(_cnt(c) for c in w.winfo_children())
+                self.assertLess(_cnt(sw.win), 70)
+                self.assertEqual(sw._var_slot_cap.get(), "0")
+                self.assertFalse(sw._var_slot_auto.get())
+                # Invalid inf must NOT raise uncaught OverflowError
+                sw._var_slot_cap.set("inf")
+                sw._handle_save()
+                self.assertEqual(len(saved_patches), 0)
+                self.assertFalse(sw._closed)
+                # Empty string maps cleanly to 0 (unlimited)
+                sw._var_slot_cap.set("")
+                patch_empty = sw._build_patch_from_form()
+                self.assertEqual(patch_empty["slot_cap"], 0)
+                # Positive 500 legacy cap round-trip
+                sw._var_slot_cap.set("500")
+                patch_500 = sw._build_patch_from_form()
+                self.assertEqual(patch_500["slot_cap"], 500)
+                # Reset defaults restores slot_cap=0 and slot_auto_clean_enabled=False
+                sw._var_slot_auto.set(True)
+                sw._handle_reset_defaults()
+                self.assertEqual(sw._var_slot_cap.get(), "0")
+                self.assertFalse(sw._var_slot_auto.get())
+            finally:
+                sw.close()
+
+            # ConversationSlotsWindow sync_from_summary MUST refresh when cap switches 0 -> 500 with identical total_db
+            now = 1795750000.0
+            inv0 = SlotInventorySnapshot(
+                observed_at=now, cap=0, total_db=120, remaining_slots=0, main_count=80,
+                cleanable_sub_count=10, cleanable_30m_count=15, protected_sub_count=30,
+                unknown_count=0, pinned_floor_count=105, total_bytes=12 * 1024 * 1024,
+                cleanable_bytes=2 * 1024 * 1024, protect_age_min=120, status="ok",
+                main_at_risk=False, risk_message="", summary_db_ok=True,
+            )
+            inv500 = replace(inv0, cap=500, remaining_slots=380)
+            current_inv = [inv0]
+            cw = ConversationSlotsWindow(
+                parent=root,
+                theme=THEMES["midnight_blue"],
+                load_inventory=lambda: current_inv[0],
+                on_clean_now=lambda cb: None,
+                is_auto_clean_enabled=lambda: False,
+                on_toggle_auto_clean=lambda: None,
+                get_protect_age_min=lambda: 120,
+                get_clean_mode=lambda: "recycle",
+                async_refresh=False,
+            )
+            try:
+                cw.refresh(blocking=True)
+                self.assertEqual(cw._lbl_badge.cget("text"), "本地会话清理")
+                self.assertIn("120 条", cw._kpi_cards[0]["val"].cget("text"))
+                self.assertNotIn("/ 0", cw._kpi_cards[0]["val"].cget("text"))
+                current_inv[0] = inv500
+                cw.sync_from_summary(inv500)
+                self.assertEqual(cw._lbl_badge.cget("text"), "500 槽位守护")
+                self.assertIn("120 / 500", cw._kpi_cards[0]["val"].cget("text"))
+            finally:
+                cw.close()
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":

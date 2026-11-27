@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -29,10 +30,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "window_y": None,
     "conv_filter": "main",
     "conv_list_rows": 5,
-    "slot_cap": 500,
+    "slot_cap": 0,
     "slot_warn_threshold": 380,
     "slot_alert_threshold": 450,
-    "slot_auto_clean_enabled": True,
+    "slot_auto_clean_enabled": False,
     "slot_protect_age_min": 120,
     "slot_auto_trigger_threshold": 420,
     "slot_clean_mode": "recycle",
@@ -51,17 +52,28 @@ VALID_UPDATE_MODES = ("download", "auto_restart", "notify")
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    if isinstance(value, bool):
+        return default
     try:
-        num = int(value)
-    except (TypeError, ValueError):
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return default
+            num = int(value)
+        else:
+            num = int(value)
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(low, min(high, num))
 
 
 def _clamp_float(value: Any, default: float, low: float, high: float) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         num = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
         return default
     return max(low, min(high, num))
 
@@ -94,15 +106,43 @@ def sanitize_config(raw: Dict[str, Any] | None) -> Dict[str, Any]:
         cfg["conv_filter"] = conv_filter
     cfg["conv_list_rows"] = _clamp_int(raw.get("conv_list_rows"), 5, 3, 12)
 
-    cfg["slot_cap"] = _clamp_int(raw.get("slot_cap"), 500, 100, 5000)
-    cfg["slot_warn_threshold"] = _clamp_int(raw.get("slot_warn_threshold"), 380, 50, cfg["slot_cap"] - 20)
-    cfg["slot_alert_threshold"] = _clamp_int(raw.get("slot_alert_threshold"), 450, cfg["slot_warn_threshold"] + 1, cfg["slot_cap"])
-    cfg["slot_auto_clean_enabled"] = bool(raw.get("slot_auto_clean_enabled", True))
+    # slot_cap == 0 means unlimited local conversation history (Antigravity v2.35+ default);
+    # positive values (100..5000, e.g. 500) remain supported for legacy <=2.34 clients.
+    raw_slot_cap = raw.get("slot_cap")
+    if raw_slot_cap is None or isinstance(raw_slot_cap, bool):
+        cfg["slot_cap"] = 0
+    else:
+        try:
+            if isinstance(raw_slot_cap, float):
+                parsed_cap = int(raw_slot_cap) if math.isfinite(raw_slot_cap) else 0
+            else:
+                parsed_cap = int(raw_slot_cap)
+        except (TypeError, ValueError, OverflowError):
+            parsed_cap = 0
+        cfg["slot_cap"] = 0 if parsed_cap <= 0 else max(100, min(5000, parsed_cap))
+
+    if cfg["slot_cap"] > 0:
+        cfg["slot_warn_threshold"] = _clamp_int(raw.get("slot_warn_threshold"), min(380, cfg["slot_cap"] - 20), 50, cfg["slot_cap"] - 20)
+        cfg["slot_alert_threshold"] = _clamp_int(
+            raw.get("slot_alert_threshold"),
+            min(450, cfg["slot_cap"]),
+            cfg["slot_warn_threshold"] + 1,
+            cfg["slot_cap"],
+        )
+        trig_high = max(50, cfg["slot_cap"] - 10)
+        trig_low = min(trig_high, max(50, int(cfg["slot_cap"] * 0.5)))
+        cfg["slot_auto_trigger_threshold"] = _clamp_int(
+            raw.get("slot_auto_trigger_threshold"), min(420, trig_high), trig_low, trig_high
+        )
+    else:
+        cfg["slot_warn_threshold"] = _clamp_int(raw.get("slot_warn_threshold"), 380, 50, 4980)
+        cfg["slot_alert_threshold"] = _clamp_int(
+            raw.get("slot_alert_threshold"), 450, cfg["slot_warn_threshold"] + 1, 5000
+        )
+        cfg["slot_auto_trigger_threshold"] = _clamp_int(raw.get("slot_auto_trigger_threshold"), 420, 50, 4990)
+    cfg["slot_auto_clean_enabled"] = bool(raw.get("slot_auto_clean_enabled", False))
     # Hard floor: NEVER allow automatic or manual cleanup age protection below 30 minutes
     cfg["slot_protect_age_min"] = _clamp_int(raw.get("slot_protect_age_min"), 120, 30, 10080)
-    trig_high = max(50, cfg["slot_cap"] - 10)
-    trig_low = min(trig_high, max(50, int(cfg["slot_cap"] * 0.5)))
-    cfg["slot_auto_trigger_threshold"] = _clamp_int(raw.get("slot_auto_trigger_threshold"), min(420, trig_high), trig_low, trig_high)
     clean_mode = raw.get("slot_clean_mode")
     if clean_mode in VALID_SLOT_CLEAN_MODES:
         cfg["slot_clean_mode"] = clean_mode

@@ -355,7 +355,7 @@ class AntigravityCapsuleApp:
         self._var_startup = tk.BooleanVar(value=self._startup_cached)
         self._var_notifications = tk.BooleanVar(value=bool(self.config["notifications_enabled"]))
         self._var_start_min = tk.BooleanVar(value=bool(self.config["start_minimized"]))
-        self._var_auto_clean = tk.BooleanVar(value=bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_auto_clean = tk.BooleanVar(value=bool(self.config.get("slot_auto_clean_enabled", False)))
         self._var_update_check = tk.BooleanVar(value=bool(self.config.get("update_check_enabled", True)))
         self._var_update_mode = tk.StringVar(value=self._current_update_mode())
         self._var_auto_update = tk.BooleanVar(value=bool(self.config.get("auto_update_restart", False)))
@@ -606,9 +606,10 @@ class AntigravityCapsuleApp:
 
         head_row_slots = tk.Frame(self._card_head)
         head_row_slots.pack(fill="x", pady=(6, 3))
+        self._head_row_slots = head_row_slots
         self._lbl_slots_title = tk.Label(
             head_row_slots,
-            text="本地会话槽位 (详情 ▾)",
+            text="本地会话 (详情 ▾)",
             font=(UI_FONT, 8),
             cursor="hand2",
         )
@@ -617,7 +618,7 @@ class AntigravityCapsuleApp:
 
         self._btn_slots_auto = tk.Label(
             head_row_slots,
-            text="自动:开",
+            text="自动:关",
             font=(UI_FONT, 7, "bold"),
             padx=5,
             pady=1,
@@ -639,7 +640,7 @@ class AntigravityCapsuleApp:
 
         self._lbl_slots_val = tk.Label(
             head_row_slots,
-            text="— / 500",
+            text="—",
             font=(MONO_FONT, 8, "bold"),
             cursor="hand2",
         )
@@ -647,7 +648,8 @@ class AntigravityCapsuleApp:
         self._lbl_slots_val.bind("<Button-1>", lambda _e: self.open_slots_window())
 
         self._slots_canvas = tk.Canvas(self._card_head, height=7, highlightthickness=0, bd=0, cursor="hand2")
-        self._slots_canvas.pack(fill="x")
+        if int(self.config.get("slot_cap", 0) or 0) > 0:
+            self._slots_canvas.pack(fill="x")
         self._slots_canvas.bind("<Configure>", lambda _e: self._draw_slots_progress(self._last_slots_pct, self._last_slots_color))
         self._slots_canvas.bind("<Button-1>", lambda _e: self.open_slots_window())
 
@@ -1015,7 +1017,7 @@ class AntigravityCapsuleApp:
         )
         self._ctx_menu.add_cascade(label="更新方式", menu=self._ctx_update_mode_menu)
         self._ctx_menu.add_separator()
-        self._ctx_menu.add_command(label="查看本机 500 槽位详情", command=self.open_slots_window)
+        self._ctx_menu.add_command(label="查看本地会话与清理详情", command=self.open_slots_window)
         self._ctx_menu.add_command(label=self._format_clean_menu_label(), command=self.trigger_manual_subagent_cleanup)
         self._ctx_clean_menu_idx = self._ctx_menu.index("end")
         self._ctx_menu.add_command(
@@ -1427,7 +1429,7 @@ class AntigravityCapsuleApp:
         self._var_startup.set(self._startup_cached)
         self._var_start_min.set(bool(self.config["start_minimized"]))
         self._var_notifications.set(bool(self.config["notifications_enabled"]))
-        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", False)))
         self._var_update_check.set(bool(self.config.get("update_check_enabled", True)))
         self._var_update_mode.set(self._current_update_mode())
         self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
@@ -1650,7 +1652,7 @@ class AntigravityCapsuleApp:
             self.tray.refresh_menu()
 
     def _sync_slots_auto_button(self) -> None:
-        enabled = bool(self.config.get("slot_auto_clean_enabled", True))
+        enabled = bool(self.config.get("slot_auto_clean_enabled", False))
         self._var_auto_clean.set(enabled)
         if not self._expanded_built:
             return
@@ -1665,7 +1667,7 @@ class AntigravityCapsuleApp:
             self._btn_slots_clean.configure(text=text, fg=fg)
 
     def toggle_auto_clean_slots(self) -> None:
-        new_val = not bool(self.config.get("slot_auto_clean_enabled", True))
+        new_val = not bool(self.config.get("slot_auto_clean_enabled", False))
         self._save_config_patch({"slot_auto_clean_enabled": new_val})
         self.engine.update_config(self.config)
         self._sync_slots_auto_button()
@@ -1782,7 +1784,7 @@ class AntigravityCapsuleApp:
         self._var_topmost.set(topmost)
         self._var_notifications.set(bool(self.config.get("notifications_enabled", True)))
         self._var_start_min.set(bool(self.config.get("start_minimized", False)))
-        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", True)))
+        self._var_auto_clean.set(bool(self.config.get("slot_auto_clean_enabled", False)))
         self._var_update_check.set(bool(self.config.get("update_check_enabled", True)))
         self._var_update_mode.set(self._current_update_mode())
         self._var_auto_update.set(bool(self.config.get("auto_update_restart", False)))
@@ -1827,7 +1829,7 @@ class AntigravityCapsuleApp:
                 "theme": self.theme,
                 "load_inventory": lambda: self.engine.read_slot_inventory(include_items=True, force=True),
                 "on_clean_now": self._run_manual_clean_async,
-                "is_auto_clean_enabled": lambda: bool(self.config.get("slot_auto_clean_enabled", True)),
+                "is_auto_clean_enabled": lambda: bool(self.config.get("slot_auto_clean_enabled", False)),
                 "on_toggle_auto_clean": self.toggle_auto_clean_slots,
                 "get_protect_age_min": lambda: max(30, int(self.config.get("slot_protect_age_min", 120))),
                 "get_clean_mode": lambda: str(self.config.get("slot_clean_mode", "recycle")),
@@ -1953,7 +1955,7 @@ class AntigravityCapsuleApp:
                 ok = messagebox.askyesno(
                     "确认清理历史子代理",
                     (
-                        f"准备安全让位 {inv.cleanable_sub_count} 条已结束老旧子代理（超过 {protect_min} 分钟，约 {format_bytes_human(inv.cleanable_bytes)}）。\n\n"
+                        f"准备安全清理 {inv.cleanable_sub_count} 条已结束老旧子代理（超过 {protect_min} 分钟，约 {format_bytes_human(inv.cleanable_bytes)}）。\n\n"
                         f"• 清理方式：{mode_desc}\n"
                         f"• 永久保护：{inv.main_count} 条主对话、{inv.protected_sub_count} 条保护中子代理、{inv.unknown_count} 条未知文件（0 受影响）\n"
                         f"• 遇进程句柄占用将自动跳过，绝不强杀 Antigravity\n\n"
@@ -1973,7 +1975,7 @@ class AntigravityCapsuleApp:
                         msg = f"子代理清理中止：{res.error}"
                     else:
                         skip = f"（跳过占用 {res.skipped_locked_count}）" if res.skipped_locked_count else ""
-                        msg = f"已让位 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，剩余 {res.remaining_db_count} 槽{skip}"
+                        msg = f"已清理 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，当前剩余 {res.remaining_db_count} 条会话{skip}"
                     if self._expanded and self._expanded_built:
                         self._lbl_banner.configure(text=msg, fg=self.theme["red"] if res.error else self.theme["green"])
                     if self._slots_win is not None and not self._slots_win._closed:
@@ -2818,7 +2820,7 @@ class AntigravityCapsuleApp:
         inv = snap.slot_inventory
         bar_slots_was_visible = bool(self._lbl_bar_slots.winfo_manager())
         bar_slots_now_visible = False
-        if inv is not None and (inv.main_at_risk or inv.status in ("warn", "danger")):
+        if inv is not None and inv.cap > 0 and (inv.main_at_risk or inv.status in ("warn", "danger")):
             bar_slots_now_visible = True
             if inv.main_at_risk:
                 bar_slot_txt = f"槽位危 {inv.total_db}/{inv.cap}!"
@@ -2842,7 +2844,7 @@ class AntigravityCapsuleApp:
         need_geom_sync = bool(bar_slots_now_visible != bar_slots_was_visible)
 
         # High-priority main-conversation eviction risk guard: proactively surface HUD once even if muted/minimized!
-        if inv is not None and inv.main_at_risk:
+        if inv is not None and inv.cap > 0 and inv.main_at_risk:
             if not self._last_main_risk_alerted:
                 self._last_main_risk_alerted = True
                 if not self._visible:
@@ -2879,10 +2881,14 @@ class AntigravityCapsuleApp:
             else:
                 hit_s = "—"
             tps_s = f"{snap.primary_tps:.0f}t/s" if snap.primary_tps is not None else "—"
-            slot_tip = f" | 槽位 {inv.total_db}/{inv.cap}" if inv is not None else ""
+            slot_tip = (
+                f" | 会话 {inv.total_db}条"
+                if (inv is not None and inv.cap <= 0)
+                else (f" | 槽位 {inv.total_db}/{inv.cap}" if inv is not None else "")
+            )
             step_lbl = f"近24h {eff_steps}步" if has_24h else f"{eff_steps}步"
             tip = f"反重力监控 {short_grade} | 缓存 {hit_s} | {tps_s} | {acc_txt} | {step_lbl}{slot_tip}"
-            tray_lvl = "red" if (inv is not None and inv.main_at_risk) else (snap.level if snap.level in ("green", "orange", "red") else "green")
+            tray_lvl = "red" if (inv is not None and inv.cap > 0 and inv.main_at_risk) else (snap.level if snap.level in ("green", "orange", "red") else "green")
             self.tray.update_status(tray_lvl, tip)
 
             if snap.alerts:
@@ -3100,48 +3106,84 @@ class AntigravityCapsuleApp:
         self._last_steps_color = step_bar_color
         self._draw_steps_progress(self._last_steps_pct, self._last_steps_color)
 
-        # Module 1B: Local 500-slot conversation pool guard
+        # Module 1B: Local conversation storage & optional legacy slot-cap guard
         self._sync_slots_auto_button()
+        slots_bar_was_vis = bool(self._slots_canvas.winfo_manager())
         if inv is not None:
-            slot_pct = min(100, int(round((inv.total_db / max(1, inv.cap)) * 100.0)))
-            slot_bar_col = compute_steps_color(
-                inv.total_db,
-                int(self.config.get("slot_warn_threshold", 380)),
-                int(self.config.get("slot_alert_threshold", 450)),
-                t["green"],
-                t["red"],
-            )
-            if inv.main_at_risk:
-                slot_bar_col = t["red"]
-            slot_txt_col = slot_bar_col if (inv.main_at_risk or inv.status != "ok") else t["text_primary"]
-            slot_val_txt = f"{inv.total_db} / {inv.cap} ({slot_pct}%) · 主 {inv.main_count} / 可清 {inv.cleanable_sub_count}"
-            self._lbl_slots_val.configure(text=slot_val_txt, fg=slot_txt_col)
-            if not self._slots_cleaning_busy:
-                if inv.cleanable_sub_count > 0:
-                    self._btn_slots_clean.configure(text=f"清理({inv.cleanable_sub_count})", bg=t["btn_hover"], fg=t["cyan"])
-                else:
-                    self._btn_slots_clean.configure(text="清理", bg=t["btn_bg"], fg=t["text_muted"])
-            self._last_slots_pct = slot_pct
-            self._last_slots_color = slot_bar_col
-            self._draw_slots_progress(self._last_slots_pct, self._last_slots_color)
-
-            risk_was_visible = bool(self._slot_risk_frame.winfo_manager())
-            if inv.main_at_risk:
-                risk_msg = inv.risk_headline or f"槽位 {inv.total_db}/{inv.cap} 已撞 30 分钟下限，重启可能删主对话！点此查看"
-                self._lbl_slot_risk.configure(text=f"⚠ {risk_msg}（点此展开详情）", bg=t["red_bg"], fg=t["red"])
-                self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
-                if not risk_was_visible:
-                    self._slot_risk_frame.pack(fill="x", pady=(5, 0))
+            if inv.cap <= 0:
+                self._lbl_slots_title.configure(text="本地会话 (详情 ▾)")
+                slot_val_txt = (
+                    f"共 {inv.total_db} 条 · 主 {inv.main_count} / 可清 {inv.cleanable_sub_count}"
+                    f" · {format_bytes_human(inv.total_bytes)}"
+                )
+                self._lbl_slots_val.configure(text=slot_val_txt, fg=t["text_primary"])
+                if not self._slots_cleaning_busy:
+                    if inv.cleanable_sub_count > 0:
+                        self._btn_slots_clean.configure(text=f"清理({inv.cleanable_sub_count})", bg=t["btn_hover"], fg=t["cyan"])
+                    else:
+                        self._btn_slots_clean.configure(text="清理", bg=t["btn_bg"], fg=t["text_muted"])
+                if slots_bar_was_vis:
+                    self._slots_canvas.pack_forget()
                     need_geom_sync = True
-            else:
-                if risk_was_visible:
+                if self._slot_risk_frame.winfo_manager():
                     self._slot_risk_frame.pack_forget()
                     need_geom_sync = True
+            else:
+                self._lbl_slots_title.configure(text="本地会话槽位 (详情 ▾)")
+                slot_pct = min(100, int(round((inv.total_db / max(1, inv.cap)) * 100.0)))
+                slot_bar_col = compute_steps_color(
+                    inv.total_db,
+                    int(self.config.get("slot_warn_threshold", 380)),
+                    int(self.config.get("slot_alert_threshold", 450)),
+                    t["green"],
+                    t["red"],
+                )
+                if inv.main_at_risk:
+                    slot_bar_col = t["red"]
+                slot_txt_col = slot_bar_col if (inv.main_at_risk or inv.status != "ok") else t["text_primary"]
+                slot_val_txt = f"{inv.total_db} / {inv.cap} ({slot_pct}%) · 主 {inv.main_count} / 可清 {inv.cleanable_sub_count}"
+                self._lbl_slots_val.configure(text=slot_val_txt, fg=slot_txt_col)
+                if not self._slots_cleaning_busy:
+                    if inv.cleanable_sub_count > 0:
+                        self._btn_slots_clean.configure(text=f"清理({inv.cleanable_sub_count})", bg=t["btn_hover"], fg=t["cyan"])
+                    else:
+                        self._btn_slots_clean.configure(text="清理", bg=t["btn_bg"], fg=t["text_muted"])
+                if not slots_bar_was_vis:
+                    self._slots_canvas.pack(fill="x", after=self._head_row_slots)
+                    need_geom_sync = True
+                self._last_slots_pct = slot_pct
+                self._last_slots_color = slot_bar_col
+                self._draw_slots_progress(self._last_slots_pct, self._last_slots_color)
+
+                risk_was_visible = bool(self._slot_risk_frame.winfo_manager())
+                if inv.main_at_risk:
+                    risk_msg = inv.risk_headline or f"槽位 {inv.total_db}/{inv.cap} 已撞 30 分钟下限，重启可能删主对话！点此查看"
+                    self._lbl_slot_risk.configure(text=f"⚠ {risk_msg}（点此展开详情）", bg=t["red_bg"], fg=t["red"])
+                    self._slot_risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
+                    if not risk_was_visible:
+                        self._slot_risk_frame.pack(fill="x", pady=(5, 0), after=self._slots_canvas)
+                        need_geom_sync = True
+                else:
+                    if risk_was_visible:
+                        self._slot_risk_frame.pack_forget()
+                        need_geom_sync = True
         else:
-            self._lbl_slots_val.configure(text="— / 500", fg=t["text_muted"])
-            self._last_slots_pct = 0
-            self._last_slots_color = t["green"]
-            self._draw_slots_progress(0, t["green"])
+            cfg_cap = int(self.config.get("slot_cap", 0) or 0)
+            if cfg_cap <= 0:
+                self._lbl_slots_title.configure(text="本地会话 (详情 ▾)")
+                self._lbl_slots_val.configure(text="—", fg=t["text_muted"])
+                if slots_bar_was_vis:
+                    self._slots_canvas.pack_forget()
+                    need_geom_sync = True
+            else:
+                self._lbl_slots_title.configure(text="本地会话槽位 (详情 ▾)")
+                self._lbl_slots_val.configure(text=f"— / {cfg_cap}", fg=t["text_muted"])
+                if not slots_bar_was_vis:
+                    self._slots_canvas.pack(fill="x", after=self._head_row_slots)
+                    need_geom_sync = True
+                self._last_slots_pct = 0
+                self._last_slots_color = t["green"]
+                self._draw_slots_progress(0, t["green"])
             if self._slot_risk_frame.winfo_manager():
                 self._slot_risk_frame.pack_forget()
                 need_geom_sync = True
@@ -3901,22 +3943,33 @@ class AntigravityCapsuleApp:
             self._show_text_tooltip(text, event)
 
     def _build_slots_tooltip_text(self, inv: SlotInventorySnapshot) -> str:
-        auto_s = "开启（离线空闲 / 高水位自动让位）" if self.config.get("slot_auto_clean_enabled", True) else "已关闭"
+        auto_enabled = bool(self.config.get("slot_auto_clean_enabled", False))
         mode_map = {"recycle": "Windows 系统回收站（可还原）", "archive": "tar+SHA256 归档后删除", "delete": "直接删除"}
         mode_s = mode_map.get(str(self.config.get("slot_clean_mode", "recycle")), "系统回收站")
-        lines = [
-            "Antigravity 本机 500 会话槽位池（点击展开完整明细）:",
-            f"  当前占用: {inv.total_db} / {inv.cap} ({inv.usage_pct:.0f}% · 安全余量 {inv.headroom} 槽 · 约 {format_bytes_human(inv.total_bytes)})",
-            f"  主对话: {inv.main_count} 条（永久保护，绝不自动清理）",
-            f"  可清理子代理 (>{inv.protect_age_min}m): {inv.cleanable_sub_count} 条（约 {format_bytes_human(inv.cleanable_bytes)}）",
-            f"  保护中子代理: {inv.protected_sub_count} 条（30m 硬下限不可突破；30m 外可清 {inv.cleanable_30m_count} 条）",
-        ]
+        if inv.cap <= 0:
+            auto_s = "开启（离线或在线每 30m 温和自动清理超期子代理）" if auto_enabled else "已关闭（默认，可按需手动一键清理）"
+            lines = [
+                "本地会话存储与磁盘减负（Antigravity v2.35+ 默认无限历史 · 点击展开明细）:",
+                f"  本地会话: 共 {inv.total_db} 条（约 {format_bytes_human(inv.total_bytes)} · 不限上限）",
+                f"  主对话: {inv.main_count} 条（永久保护，绝不自动清理）",
+                f"  可清理子代理 (>{inv.protect_age_min}m): {inv.cleanable_sub_count} 条（可释放约 {format_bytes_human(inv.cleanable_bytes)}）",
+                f"  保护中子代理: {inv.protected_sub_count} 条（30m 硬下限不可突破；30m 外可清 {inv.cleanable_30m_count} 条）",
+            ]
+        else:
+            auto_s = "开启（离线空闲 / 高水位自动让位）" if auto_enabled else "已关闭"
+            lines = [
+                f"Antigravity 本机 {inv.cap} 会话槽位池（旧版上限兼容模式 · 点击展开完整明细）:",
+                f"  当前占用: {inv.total_db} / {inv.cap} ({inv.usage_pct:.0f}% · 安全余量 {inv.headroom} 槽 · 约 {format_bytes_human(inv.total_bytes)})",
+                f"  主对话: {inv.main_count} 条（永久保护，绝不自动清理）",
+                f"  可清理子代理 (>{inv.protect_age_min}m): {inv.cleanable_sub_count} 条（约 {format_bytes_human(inv.cleanable_bytes)}）",
+                f"  保护中子代理: {inv.protected_sub_count} 条（30m 硬下限不可突破；30m 外可清 {inv.cleanable_30m_count} 条）",
+            ]
         if inv.unknown_count > 0:
             lines.append(f"  未知 .db: {inv.unknown_count} 条（不在摘要库中，保守跳过）")
-        lines.append(f"  清理策略: {mode_s} │ 自动让位: {auto_s}")
+        lines.append(f"  清理策略: {mode_s} │ 自动清理: {auto_s}")
         if inv.last_auto_clean_summary:
             lines.append(f"  最近清理: {inv.last_auto_clean_summary}")
-        if inv.main_at_risk and inv.risk_headline:
+        if inv.cap > 0 and inv.main_at_risk and inv.risk_headline:
             lines.append(f"  ⚠ 风险提醒: {inv.risk_headline}")
         return "\n".join(lines)
 
@@ -3970,6 +4023,8 @@ class AntigravityCapsuleApp:
             lines.append(f"代理状态: {snap.proxy_outage_note}")
         if not lines:
             lines.append("实时速度与首字等待: 正在等待下一轮采样")
+        else:
+            lines.append("口径说明: 主吞吐为同模型近 5 步流时长加权平滑（已过滤断流与工具突刺），逐拍明细为单步实测")
         return "\n".join(lines)
 
     def _show_speed_tooltip(self, event: tk.Event) -> None:
@@ -4726,7 +4781,7 @@ class AntigravityCapsuleApp:
                     sp_txt = f"{conv.tps / 1000.0:.1f}k/s" if conv.tps >= 1000 else f"{conv.tps:.0f} t/s"
                 else:
                     sp_txt = "—"
-                sp_col = t["orange"] if conv.speed_status == "slow" else t["cyan"]
+                sp_col = t["text_muted"] if conv.tps is None else (t["orange"] if conv.speed_status == "slow" else t["cyan"])
                 row_ui["speed"].configure(text=sp_txt, fg=sp_col)
 
             row_ui["id"].grid(row=idx, column=0, sticky="w", padx=(0, 6), pady=3)
@@ -4836,6 +4891,8 @@ class AntigravityCapsuleApp:
 
     def _spawn_auto_clean_thread(self, snap: MonitorSnapshot) -> None:
         if self._closing or self.engine.read_only:
+            return
+        if not bool(self.config.get("slot_auto_clean_enabled", False)):
             return
         if self._auto_clean_thread is not None and self._auto_clean_thread.is_alive():
             return
@@ -4951,7 +5008,7 @@ class AntigravityCapsuleApp:
                 "startup": lambda: self._startup_cached,
                 "start_minimized": lambda: self.config["start_minimized"],
                 "notifications": lambda: self.config["notifications_enabled"],
-                "auto_clean": lambda: self.config.get("slot_auto_clean_enabled", True),
+                "auto_clean": lambda: self.config.get("slot_auto_clean_enabled", False),
                 "update_check": lambda: self.config.get("update_check_enabled", True),
                 "update_mode": self._current_update_mode,
                 "auto_update": lambda: self.config.get("auto_update_restart", False),

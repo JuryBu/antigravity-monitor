@@ -1,4 +1,4 @@
-"""On-demand themed modal inspecting Antigravity's 500-slot local conversation pool & subagent cleanup."""
+"""On-demand themed modal inspecting Antigravity's local conversation pool & subagent cleanup."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class ConversationSlotsWindow:
         self._scroll_drag_origin_top: float = 0.0
 
         self.win = tk.Toplevel(parent)
-        self.win.title("本机 500 槽位对话分布与子代理让位清理")
+        self.win.title("本地会话分布与子代理清理")
         self.win.overrideredirect(True)
         self.win.resizable(False, False)
         self.win.attributes("-topmost", True)
@@ -90,7 +90,11 @@ class ConversationSlotsWindow:
             on_drag_cancel=self._on_dragger_cancelled,
             size_provider=self._get_window_size,
             theme_provider=lambda: self.theme,
-            title_provider=lambda: "500 槽位守护 · 本机对话分布",
+            title_provider=lambda: (
+                f"{self._snapshot.cap} 槽位守护 · 本机对话分布"
+                if (self._snapshot is not None and self._snapshot.cap > 0)
+                else "本地会话清理 · 本机对话分布"
+            ),
             header_height_provider=self._get_header_height,
             screen_bounds_fn=self._screen_bounds_fn,
         )
@@ -129,11 +133,11 @@ class ConversationSlotsWindow:
         self._btn_close.pack(side="right", padx=(6, 0))
         self._btn_close.bind("<Button-1>", lambda _e: self.close())
 
-        self._btn_auto = tk.Label(self._hdr, text="自动清理:开", font=(UI_FONT, 8, "bold"), padx=7, pady=2, cursor="hand2")
+        self._btn_auto = tk.Label(self._hdr, text="自动清理:关", font=(UI_FONT, 8, "bold"), padx=7, pady=2, cursor="hand2")
         self._btn_auto.pack(side="right", padx=(6, 0))
         self._btn_auto.bind("<Button-1>", lambda _e: self._handle_toggle_auto())
 
-        self._lbl_badge = tk.Label(self._hdr, text="500 槽位守护", font=(UI_FONT, 8, "bold"), padx=6, pady=1)
+        self._lbl_badge = tk.Label(self._hdr, text="本地会话清理", font=(UI_FONT, 8, "bold"), padx=6, pady=1)
         self._lbl_badge.pack(side="left", padx=(0, 6))
         self._lbl_title = tk.Label(self._hdr, text="本机对话分布", font=(UI_FONT, 10, "bold"), anchor="w")
         self._lbl_title.pack(side="left")
@@ -154,7 +158,7 @@ class ConversationSlotsWindow:
         self._kpi_row = tk.Frame(self._surface)
         self._kpi_row.pack(fill="x", pady=(0, 8))
         self._kpi_cards: List[Dict[str, tk.Widget]] = []
-        kpi_titles = ("总槽位占用 / 余量", "现存主对话 (永久保护)", "可让位老旧子代理", "保护期 / 未知会话")
+        kpi_titles = ("本地会话总数 / 体积", "现存主对话 (永久保护)", "可清理老旧子代理", "保护期 / 未知会话")
         for i, title in enumerate(kpi_titles):
             self._kpi_row.grid_columnconfigure(i, weight=1, uniform="skpi")
             card = tk.Frame(self._kpi_row, padx=8, pady=6, highlightthickness=1)
@@ -268,7 +272,7 @@ class ConversationSlotsWindow:
         self._status_box.pack(fill="x", pady=(0, 8))
         self._lbl_status = tk.Label(
             self._status_box,
-            text="纯只读盘点就绪 · 仅在显式触发或自动让位开启时安全清理超期已结束子代理",
+            text="纯只读盘点就绪 · 仅在显式触发或自动清理开启时安全清理超期已结束子代理",
             font=(UI_FONT, 8),
             anchor="w",
         )
@@ -474,9 +478,9 @@ class ConversationSlotsWindow:
         t = self.theme
         enabled = bool(self._is_auto_clean_enabled())
         if enabled:
-            self._btn_auto.configure(text="自动让位:开", bg=t["green_bg"], fg=t["green"])
+            self._btn_auto.configure(text="自动清理:开", bg=t["green_bg"], fg=t["green"])
         else:
-            self._btn_auto.configure(text="自动让位:关", bg=t["card_alt_bg"], fg=t["text_muted"])
+            self._btn_auto.configure(text="自动清理:关", bg=t["card_alt_bg"], fg=t["text_muted"])
 
     def _handle_toggle_auto(self) -> None:
         self._on_toggle_auto_clean()
@@ -590,7 +594,10 @@ class ConversationSlotsWindow:
             return
         self._snapshot = inv
         self._last_summary_sig = (
+            inv.cap,
             inv.total_db,
+            inv.total_bytes,
+            inv.protect_age_min,
             inv.cleanable_sub_count,
             inv.cleanable_30m_count,
             inv.main_at_risk,
@@ -661,7 +668,10 @@ class ConversationSlotsWindow:
             return
         self._sync_auto_button()
         sig = (
+            inv.cap,
             inv.total_db,
+            inv.total_bytes,
+            inv.protect_age_min,
             inv.cleanable_sub_count,
             inv.cleanable_30m_count,
             inv.main_at_risk,
@@ -683,11 +693,11 @@ class ConversationSlotsWindow:
         self._lbl_sub.configure(text=f"更新时间 {datetime.datetime.fromtimestamp(snap.observed_at).strftime('%H:%M:%S')}")
         self._lbl_policy_hint.configure(text=f"策略: {mode_txt} · 保护 {protect_min}m（硬下限 {MIN_PROTECT_AGE_MIN}m）")
 
-        if snap.main_at_risk:
+        if snap.cap > 0 and snap.main_at_risk:
             self._risk_frame.configure(bg=t["red_bg"], highlightbackground=t["red"], highlightcolor=t["red"])
             self._lbl_risk.configure(bg=t["red_bg"], fg=t["red"], text=f"⚠️ {snap.risk_message}")
             self._risk_frame.pack(fill="x", pady=(0, 8), before=self._kpi_row)
-        elif snap.status in ("danger", "warn") and snap.risk_message:
+        elif snap.cap > 0 and snap.status in ("danger", "warn") and snap.risk_message:
             bg_c = t["red_bg"] if snap.status == "danger" else t["orange_bg"]
             fg_c = t["red"] if snap.status == "danger" else t["orange"]
             self._risk_frame.configure(bg=bg_c, highlightbackground=fg_c, highlightcolor=fg_c)
@@ -696,11 +706,25 @@ class ConversationSlotsWindow:
         else:
             self._risk_frame.pack_forget()
 
-        # KPI 1: Total slots
-        pct = int(round((snap.total_db / max(1, snap.cap)) * 100))
-        tot_col = t["red"] if snap.status in ("danger", "main_at_risk") else (t["orange"] if snap.status == "warn" else t["green"])
-        self._kpi_cards[0]["val"].configure(text=f"{snap.total_db} / {snap.cap} ({pct}%)", fg=tot_col)
-        self._kpi_cards[0]["sub"].configure(text=f"余 {snap.remaining_slots} 槽 · 基底 {snap.pinned_floor_count}", fg=t["text_secondary"])
+        # KPI 1: Unlimited local history (cap <= 0) vs legacy capped slot pool (cap > 0)
+        if snap.cap <= 0:
+            self._lbl_badge.configure(text="本地会话清理")
+            self._kpi_cards[0]["title"].configure(text="本地会话总数 / 体积")
+            self._kpi_cards[0]["val"].configure(text=f"{snap.total_db} 条", fg=t["green"])
+            self._kpi_cards[0]["sub"].configure(
+                text=f"共 {format_bytes_human(snap.total_bytes)} · 无限历史",
+                fg=t["text_secondary"],
+            )
+        else:
+            self._lbl_badge.configure(text=f"{snap.cap} 槽位守护")
+            self._kpi_cards[0]["title"].configure(text="总槽位占用 / 余量")
+            pct = int(round((snap.total_db / max(1, snap.cap)) * 100))
+            tot_col = t["red"] if snap.status in ("danger", "main_at_risk") else (t["orange"] if snap.status == "warn" else t["green"])
+            self._kpi_cards[0]["val"].configure(text=f"{snap.total_db} / {snap.cap} ({pct}%)", fg=tot_col)
+            self._kpi_cards[0]["sub"].configure(
+                text=f"余 {snap.remaining_slots} 槽 · 基底 {snap.pinned_floor_count}",
+                fg=t["text_secondary"],
+            )
 
         # KPI 2: Main conversations
         self._kpi_cards[1]["val"].configure(text=f"{snap.main_count} 条", fg=t["cyan"])
@@ -781,8 +805,13 @@ class ConversationSlotsWindow:
             if self._search_query:
                 empty_txt = f"未找到匹配「{self._search_query}」的对话，可点击 × 清空搜索条件"
             else:
+                clean_empty = (
+                    "当前没有超过保护期的已结束子代理，本地目录很干净"
+                    if snap.cap <= 0
+                    else "当前没有超过保护期的已结束子代理，槽位很干净"
+                )
                 empty_txt = {
-                    "cleanable_sub": "当前没有超过保护期的已结束子代理，槽位很干净",
+                    "cleanable_sub": clean_empty,
                     "protected_sub": "当前没有运行中或保护期内的子代理",
                     "main": "当前未检测到本地主对话 .db 文件",
                     "unknown": "无未登记的未知 .db 文件（全部已在摘要库核验）",
@@ -844,7 +873,7 @@ class ConversationSlotsWindow:
         skip_part = f"（{'；'.join(skip_parts)}）" if skip_parts else ""
         msg = (
             f"已完成清理：移出 {res.removed_count} 条子代理，释放 {format_bytes_human(res.freed_bytes)}，"
-            f"当前剩余 {res.remaining_db_count} 槽{skip_part}"
+            f"当前剩余 {res.remaining_db_count} 条会话{skip_part}"
         )
         col_key = "orange" if (rec_unavail > 0 and res.removed_count == 0) else "green"
         return (msg, col_key)
@@ -862,7 +891,7 @@ class ConversationSlotsWindow:
         ok = messagebox.askyesno(
             "确认清理历史子代理",
             (
-                f"准备安全让位 {snap.cleanable_sub_count} 条已结束老旧子代理（超过 {protect_min} 分钟，约 {format_bytes_human(snap.cleanable_bytes)}）。\n\n"
+                f"准备安全清理 {snap.cleanable_sub_count} 条已结束老旧子代理（超过 {protect_min} 分钟，约 {format_bytes_human(snap.cleanable_bytes)}）。\n\n"
                 f"• 清理方式：{mode_desc}\n"
                 f"• 永久保护：{snap.main_count} 条主对话、{snap.protected_sub_count} 条保护中子代理、{snap.unknown_count} 条未知文件（0 受影响）\n"
                 f"• 遇进程句柄占用将自动跳过，绝不强杀 Antigravity\n\n"

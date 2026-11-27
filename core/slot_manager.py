@@ -1,11 +1,11 @@
-"""Read-only 500-slot conversation inventory monitor and guarded subagent cleanup engine.
+"""Read-only local conversation inventory monitor and guarded subagent cleanup engine.
 
-Antigravity Desktop Language Server hard-prunes local conversations to 500 slots on startup
-(shared between main conversations and ephemeral subagents/swarm workers). This module:
-  1. Provides a fast, strictly read-only slot inventory scanner (never touches ``.db-shm`` mtime).
+Supports Antigravity v2.35+ unlimited local conversation history (``slot_cap=0``, default)
+as well as legacy <=2.34 capped pools (e.g. ``slot_cap=500``). This module:
+  1. Provides a fast, strictly read-only inventory scanner (never touches ``.db-shm`` mtime).
   2. Enforces 6-layer safety guards before moving/archiving/deleting any completed subagent.
-  3. Hard-clamps the protection age floor at >= 30 minutes and alerts when main conversations
-     approach eviction risk.
+  3. Hard-clamps the protection age floor at >= 30 minutes and alerts when capped main
+     conversations approach eviction risk.
 """
 
 from __future__ import annotations
@@ -32,7 +32,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 MIN_PROTECT_AGE_MIN: int = 30
-DEFAULT_SLOT_CAP: int = 500
+# Antigravity v2.35+ keeps unlimited local conversation history by default (0 = unlimited).
+# Legacy <=2.34 clients can still opt into a positive cap (e.g. 500) in Settings.
+DEFAULT_SLOT_CAP: int = 0
+LEGACY_SLOT_CAP: int = 500
 _RECYCLE_UNAVAILABLE_MARKERS: Tuple[str, ...] = (
     "recycle_bin_disabled_on_volume",
     "recycle_bin_unavailable_on_volume",
@@ -391,7 +394,7 @@ class SlotInventorySnapshot:
     observed_at: float
     cap: int = DEFAULT_SLOT_CAP
     total_db: int = 0
-    remaining_slots: int = DEFAULT_SLOT_CAP
+    remaining_slots: int = 0
     main_count: int = 0
     protected_sub_count: int = 0
     cleanable_sub_count: int = 0
@@ -411,7 +414,13 @@ class SlotInventorySnapshot:
     last_auto_clean_summary: str = ""
 
     @property
+    def is_unlimited(self) -> bool:
+        return self.cap <= 0
+
+    @property
     def usage_pct(self) -> float:
+        if self.cap <= 0:
+            return 0.0
         return round((self.total_db / max(1, self.cap)) * 100.0, 1)
 
     @property
@@ -445,7 +454,7 @@ class SlotCleanupResult:
 
 
 class SlotInventoryScanner:
-    """Strictly read-only scanner for Antigravity's 500-slot local conversation pool."""
+    """Strictly read-only scanner for Antigravity's local conversation pool."""
 
     def __init__(
         self,
@@ -465,7 +474,7 @@ class SlotInventoryScanner:
         self._cached_at: float = 0.0
         self._dir_size_lock = threading.Lock()
         self._dir_size_cache: OrderedDict[str, Tuple[float, int, int, int, int]] = OrderedDict()
-        self._dir_size_cache_max: int = max(512, DEFAULT_SLOT_CAP + 128)
+        self._dir_size_cache_max: int = max(512, (DEFAULT_SLOT_CAP if DEFAULT_SLOT_CAP > 0 else LEGACY_SLOT_CAP) + 128)
         self._dir_size_cache_ttl_sec: float = 300.0
         self._active_dir_size_cache_ttl_sec: float = max(0.5, float(active_dir_cache_ttl_sec))
         self._dir_size_epoch: int = 0
@@ -632,11 +641,16 @@ class SlotInventoryScanner:
     ) -> SlotInventorySnapshot:
         now = float(now_ts if now_ts is not None else time.time())
         eff_protect = max(MIN_PROTECT_AGE_MIN, int(protect_age_min))
-        cap = max(50, int(slot_cap))
-        warn_th = max(10, min(int(warn_threshold), cap - 5))
-        alert_th = max(warn_th + 1, min(int(alert_threshold), cap))
+        raw_cap = int(slot_cap)
+        cap = 0 if raw_cap <= 0 else max(50, raw_cap)
+        if cap > 0:
+            warn_th = max(10, min(int(warn_threshold), cap - 5))
+            alert_th = max(warn_th + 1, min(int(alert_threshold), cap))
+        else:
+            warn_th = 0
+            alert_th = 0
         with self._dir_size_lock:
-            self._dir_size_cache_max = max(512, cap + 128)
+            self._dir_size_cache_max = max(512, (cap if cap > 0 else LEGACY_SLOT_CAP) + 128)
 
         with self._lock:
             stamp = self._compute_light_stamp(eff_protect, cap, warn_th, alert_th)
@@ -660,6 +674,13 @@ class SlotInventoryScanner:
                             db_entries.append((entry.name[:-3], entry.path))
             except OSError:
                 db_entries = []
+
+        # Dynamically size LRU capacity (bounded at 4096) so >628 conversations in unlimited mode never thrash
+        with self._dir_size_lock:
+            self._dir_size_cache_max = max(
+                512,
+                min(4096, max(len(db_entries), cap if cap > 0 else LEGACY_SLOT_CAP) + 128),
+            )
 
         summary_ok, sum_map = self._read_summaries_ro()
 
@@ -823,45 +844,52 @@ class SlotInventoryScanner:
                 )
 
         total_db = len(db_entries)
-        remaining = max(0, cap - total_db)
         pinned_floor = max(0, total_db - clean30_cnt)
-        pinned_30m_sub = max(0, pinned_floor - main_cnt - unknown_cnt)
-        cap_floor_margin = min(30, max(5, int(round(cap * 0.06))))
-        near_cap_margin = min(15, max(3, int(round(cap * 0.03))))
-        # Main conversations face real pruning danger ONLY when summary_db_ok is True AND hitting/nearing cap
-        # while even cleaning everything down to the 30m hard floor still leaves the pool critically full.
-        main_at_risk = bool(
-            summary_ok
-            and (
-                (total_db >= alert_th and pinned_floor >= alert_th)
-                or (total_db >= cap - near_cap_margin and clean30_cnt == 0)
-                or (pinned_floor >= cap - cap_floor_margin)
-            )
-        )
-        risk_msg = ""
-        if not summary_ok:
-            status = "warn" if total_db >= warn_th else "ok"
-            if total_db >= warn_th:
-                risk_msg = f"本机槽位 {total_db}/{cap}，但 conversation_summaries.db 暂不可读，已保守暂停自动识别清理"
-        elif main_at_risk:
-            status = "main_at_risk"
-            parts = [f"主对话 {main_cnt}"]
-            if pinned_30m_sub > 0:
-                parts.append(f"30m内保护子代理 {pinned_30m_sub}")
-            if unknown_cnt > 0:
-                parts.append(f"未知 {unknown_cnt}")
-            risk_msg = (
-                f"已撞 30m 保护下限！不可清基底 {pinned_floor}/{cap}（{' / '.join(parts)}），"
-                "重启 Antigravity 可能裁删老主对话，请先备份或归档主对话"
-            )
-        elif total_db >= alert_th:
-            status = "danger"
-            risk_msg = f"本机槽位已达 {total_db}/{cap}，建议尽快让位 {clean_cnt} 条历史子代理防重启裁剪"
-        elif total_db >= warn_th:
-            status = "warn"
-            risk_msg = f"本机槽位 {total_db}/{cap} 偏高，当前有 {clean_cnt} 条超过 {eff_protect} 分钟的子代理可安全让位"
-        else:
+        if cap <= 0:
+            # Antigravity v2.35+ unlimited local conversation history: no cap alarm / eviction danger
+            remaining = 0
+            main_at_risk = False
             status = "ok"
+            risk_msg = ""
+        else:
+            remaining = max(0, cap - total_db)
+            pinned_30m_sub = max(0, pinned_floor - main_cnt - unknown_cnt)
+            cap_floor_margin = min(30, max(5, int(round(cap * 0.06))))
+            near_cap_margin = min(15, max(3, int(round(cap * 0.03))))
+            # Main conversations face real pruning danger ONLY when summary_db_ok is True AND hitting/nearing cap
+            # while even cleaning everything down to the 30m hard floor still leaves the pool critically full.
+            main_at_risk = bool(
+                summary_ok
+                and (
+                    (total_db >= alert_th and pinned_floor >= alert_th)
+                    or (total_db >= cap - near_cap_margin and clean30_cnt == 0)
+                    or (pinned_floor >= cap - cap_floor_margin)
+                )
+            )
+            risk_msg = ""
+            if not summary_ok:
+                status = "warn" if total_db >= warn_th else "ok"
+                if total_db >= warn_th:
+                    risk_msg = f"本机槽位 {total_db}/{cap}，但 conversation_summaries.db 暂不可读，已保守暂停自动识别清理"
+            elif main_at_risk:
+                status = "main_at_risk"
+                parts = [f"主对话 {main_cnt}"]
+                if pinned_30m_sub > 0:
+                    parts.append(f"30m内保护子代理 {pinned_30m_sub}")
+                if unknown_cnt > 0:
+                    parts.append(f"未知 {unknown_cnt}")
+                risk_msg = (
+                    f"已撞 30m 保护下限！不可清基底 {pinned_floor}/{cap}（{' / '.join(parts)}），"
+                    "重启 Antigravity 可能裁删老主对话，请先备份或归档主对话"
+                )
+            elif total_db >= alert_th:
+                status = "danger"
+                risk_msg = f"本机槽位已达 {total_db}/{cap}，建议尽快让位 {clean_cnt} 条历史子代理防重启裁剪"
+            elif total_db >= warn_th:
+                status = "warn"
+                risk_msg = f"本机槽位 {total_db}/{cap} 偏高，当前有 {clean_cnt} 条超过 {eff_protect} 分钟的子代理可安全让位"
+            else:
+                status = "ok"
 
         if include_items:
             items_out.sort(key=lambda x: x.last_active_ts, reverse=True)

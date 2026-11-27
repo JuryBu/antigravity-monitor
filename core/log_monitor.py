@@ -59,7 +59,128 @@ from core.slot_manager import (
     SlotSubagentCleaner,
     format_bytes_human,
 )
-from core.sqlite_reader import ConversationDbReader, ConversationDbSnapshot, parse_pb_map
+from core.sqlite_reader import (
+    ConversationDbReader,
+    ConversationDbSnapshot,
+    _compute_clean_step_tps,
+    _max_plausible_tps_for_model,
+    parse_pb_map,
+)
+
+
+def _clean_model_hint(raw: Any) -> str:
+    txt = str(raw or "").strip()
+    if not txt or txt == "未知模型":
+        return ""
+    return txt
+
+
+def compute_weighted_avg_tps(samples: List[Tuple[Optional[float], Optional[float], int]]) -> Optional[float]:
+    """Compute stream-duration weighted average TPS over clean finite samples (single source of truth)."""
+    w_out = 0
+    w_strm = 0.0
+    valid_tpss: List[float] = []
+    for tps_val, strm_val, out_val in samples:
+        if tps_val is None or isinstance(tps_val, bool):
+            continue
+        try:
+            tf = float(tps_val)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(tf) or tf <= 0.0:
+            continue
+        valid_tpss.append(tf)
+        if strm_val is not None and not isinstance(strm_val, bool) and not isinstance(out_val, bool):
+            try:
+                sf = float(strm_val)
+                oi = int(out_val or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(sf) and sf >= 0.5 and oi > 0:
+                w_out += oi
+                w_strm += sf
+    if w_strm >= 0.5 and w_out > 0:
+        res = float(w_out) / w_strm
+        if math.isfinite(res) and res > 0.0:
+            return res
+    return (sum(valid_tpss) / len(valid_tpss)) if valid_tpss else None
+
+
+def resolve_gen_clean_tps(
+    gen: Any,
+    resolved_model: str = "",
+    enum_map: Optional[Dict[str, str]] = None,
+) -> Optional[float]:
+    """Resolve effective clean single-step TPS using the aligned model & dynamic enum map.
+
+    - Rejects non-finite / non-positive TPS values.
+    - Drops burst outliers when an empty/unrecognized DB model_label resolves to a stricter family (e.g. Carbon <= 320).
+    - Recovers genuine high-speed streams when an empty/unrecognized DB model_label resolves to a faster family
+      (e.g. Hydrogen/Flash <= 650) that was previously filtered solely by the 420 default ceiling.
+    """
+    if gen is None:
+        return None
+    raw_tps_obj = getattr(gen, "tps", None)
+    raw_tps: Optional[float] = None
+    if raw_tps_obj is not None and not isinstance(raw_tps_obj, bool):
+        try:
+            tf = float(raw_tps_obj)
+            if math.isfinite(tf) and tf > 0.0:
+                raw_tps = tf
+        except (TypeError, ValueError):
+            raw_tps = None
+
+    resolved_hint = _clean_model_hint(resolved_model)
+    if not resolved_hint:
+        return raw_tps
+    resolved_norm = resolve_model_label(resolved_hint, enum_map=enum_map) or resolved_hint
+    resolved_ceil = _max_plausible_tps_for_model(resolved_norm)
+    gen_label = _clean_model_hint(getattr(gen, "model_label", ""))
+    gen_ceil = _max_plausible_tps_for_model(gen_label)
+
+    if raw_tps is not None:
+        if raw_tps > resolved_ceil:
+            return None
+        return raw_tps
+
+    if resolved_ceil > gen_ceil:
+        out_t = getattr(gen, "output_tokens", 0)
+        strm_s = getattr(gen, "streaming_sec", None)
+        retry_err = getattr(gen, "retry_error", "")
+        recomputed = _compute_clean_step_tps(out_t, strm_s, retry_err, resolved_norm)
+        if recomputed is not None and recomputed > gen_ceil:
+            return recomputed
+    return None
+
+
+def resolve_latest_same_family_tps(
+    points: List[Any],
+    enum_map: Optional[Dict[str, str]] = None,
+) -> Optional[float]:
+    """Return latest finite clean TPS within the trailing model family (no cross-family leakage)."""
+    if not points:
+        return None
+    target_fam = ""
+    last_hint = _clean_model_hint(getattr(points[-1], "model", ""))
+    if last_hint:
+        target_fam = classify_speed_model_family(last_hint, enum_map=enum_map)
+    for p in reversed(points):
+        p_hint = _clean_model_hint(getattr(p, "model", ""))
+        if p_hint:
+            p_fam = classify_speed_model_family(p_hint, enum_map=enum_map)
+            if not target_fam:
+                target_fam = p_fam
+            elif p_fam != target_fam:
+                break
+        tv = getattr(p, "tps", None)
+        if tv is not None and not isinstance(tv, bool):
+            try:
+                tf = float(tv)
+                if math.isfinite(tf) and tf > 0.0:
+                    return tf
+            except (TypeError, ValueError):
+                continue
+    return None
 
 EMAIL_RE = re.compile(r"(?<!\*)\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 RETRY_RE = re.compile(r"(?:^|[\s\[/\\])(?:run|retry)\.go:\d+\].*attempt\s+\d+\s+failed", re.IGNORECASE)
@@ -3373,6 +3494,7 @@ class AntigravityMonitorEngine:
         self.slot_cleaner = SlotSubagentCleaner(self.slot_scanner, journal_path=journal_path)
         self._offline_since_ts: float = 0.0
         self._last_auto_clean_ts: float = 0.0
+        self._last_periodic_auto_clean_ts: float = 0.0
         self._last_auto_clean_summary: str = ""
         self._account_cache: AccountQuotaInfo = AccountQuotaInfo()
         self._active_hub_pid: int = 0
@@ -3432,7 +3554,7 @@ class AntigravityMonitorEngine:
         inv = self.slot_scanner.scan(
             now_ts=now_ts,
             protect_age_min=int(cfg.get("slot_protect_age_min", 120)),
-            slot_cap=int(cfg.get("slot_cap", 500)),
+            slot_cap=int(cfg.get("slot_cap", 0)),
             warn_threshold=int(cfg.get("slot_warn_threshold", 380)),
             alert_threshold=int(cfg.get("slot_alert_threshold", 450)),
             include_items=include_items,
@@ -3478,7 +3600,7 @@ class AntigravityMonitorEngine:
             trigger=trigger,
             dry_run=dry_run,
             now_ts=now_ts,
-            slot_cap=int(cfg.get("slot_cap", 500)),
+            slot_cap=int(cfg.get("slot_cap", 0)),
             stop_event=stop_event,
         )
         if not dry_run:
@@ -3492,7 +3614,7 @@ class AntigravityMonitorEngine:
                     self._static_conv_agg_cache.pop(cid, None)
                 if update_summary:
                     hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
-                    tag = "手动清理" if trigger == "manual" else "自动让位"
+                    tag = "手动清理" if trigger == "manual" else ("命令行清理" if trigger == "cli" else "自动清理")
                     if res.error:
                         self._last_auto_clean_summary = f"{hm} {tag}失败: {res.error}"
                     elif res.removed_count > 0:
@@ -3508,7 +3630,7 @@ class AntigravityMonitorEngine:
         """Run safe automatic old-subagent cleanup when Antigravity is offline/closed or slots hit high water."""
         with self._lock:
             cfg = dict(self.config)
-            if self.read_only or not bool(cfg.get("slot_auto_clean_enabled", True)):
+            if self.read_only or not bool(cfg.get("slot_auto_clean_enabled", False)):
                 return None
             inv = snap.slot_inventory
             if inv is None or not inv.summary_db_ok:
@@ -3532,30 +3654,39 @@ class AntigravityMonitorEngine:
                 return None
 
             base_protect = max(MIN_PROTECT_AGE_MIN, int(cfg.get("slot_protect_age_min", 120)))
+            has_slot_cap = inv.cap > 0
             trigger_th = int(cfg.get("slot_auto_trigger_threshold", 420))
             alert_th = int(cfg.get("slot_alert_threshold", 450))
 
             chosen_trigger = ""
             chosen_age = base_protect
             if is_offline_idle and (now - self._offline_since_ts) >= 15.0:
-                # Ideal window: Antigravity is closed/idle (zero LS handle locks) before next startup prune!
+                # Ideal window: Antigravity is closed/idle (zero LS handle locks)
                 if inv.cleanable_sub_count > 0:
                     chosen_trigger = "auto_offline"
                     chosen_age = base_protect
-                elif inv.total_db >= trigger_th and inv.cleanable_30m_count > 0:
+                elif has_slot_cap and inv.total_db >= trigger_th and inv.cleanable_30m_count > 0:
                     chosen_trigger = "auto_offline"
                     chosen_age = MIN_PROTECT_AGE_MIN
-            elif snap.account.online and inv.total_db >= trigger_th:
+            elif has_slot_cap and snap.account.online and inv.total_db >= trigger_th:
                 if inv.cleanable_sub_count > 0:
                     chosen_trigger = "auto_high_water"
                     chosen_age = base_protect
                 elif inv.total_db >= alert_th and inv.cleanable_30m_count > 0:
                     chosen_trigger = "auto_high_water"
                     chosen_age = MIN_PROTECT_AGE_MIN
+            elif (not has_slot_cap) and snap.account.online and inv.cleanable_sub_count > 0:
+                # Unlimited history mode (v2.35+): when user manually enables auto-clean, gently clean
+                # expired old subagents at most once per 30m using base_protect ONLY (never 30m floor / high_water).
+                if self._last_periodic_auto_clean_ts <= 0.0 or (now - self._last_periodic_auto_clean_ts) >= 1800.0:
+                    chosen_trigger = "auto_periodic"
+                    chosen_age = base_protect
 
             if not chosen_trigger:
                 return None
             self._last_auto_clean_ts = now
+            if chosen_trigger == "auto_periodic":
+                self._last_periodic_auto_clean_ts = now
 
         res = self.clean_old_subagents(
             protect_age_min=chosen_age,
@@ -3565,11 +3696,10 @@ class AntigravityMonitorEngine:
             stop_event=stop_event,
             update_summary=False,
         )
-        # Stepped pass down to the 30m hard floor if pool is still high after 2h pass:
-        # - Offline: remaining >= trigger_th
-        # - Online high-water: remaining >= alert_th (prevents 1 locked >2h subagent from starving 30m..120m cleanups!)
+        # Stepped pass down to the 30m hard floor ONLY in legacy capped mode when pool stays high after 2h pass
         need_step2 = (
-            chosen_age > MIN_PROTECT_AGE_MIN
+            has_slot_cap
+            and chosen_age > MIN_PROTECT_AGE_MIN
             and not res.error
             and (stop_event is None or not stop_event.is_set())
             and (
@@ -3614,9 +3744,9 @@ class AntigravityMonitorEngine:
         hm = datetime.datetime.fromtimestamp(res.finished_at).strftime("%H:%M")
         with self._lock:
             if res.error:
-                self._last_auto_clean_summary = f"{hm} 自动让位失败: {res.error}"
+                self._last_auto_clean_summary = f"{hm} 自动清理失败: {res.error}"
             elif res.removed_count > 0:
-                self._last_auto_clean_summary = f"{hm} 自动让位 {res.removed_count} 条子代理 ({format_bytes_human(res.freed_bytes)})"
+                self._last_auto_clean_summary = f"{hm} 自动清理 {res.removed_count} 条子代理 ({format_bytes_human(res.freed_bytes)})"
         if res.error:
             self.slot_cleaner._append_journal(
                 {
@@ -4089,6 +4219,7 @@ class AntigravityMonitorEngine:
             model_raw_resolved or model_display,
             float(self.config["slow_tps_threshold"]),
             float(self.config["slow_ttft_threshold_sec"]),
+            enum_map=self._model_enum_map,
         )
 
         fresh_rem: Optional[int] = None
@@ -4252,6 +4383,7 @@ class AntigravityMonitorEngine:
             c.model_raw or c.model,
             float(self.config["slow_tps_threshold"]),
             float(self.config["slow_ttft_threshold_sec"]),
+            enum_map=self._model_enum_map,
         )
         c.effective_slow_tps_th = eff_th.slow_tps
         c.effective_slow_ttft_th = eff_th.slow_ttft
@@ -4284,6 +4416,81 @@ class AntigravityMonitorEngine:
         c.freshness_invalid_reason = fresh_invalid
         c.freshness_zone = _compute_freshness_zone(fresh_rem, fresh_invalid)
 
+    @staticmethod
+    def _compute_smoothed_conv_tps(
+        gens: List[Optional[Any]],
+        fallback_model: str = "",
+        enum_map: Optional[Dict[str, str]] = None,
+        max_window: int = 5,
+        step_models: Optional[List[str]] = None,
+    ) -> Optional[float]:
+        """Compute stream-weighted TPS over up to ``max_window`` recent clean steps of the latest model family.
+
+        Stops scanning backward on model-family switch so Hydrogen/Neon/Carbon never mix decode speeds,
+        never projects the latest fallback_model onto unlabeled historical steps of another family,
+        and anchors on trailing step_models/fallback_model even when the newest step has no DB row yet.
+        """
+        if not gens:
+            return None
+        limit = max(1, int(max_window))
+        has_step_models = bool(step_models is not None and len(step_models) == len(gens))
+        fb_clean = _clean_model_hint(fallback_model)
+
+        any_explicit_model = False
+        for i, g in enumerate(gens):
+            gm = _clean_model_hint(getattr(g, "model_label", "")) if g is not None else ""
+            sm = _clean_model_hint(step_models[i]) if has_step_models else ""
+            if gm or sm:
+                any_explicit_model = True
+                break
+
+        last_g = gens[-1]
+        last_raw = _clean_model_hint(getattr(last_g, "model_label", "")) if last_g is not None else ""
+        if not last_raw and has_step_models:
+            last_raw = _clean_model_hint(step_models[-1])
+        if last_raw:
+            target_fam = classify_speed_model_family(last_raw, enum_map=enum_map)
+        elif last_g is None and fb_clean:
+            # Newest aligned step is not yet in SQLite; anchor on the current conversation model to avoid stale cross-family leak
+            target_fam = classify_speed_model_family(fb_clean, enum_map=enum_map)
+        elif (not any_explicit_model) and fb_clean:
+            target_fam = classify_speed_model_family(fb_clean, enum_map=enum_map)
+        else:
+            target_fam = ""
+
+        samples: List[Tuple[Optional[float], Optional[float], int]] = []
+        for i in range(len(gens) - 1, -1, -1):
+            g = gens[i]
+            gm = _clean_model_hint(getattr(g, "model_label", "")) if g is not None else ""
+            sm = _clean_model_hint(step_models[i]) if has_step_models else ""
+            eff_raw = gm or sm
+            if eff_raw:
+                g_fam = classify_speed_model_family(eff_raw, enum_map=enum_map)
+                if not target_fam:
+                    target_fam = g_fam
+                elif g_fam != target_fam:
+                    break
+            elif any_explicit_model and target_fam:
+                # Unlabeled historical step in a mixed/labeled stream must NOT inherit the latest model's family
+                continue
+            if g is None:
+                continue
+            model_for_tps = eff_raw or (fb_clean if not any_explicit_model else "")
+            eff_tps = resolve_gen_clean_tps(g, model_for_tps, enum_map=enum_map)
+            if eff_tps is not None:
+                samples.append(
+                    (
+                        eff_tps,
+                        getattr(g, "streaming_sec", None),
+                        int(getattr(g, "output_tokens", 0) or 0),
+                    )
+                )
+                if len(samples) >= limit:
+                    break
+        if not samples:
+            return None
+        return compute_weighted_avg_tps(samples)
+
     def _evaluate_conv_speed_window(
         self,
         c: ConversationSummary,
@@ -4297,13 +4504,18 @@ class AntigravityMonitorEngine:
         for st, g in pairs[-5:]:
             if g is None:
                 continue
-            m_str = (st.model if (st is not None and st.model) else (c.model_raw or c.model))
+            m_str = (
+                _clean_model_hint(st.model if st is not None else "")
+                or _clean_model_hint(getattr(g, "model_label", ""))
+                or _clean_model_hint(c.model_raw or c.model)
+            )
+            eff_tps = resolve_gen_clean_tps(g, m_str, enum_map=self._model_enum_map)
             ctx_tok = st.total_tokens if st is not None else c.context_tokens
             mc = st.active_media_count if st is not None else c.active_media_count
             mb = st.active_media_bytes if st is not None else c.active_media_bytes
             sp_st, med_ex = self._classify_speed_ex(
                 g.output_tokens,
-                g.tps,
+                eff_tps,
                 g.ttft_sec,
                 ctx_tok,
                 streaming_sec=g.streaming_sec,
@@ -4312,14 +4524,14 @@ class AntigravityMonitorEngine:
                 model=m_str,
                 max_context_tokens=max_ctx,
             )
-            th = resolve_model_speed_thresholds(m_str, cfg_tps, cfg_ttft)
+            th = resolve_model_speed_thresholds(m_str, cfg_tps, cfg_ttft, enum_map=self._model_enum_map)
             is_low_tps = bool(
                 g.output_tokens >= 500
                 and (g.streaming_sec is None or g.streaming_sec >= 1.5)
-                and g.tps is not None
-                and g.tps < th.slow_tps
+                and eff_tps is not None
+                and eff_tps < th.slow_tps
             )
-            is_severe_tps = bool(is_low_tps and g.tps is not None and g.tps < th.slow_tps * 0.75)
+            is_severe_tps = bool(is_low_tps and eff_tps is not None and eff_tps < th.slow_tps * 0.75)
             ctx_allow = compute_large_ctx_ttft_allowance(ctx_tok, max_ctx)
             media_mb = max(0.0, float(mb)) / (1024.0 * 1024.0)
             media_grace = min(120.0, max(0, int(mc)) * 3.0 + media_mb * 10.0)
@@ -4335,6 +4547,8 @@ class AntigravityMonitorEngine:
                     "is_low_tps": is_low_tps,
                     "is_severe_tps": is_severe_tps,
                     "is_extreme_ttft": is_extreme_ttft,
+                    "has_clean_tps": eff_tps is not None,
+                    "has_retry_err": bool((getattr(g, "retry_error", "") or "").strip()),
                 }
             )
         if not evaluated:
@@ -4346,7 +4560,32 @@ class AntigravityMonitorEngine:
         c.effective_slow_ttft_th = last_ev["th"].slow_ttft
 
         measured = [r for r in evaluated if r["status"] != "unknown"]
-        if not measured or measured[-1]["status"] != "slow":
+        if not measured:
+            c.sustained_slow = False
+            return
+        # Guard against washing out sustained low-TPS throttling when the latest step had its TPS
+        # filtered out (burst tool call / retry_error / tiny reply) and only passed the TTFT check.
+        eff_measured = list(measured)
+        trailing_unverified_tps = False
+        while eff_measured and eff_measured[-1]["status"] == "ok" and not eff_measured[-1]["has_clean_tps"]:
+            trailing_unverified_tps = True
+            eff_measured.pop()
+        if trailing_unverified_tps and eff_measured and eff_measured[-1]["status"] == "slow" and eff_measured[-1]["is_low_tps"]:
+            lat_prev = eff_measured[-1]
+            prev_slow_cnt = sum(1 for r in eff_measured if r["status"] == "slow")
+            prev_sustained = bool(
+                lat_prev["is_severe_tps"]
+                or lat_prev["is_extreme_ttft"]
+                or (len(eff_measured) >= 2 and eff_measured[-2]["status"] == "slow")
+                or prev_slow_cnt >= 3
+                or (len(eff_measured) == 1 and lat_prev["is_low_tps"])
+            )
+            if prev_sustained:
+                c.speed_status = "slow"
+                c.sustained_slow = True
+                return
+
+        if measured[-1]["status"] != "slow":
             c.sustained_slow = False
             return
         lat = measured[-1]
@@ -4457,8 +4696,19 @@ class AntigravityMonitorEngine:
                 account_scoped=account_scoped,
                 reconciled_changed=reconciled_changed,
             )
+            r_off = len(c.recent_steps) - len(aligned_recent)
+            aligned_step_models: List[str] = []
+            for gi_m in range(len(aligned_recent)):
+                si_m = gi_m + r_off
+                st_m = c.recent_steps[si_m].model if (0 <= si_m < len(c.recent_steps)) else ""
+                aligned_step_models.append(st_m)
             c.recent_ttfts = [g.ttft_sec if g is not None else None for g in aligned_recent]
-            c.recent_tps_list = [g.tps if g is not None else None for g in aligned_recent]
+            c.recent_tps_list = [
+                resolve_gen_clean_tps(g, st_m or (c.model_raw or c.model), enum_map=self._model_enum_map)
+                if g is not None
+                else None
+                for g, st_m in zip(aligned_recent, aligned_step_models)
+            ]
             valid_ttfts = [t for t in c.recent_ttfts if t is not None]
             if valid_ttfts:
                 c.ttft_avg_sec = sum(valid_ttfts) / len(valid_ttfts)
@@ -4467,14 +4717,15 @@ class AntigravityMonitorEngine:
             if latest_gen is not None:
                 c.ttft_sec = latest_gen.ttft_sec
                 c.streaming_sec = latest_gen.streaming_sec
-                # For display avoid brief "— t/s" flash on instant <0.15s tool bursts,
-                # but NEVER pass a backfilled prior TPS into _classify_speed!
-                display_tps = latest_gen.tps
-                if display_tps is None:
-                    display_tps = next((t for t in reversed(c.recent_tps_list) if t is not None), None)
-                c.tps = display_tps
+                # Display stream-weighted TPS over up to 5 recent clean steps of the same model family
+                # (resists sub-second tool bursts & single-step jitter; NEVER passed into _classify_speed!)
+                c.tps = self._compute_smoothed_conv_tps(
+                    aligned_recent,
+                    fallback_model=(c.model_raw or c.model),
+                    enum_map=self._model_enum_map,
+                    step_models=aligned_step_models,
+                )
                 c.shard_tag = latest_gen.shard_tag
-                r_off = len(c.recent_steps) - len(aligned_recent)
                 speed_pairs: List[Tuple[Optional[StepRecord], Any]] = []
                 for idx_r, st_r in enumerate(c.recent_steps):
                     gi_r = idx_r - r_off
@@ -4504,8 +4755,12 @@ class AntigravityMonitorEngine:
             account_scoped=account_scoped,
         )
         valid_gens = tail_gens[-10:]
+        fb_m = c.model_raw or c.model
         c.recent_ttfts = [g.ttft_sec for g in valid_gens]
-        c.recent_tps_list = [g.tps for g in valid_gens]
+        c.recent_tps_list = [
+            resolve_gen_clean_tps(g, getattr(g, "model_label", "") or fb_m, enum_map=self._model_enum_map)
+            for g in valid_gens
+        ]
         valid_ttfts = [t for t in c.recent_ttfts if t is not None]
         if valid_ttfts:
             c.ttft_avg_sec = sum(valid_ttfts) / len(valid_ttfts)
@@ -4514,14 +4769,16 @@ class AntigravityMonitorEngine:
             gen = snap.latest
             c.ttft_sec = gen.ttft_sec
             c.streaming_sec = gen.streaming_sec
-            display_tps = gen.tps
-            if display_tps is None:
-                display_tps = next((t for t in reversed(c.recent_tps_list) if t is not None), None)
-            c.tps = display_tps
+            smooth_gens = list(valid_gens) if valid_gens else [gen]
+            if smooth_gens[-1] is not gen:
+                smooth_gens = smooth_gens[-9:] + [gen]
+            c.tps = self._compute_smoothed_conv_tps(
+                smooth_gens,
+                fallback_model=fb_m,
+                enum_map=self._model_enum_map,
+            )
             c.shard_tag = gen.shard_tag
-            fb_gens = valid_gens[-5:] if valid_gens else [gen]
-            if fb_gens[-1] is not gen:
-                fb_gens = fb_gens[-4:] + [gen]
+            fb_gens = smooth_gens[-5:]
             self._evaluate_conv_speed_window(c, [(None, g) for g in fb_gens])
 
     def poll(
@@ -7646,17 +7903,29 @@ class AntigravityMonitorEngine:
                 steps = c._scoped_steps_all
                 gens = c._scoped_gens_all if len(c._scoped_gens_all) == len(steps) else []
                 ttfts = [g.ttft_sec if g is not None else None for g in gens] if gens else c.recent_ttfts
-                tpss = [g.tps if g is not None else None for g in gens] if gens else c.recent_tps_list
+                tpss = [
+                    resolve_gen_clean_tps(g, st_x.model or (c.model_raw or c.model), enum_map=enum_map)
+                    if g is not None
+                    else None
+                    for g, st_x in zip(gens, steps)
+                ] if gens else c.recent_tps_list
                 strms = [g.streaming_sec if g is not None else None for g in gens] if gens else []
+                g_outs = [int(getattr(g, "output_tokens", 0) or 0) if g is not None else 0 for g in gens] if gens else []
             else:
                 steps = c.recent_steps[-10:]
                 gens_r = c._scoped_gens_all[-len(steps):] if c._scoped_gens_all else []
                 ttfts = c.recent_ttfts[-len(steps):] if c.recent_ttfts else []
                 tpss = c.recent_tps_list[-len(steps):] if c.recent_tps_list else []
                 strms = [g.streaming_sec if g is not None else None for g in gens_r] if len(gens_r) == len(steps) else []
+                g_outs = (
+                    [int(getattr(g, "output_tokens", 0) or 0) if g is not None else 0 for g in gens_r]
+                    if len(gens_r) == len(steps)
+                    else []
+                )
             t_off = len(steps) - len(ttfts)
             p_off = len(steps) - len(tpss)
             s_off = len(steps) - len(strms)
+            o_off = len(steps) - len(g_outs)
             max_ctx_cap = int(c.max_context_tokens or 0) or 512_000
             for idx, st in enumerate(steps):
                 if st.timestamp < cutoff_ts:
@@ -7669,9 +7938,7 @@ class AntigravityMonitorEngine:
                         "hits": 0,
                         "abn": 0,
                         "ttfts": [],
-                        "tpss": [],
-                        "w_out": 0,
-                        "w_strm": 0.0,
+                        "tps_samples": [],
                         "latest_ts": 0.0,
                         "latest_ttft": None,
                         "post_steps": 0,
@@ -7693,16 +7960,16 @@ class AntigravityMonitorEngine:
                 ti = idx - t_off
                 pi = idx - p_off
                 si = idx - s_off
+                oi = idx - o_off
                 t_val = ttfts[ti] if 0 <= ti < len(ttfts) else None
                 p_val = tpss[pi] if 0 <= pi < len(tpss) else None
                 s_val = strms[si] if 0 <= si < len(strms) else None
+                g_out_val = g_outs[oi] if 0 <= oi < len(g_outs) else 0
                 if t_val is not None:
                     b["ttfts"].append(float(t_val))
                 if p_val is not None:
-                    b["tpss"].append(float(p_val))
-                if s_val is not None and s_val >= 0.5 and st.output_tokens > 0:
-                    b["w_out"] += int(st.output_tokens)
-                    b["w_strm"] += float(s_val)
+                    eff_out = g_out_val if g_out_val > 0 else int(st.output_tokens or 0)
+                    b["tps_samples"].append((p_val, s_val, eff_out))
                 if st.timestamp >= b["latest_ts"]:
                     b["latest_ts"] = st.timestamp
                     if t_val is not None:
@@ -7765,11 +8032,7 @@ class AntigravityMonitorEngine:
         out: List[ModelPerfStats] = []
         for mname, b in buckets.items():
             tl = b["ttfts"]
-            pl = b["tpss"]
-            if b["w_strm"] >= 0.5 and b["w_out"] > 0:
-                tps_avg_val: Optional[float] = float(b["w_out"]) / float(b["w_strm"])
-            else:
-                tps_avg_val = (sum(pl) / len(pl)) if pl else None
+            tps_avg_val: Optional[float] = compute_weighted_avg_tps(b["tps_samples"])
             ptl = b["post_ttfts"]
             ptl_median: Optional[float] = None
             if ptl:
@@ -8309,12 +8572,12 @@ class AntigravityMonitorEngine:
         eff_steps = int(rolling_24h_steps) if rolling_24h_steps is not None else int(today_steps)
         eff_now = float(now_ts) if now_ts is not None else time.time()
         candidates: List[Tuple[str, str, str]] = []
-        if slot_inventory is not None and slot_inventory.summary_db_ok:
+        if slot_inventory is not None and slot_inventory.summary_db_ok and slot_inventory.cap > 0:
             if slot_inventory.main_at_risk:
                 candidates.append(
                     (
                         f"slot:main_risk:{slot_inventory.total_db // 5}:{slot_inventory.main_count}",
-                        "Antigravity 500 槽位告急（主对话风险）",
+                        f"Antigravity {slot_inventory.cap} 槽位告急（主对话风险）",
                         slot_inventory.risk_headline
                         or f"本地会话已达 {slot_inventory.total_db}/{slot_inventory.cap}，已撞 30 分钟保护下限，请先备份主对话再重启！",
                     )
@@ -8323,7 +8586,7 @@ class AntigravityMonitorEngine:
                 candidates.append(
                     (
                         f"slot:danger:{slot_inventory.total_db // 10}",
-                        "Antigravity 本机槽位逼近 500 上限",
+                        f"Antigravity 本机槽位逼近 {slot_inventory.cap} 上限",
                         f"当前 {slot_inventory.total_db}/{slot_inventory.cap}（主 {slot_inventory.main_count} / 可清子代理 {slot_inventory.cleanable_sub_count}），建议及时清理让位",
                     )
                 )
@@ -9196,6 +9459,16 @@ class AntigravityMonitorEngine:
                 if raw_m:
                     last_known_detail_model = raw_m
                     latest_resolved_model_raw = raw_m
+                pt_tps = (
+                    resolve_gen_clean_tps(gen, raw_m, enum_map=self._model_enum_map)
+                    if gen is not None
+                    else None
+                )
+                pt_out = (
+                    int(gen.output_tokens)
+                    if (gen is not None and int(getattr(gen, "output_tokens", 0) or 0) > 0)
+                    else st.output_tokens
+                )
                 points.append(
                     ConversationDetailPoint(
                         step_index=st.step_index,
@@ -9205,12 +9478,12 @@ class AntigravityMonitorEngine:
                         context_delta=st.context_delta,
                         input_tokens=st.input_tokens,
                         cache_read_tokens=st.cache_read_tokens,
-                        output_tokens=st.output_tokens,
+                        output_tokens=pt_out,
                         hit_rate=st.hit_rate,
                         classification=st.classification,
                         reason=st.reason,
                         ttft_sec=gen.ttft_sec if gen is not None else None,
-                        tps=gen.tps if gen is not None else None,
+                        tps=pt_tps,
                         streaming_sec=gen.streaming_sec if gen is not None else None,
                         is_revert=st.is_revert,
                         is_compact=st.is_compact,
@@ -9245,15 +9518,11 @@ class AntigravityMonitorEngine:
             avg_ttft = (sum(ttfts) / len(ttfts)) if ttfts else None
             max_ttft = ttfts[-1] if ttfts else None
             p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
-            # Token-weighted avg_tps over meaningful streaming steps (>=0.5s) resists short tool-call jitter
-            weighted_out = sum(p.output_tokens for p in points if p.output_tokens > 0 and p.streaming_sec is not None and p.streaming_sec >= 0.5)
-            weighted_strm = sum(p.streaming_sec for p in points if p.output_tokens > 0 and p.streaming_sec is not None and p.streaming_sec >= 0.5)
-            if weighted_strm >= 0.5 and weighted_out > 0:
-                avg_tps: Optional[float] = weighted_out / weighted_strm
-            else:
-                tpss = [p.tps for p in points if p.tps is not None]
-                avg_tps = (sum(tpss) / len(tpss)) if tpss else None
-            latest_tps = next((p.tps for p in reversed(points) if p.tps is not None), None)
+            # Token-weighted avg_tps over clean streaming steps (single source of truth)
+            avg_tps: Optional[float] = compute_weighted_avg_tps(
+                [(p.tps, p.streaming_sec, p.output_tokens) for p in points]
+            )
+            latest_tps = resolve_latest_same_family_tps(points, enum_map=self._model_enum_map)
             latest_ttft = next((p.ttft_sec for p in reversed(points) if p.ttft_sec is not None), None)
 
             consec_miss = 0
@@ -10356,12 +10625,12 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
         {"key": k, "title": t, "message": m}
         for k, t, m in snap.alerts
     ]
-    if snap.slot_inventory is not None and snap.slot_inventory.main_at_risk:
+    if snap.slot_inventory is not None and snap.slot_inventory.cap > 0 and snap.slot_inventory.main_at_risk:
         if not any(a["key"].startswith("slot:main_risk:") for a in alerts_out):
             alerts_out.append(
                 {
                     "key": f"slot:main_risk:{snap.slot_inventory.total_db // 5}:{snap.slot_inventory.main_count}",
-                    "title": "Antigravity 500 槽位告急（主对话风险）",
+                    "title": f"Antigravity {snap.slot_inventory.cap} 槽位告急（主对话风险）",
                     "message": snap.slot_inventory.risk_message,
                 }
             )
@@ -10567,6 +10836,7 @@ def format_json_snapshot(snap: MonitorSnapshot) -> str:
             {
                 "total_db": snap.slot_inventory.total_db,
                 "cap": snap.slot_inventory.cap,
+                "unlimited": bool(snap.slot_inventory.cap <= 0),
                 "remaining_slots": snap.slot_inventory.remaining_slots,
                 "headroom": snap.slot_inventory.remaining_slots,
                 "usage_pct": snap.slot_inventory.usage_pct,
@@ -10800,14 +11070,20 @@ def format_text_summary(snap: MonitorSnapshot) -> str:
         lines.append(f"代理状态: {snap.proxy_outage_note}")
     if snap.slot_inventory is not None:
         si = snap.slot_inventory
-        slot_line = (
-            f"本地槽位: {si.total_db}/{si.cap} ({si.usage_pct:.0f}% · 余 {si.headroom}) | "
-            f"主对话 {si.main_count} / 可清子代理 {si.cleanable_sub_count} ({format_bytes_human(si.cleanable_bytes)}) / 保护中 {si.protected_sub_count}"
-        )
+        if si.cap <= 0:
+            slot_line = (
+                f"本地会话: {si.total_db} 条 ({format_bytes_human(si.total_bytes)} · 无限历史) | "
+                f"主对话 {si.main_count} / 可清子代理 {si.cleanable_sub_count} ({format_bytes_human(si.cleanable_bytes)}) / 保护中 {si.protected_sub_count}"
+            )
+        else:
+            slot_line = (
+                f"本地槽位: {si.total_db}/{si.cap} ({si.usage_pct:.0f}% · 余 {si.headroom}) | "
+                f"主对话 {si.main_count} / 可清子代理 {si.cleanable_sub_count} ({format_bytes_human(si.cleanable_bytes)}) / 保护中 {si.protected_sub_count}"
+            )
         if si.unknown_count > 0:
             slot_line += f" / 未知 {si.unknown_count}"
         lines.append(slot_line)
-        if si.main_at_risk and si.risk_headline:
+        if si.cap > 0 and si.main_at_risk and si.risk_headline:
             lines.append(f"槽位警报: {si.risk_headline}")
     if len(snap.model_stats) >= 2:
         ms_parts = []

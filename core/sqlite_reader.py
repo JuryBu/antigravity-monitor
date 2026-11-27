@@ -6,7 +6,9 @@ conversation databases incur zero SQLite opens during steady-state polling.
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -115,6 +117,64 @@ def parse_pb_map(buf: bytes | memoryview) -> Dict[int, List[object]]:
     return fields
 
 
+_MIN_TPS_OUTPUT_TOKENS: int = 30
+_MIN_TPS_STREAMING_SEC: float = 0.50
+
+# Physical decode-speed ceilings (tok/s) per model family to drop bursty whole-tool-call chunks
+# whose generation time was absorbed into TTFT while streaming_duration only timed final packet recv.
+_MAX_PLAUSIBLE_TPS_CARBON: float = 320.0
+_MAX_PLAUSIBLE_TPS_LIGHT: float = 650.0
+_MAX_PLAUSIBLE_TPS_DEFAULT: float = 420.0
+
+
+_LIGHT_MODEL_RE = re.compile(
+    r"(?:hydrogen|flash|(?<![a-z0-9])m(?:528|525|530|526|527|318|319|320)(?![a-z0-9]))"
+)
+_CARBON_MODEL_RE = re.compile(
+    r"(?:carbon|(?<![a-z0-9])m(?:427|437|438|667)(?![a-z0-9]))"
+)
+
+
+def _max_plausible_tps_for_model(model_label: str) -> float:
+    low = (model_label or "").strip().lower()
+    if not low:
+        return _MAX_PLAUSIBLE_TPS_DEFAULT
+    if _LIGHT_MODEL_RE.search(low):
+        return _MAX_PLAUSIBLE_TPS_LIGHT
+    if _CARBON_MODEL_RE.search(low):
+        return _MAX_PLAUSIBLE_TPS_CARBON
+    return _MAX_PLAUSIBLE_TPS_DEFAULT
+
+
+def _compute_clean_step_tps(
+    total_out: int,
+    streaming_sec: Optional[float],
+    retry_error: str,
+    model_label: str,
+) -> Optional[float]:
+    """Compute distortion-guarded single-step streaming TPS (returns None for aborted/burst outliers).
+
+    Guards:
+      - Drop streams with non-empty retry_error (EOF / idle timeout / user cancel wait inflates streaming_sec).
+      - Require finite output_tokens >= 30 and finite streaming_sec >= 0.50s (eliminates sub-second tool-call spikes).
+      - Enforce per-family physical speed ceiling (never sets a lower floor so real slowdowns always surface).
+    """
+    if (retry_error or "").strip():
+        return None
+    if isinstance(total_out, bool) or not isinstance(total_out, (int, float)):
+        return None
+    if not math.isfinite(total_out) or total_out < _MIN_TPS_OUTPUT_TOKENS:
+        return None
+    if streaming_sec is None or isinstance(streaming_sec, bool) or not isinstance(streaming_sec, (int, float)):
+        return None
+    if not math.isfinite(streaming_sec) or streaming_sec < _MIN_TPS_STREAMING_SEC:
+        return None
+    raw_tps = float(total_out) / float(streaming_sec)
+    if not math.isfinite(raw_tps) or raw_tps <= 0.0 or raw_tps > _max_plausible_tps_for_model(model_label):
+        return None
+    return raw_tps
+
+
 def _parse_duration_sec(raw: bytes | None) -> Optional[float]:
     if not raw or not isinstance(raw, (bytes, bytearray)):
         return None
@@ -155,12 +215,6 @@ def parse_gen_metadata_row(idx: int, blob: bytes) -> Optional[GenTelemetry]:
     ttft_sec = _parse_duration_sec(m1.get(11, [None])[0] if m1.get(11) else None)
     streaming_sec = _parse_duration_sec(m1.get(12, [None])[0] if m1.get(12) else None)
 
-    # Compute pure streaming TPS only when streaming_sec >= 0.15s; never divide by (ttft + streaming)
-    # on instant burst tool-calls (<0.15s), which would mix multi-second TTFT into fake low TPS.
-    tps: Optional[float] = None
-    if total_out > 0 and streaming_sec is not None and streaming_sec >= 0.15:
-        tps = total_out / streaming_sec
-
     max_context = 0
     if m1.get(9) and isinstance(m1[9][0], bytes):
         m9 = parse_pb_map(m1[9][0])
@@ -171,12 +225,15 @@ def parse_gen_metadata_row(idx: int, blob: bytes) -> Optional[GenTelemetry]:
 
     retry_error = ""
     if m1.get(17):
-        last_retry = m1[17][-1]
-        if isinstance(last_retry, bytes):
-            retry_map = parse_pb_map(last_retry)
-            err_val = retry_map.get(3, [b""])[0]
-            if isinstance(err_val, bytes):
-                retry_error = err_val.decode("utf-8", errors="ignore").strip()
+        for retry_item in reversed(m1[17]):
+            if isinstance(retry_item, bytes):
+                retry_map = parse_pb_map(retry_item)
+                err_val = retry_map.get(3, [b""])[0]
+                if isinstance(err_val, bytes):
+                    cand_err = err_val.decode("utf-8", errors="ignore").strip()
+                    if cand_err:
+                        retry_error = cand_err
+                        break
 
     # Model label priority: m1[21] (display label) -> m1[20]["model_enum"] -> m1[19] (slug) -> top[21]/top[19] (legacy/tests)
     model_label = ""
@@ -208,6 +265,9 @@ def parse_gen_metadata_row(idx: int, blob: bytes) -> Optional[GenTelemetry]:
                 if cand:
                     model_label = cand
                     break
+
+    # Compute distortion-guarded pure streaming TPS after resolving retry_error & model_label
+    tps: Optional[float] = _compute_clean_step_tps(total_out, streaming_sec, retry_error, model_label)
 
     return GenTelemetry(
         idx=idx,

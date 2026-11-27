@@ -558,7 +558,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--conversation-id", default="", help="定向附带指定对话（完整 UUID 或前缀）的详细状态")
     parser.add_argument("--account", default="", help="指定查看的脱敏账号标签（如 al***1、be***2，或 __all__ 查看全机）")
     parser.add_argument("--range", dest="history_range", default="30m", choices=["30m", "6h", "today", "7d"], help="指定观测时间范围（默认 30m 实时）")
-    parser.add_argument("--clean-subagents", action="store_true", help="显式清理超过保护期的已结束老旧子代理以腾出 500 槽位（绝不触碰主对话）")
+    parser.add_argument("--clean-subagents", action="store_true", help="显式清理超过保护期的已结束老旧子代理以释放磁盘空间（绝不触碰主对话）")
     parser.add_argument("--dry-run", action="store_true", help="配合 --clean-subagents 仅预览待清理条数与空间，不执行任何删改")
     parser.add_argument("--min-age", type=int, default=0, help="配合 --clean-subagents 指定子代理保护期（分钟，硬下限 30 分钟，0 表示沿用配置默认 120m）")
     parser.add_argument("--minimized", action="store_true", help="启动后静默最小化到系统托盘")
@@ -682,6 +682,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "freed_bytes": res.freed_bytes,
                         "skipped_locked_count": res.skipped_locked_count,
                         "skipped_changed_count": res.skipped_changed_count,
+                        "skipped_recycle_unavailable_count": res.skipped_recycle_unavailable_count,
                         "remaining_db_count": res.remaining_db_count,
                         "archive_path": res.archive_path,
                         "error": res.error,
@@ -696,13 +697,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             elif res.dry_run:
                 print(
                     f"[预览模式] 保护期 {res.protect_age_min}m · 可安全清理 {res.candidate_count} 条老旧子代理"
-                    f"（约 {format_bytes_human(res.freed_bytes)}），当前总槽位 {res.remaining_db_count}"
+                    f"（约 {format_bytes_human(res.freed_bytes)}），当前本地会话 {res.remaining_db_count} 条"
                 )
             else:
                 print(
                     f"清理完成（模式={res.mode}，保护期={res.protect_age_min}m）：移出 {res.removed_count}/{res.candidate_count} 条，"
                     f"释放 {format_bytes_human(res.freed_bytes)}，跳过占用 {res.skipped_locked_count} / 变动 {res.skipped_changed_count}，"
-                    f"当前剩余 {res.remaining_db_count} 槽"
+                    f"当前剩余 {res.remaining_db_count} 条会话"
                 )
         return 2 if res.error else 0
 

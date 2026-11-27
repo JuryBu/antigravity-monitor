@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import sys
 import threading
 import tkinter as tk
@@ -15,12 +16,14 @@ from core.log_monitor import (
     ConversationDetailReport,
     MonitorSnapshot,
     compute_large_ctx_ttft_allowance,
+    compute_weighted_avg_tps,
     format_countdown,
     format_delta_tokens,
     format_detail_text_report,
     format_media_size,
     format_tokens,
     is_severe_freshness_invalid,
+    resolve_latest_same_family_tps,
     truncate_display_width,
 )
 
@@ -340,18 +343,10 @@ def summarize_detail_points(pts: List[ConversationDetailPoint]) -> Dict[str, Any
     max_ttft = ttfts[-1] if ttfts else None
     p95_ttft = ttfts[min(len(ttfts) - 1, int(round(0.95 * (len(ttfts) - 1))))] if ttfts else None
 
-    weighted_out = 0
-    weighted_strm = 0.0
-    for p in pts:
-        if p.streaming_sec is not None and p.streaming_sec >= 0.5 and p.output_tokens > 0:
-            weighted_out += int(p.output_tokens)
-            weighted_strm += float(p.streaming_sec)
-    if weighted_strm > 0.0 and weighted_out > 0:
-        avg_tps: Optional[float] = weighted_out / weighted_strm
-    else:
-        tpss = [p.tps for p in pts if p.tps is not None]
-        avg_tps = (sum(tpss) / len(tpss)) if tpss else None
-    latest_tps = next((p.tps for p in reversed(pts) if p.tps is not None), None)
+    avg_tps: Optional[float] = compute_weighted_avg_tps(
+        [(p.tps, p.streaming_sec, p.output_tokens) for p in pts]
+    )
+    latest_tps = resolve_latest_same_family_tps(pts)
     return {
         "peak_context_tokens": peak_ctx,
         "compact_count": compact_count,
@@ -797,9 +792,7 @@ class ConversationDetailWindow:
         if rep is None or not rep.points:
             return
         latest_pt = rep.points[-1]
-        latest_tps = self._current_wstats.get("latest_tps")
-        if latest_tps is None:
-            latest_tps = rep.latest_tps
+        latest_tps = self._current_wstats.get("latest_tps") if self._current_wstats else rep.latest_tps
         if rep.freshness_invalid_reason:
             self._update_freshness_kpi(None, rep.freshness_invalid_reason, latest_tps, getattr(rep, "consec_miss", 0))
             return
@@ -824,8 +817,9 @@ class ConversationDetailWindow:
             self._last_sync_sig = sig
             self.refresh()
         else:
-            latest_tps = self._current_wstats.get("latest_tps")
-            if latest_tps is None:
+            if self._current_wstats:
+                latest_tps = self._current_wstats.get("latest_tps")
+            else:
                 latest_tps = self._report.latest_tps if self._report is not None else conv.tps
             if not (snap.is_custom_account_view or snap.history_range != "30m"):
                 self._update_freshness_kpi(
